@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Fri, 16 Oct 2026 10:25:05 +0200
+Subject: [PATCH] faudio: Keep resampling taps within the samples to resample.
+
+From upstream FAudio a3b49d6 (Fix resample taps exceeding the total
+resample sample count) and 2ead980 (Increment resampleOffset even when
+resampleStep is 1), both 2026-09-26, after the FAudio 26.09 that Wine
+carries.
+
+A voice that played at the output rate never advanced resampleOffset, so
+when it started resampling (a new frequency ratio) the tap loops ran
+from that stale offset to the decoded sample count. tap_samples then
+exceeded toResample, toResample - tap_samples wrapped, and the SSE2
+resampler wrote far past resampled_audio: Call of Juarez Gunslinger
+corrupted the process heap and crashed in its XAudio2 mixer.
+---
+ libs/faudio/src/FAudio_internal.c | 45 ++++++++++++++++++++-----------
+ 1 file changed, 30 insertions(+), 15 deletions(-)
+
+diff --git a/libs/faudio/src/FAudio_internal.c b/libs/faudio/src/FAudio_internal.c
+index eb059ce..aaa8051 100644
+--- a/libs/faudio/src/FAudio_internal.c
++++ b/libs/faudio/src/FAudio_internal.c
+@@ -1147,6 +1147,7 @@ static void FAudio_INTERNAL_MixSource(FAudioSourceVoice *voice)
+ 	{
+ 		/* Actually, just use the existing buffer... */
+ 		finalSamples = voice->audio->decoded_audio;
++		voice->src.resampleOffset += (toResample << FIXED_PRECISION);
+ 	}
+ 	else
+ 	{
+@@ -1175,30 +1176,44 @@ static void FAudio_INTERNAL_MixSource(FAudioSourceVoice *voice)
+ 				*dst++ = lerp(voice->src.resample_taps[0][i], voice->src.resample_taps[1][i], frac);
+ 
+ 			voice->src.resampleOffset += voice->src.resampleStep;
+-			++tap_samples;
++
++			if (++tap_samples >= toResample)
++			{
++				break;
++			}
+ 		}
+ 
+ 		/* Then the samples between the last sample of the
+ 		 * previous quantum and the first sample of this one. */
+-		while ((voice->src.resampleOffset >> FIXED_PRECISION) < prev_sample_count)
++		if (tap_samples < toResample)
+ 		{
+-			float frac = fixed_to_float(voice->src.resampleOffset & FIXED_FRACTION_MASK);
++			while ((voice->src.resampleOffset >> FIXED_PRECISION) < prev_sample_count)
++			{
++				float frac = fixed_to_float(voice->src.resampleOffset & FIXED_FRACTION_MASK);
+ 
+-			for (unsigned int i = 0; i < channels; ++i)
+-				*dst++ = lerp(voice->src.resample_taps[1][i], voice->audio->decoded_audio[i], frac);
++				for (unsigned int i = 0; i < channels; ++i)
++					*dst++ = lerp(voice->src.resample_taps[1][i], voice->audio->decoded_audio[i], frac);
+ 
+-			voice->src.resampleOffset += voice->src.resampleStep;
+-			++tap_samples;
++				voice->src.resampleOffset += voice->src.resampleStep;
++
++				if (++tap_samples >= toResample)
++				{
++					break;
++				}
++			}
+ 		}
+ 
+-		voice->src.resample(
+-			voice->audio->decoded_audio,
+-			dst,
+-			(uint64_t *)&voice->src.resampleOffset,
+-			voice->src.resampleStep,
+-			toResample - tap_samples,
+-			channels
+-		);
++		if (tap_samples < toResample)
++		{
++			voice->src.resample(
++				voice->audio->decoded_audio,
++				dst,
++				(uint64_t *)&voice->src.resampleOffset,
++				voice->src.resampleStep,
++				toResample - tap_samples,
++				channels
++			);
++		}
+ 		finalSamples = voice->audio->resampled_audio;
+ 
+ 		/* Actually this is probably wrong in the case we do get a

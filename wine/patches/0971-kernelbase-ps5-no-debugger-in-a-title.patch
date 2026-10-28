@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Fri, 16 Oct 2026 08:50:41 +0200
+Subject: [PATCH] kernelbase: Do not start a debugger in a PS5 title.
+
+A PS5 title is one process and ntdll fails process creation there (patch
+0550), so winedbg never starts. Before CreateProcessW fails,
+start_debugger reads AeDebug and allocates the command line and a copy
+of the environment from the process heap. When the faulting game holds
+that lock in another thread, the crash froze the title instead of ending
+it: Call of Juarez Gunslinger waited on its main heap lock forever. Other
+threads that fault meanwhile wait for the first one on the debugger
+event.
+
+In a title (the starter sets WINE_PS5_NTDLL_DIR, read once at DLL
+attach), UnhandledExceptionFilter still calls the game's own filter, then
+logs the exception and lets the thread's handler terminate the process
+(patch 0896 then leaves through exit()).
+---
+ dlls/kernelbase/debug.c      | 23 +++++++++++++++++++++++
+ dlls/kernelbase/kernelbase.h |  1 +
+ dlls/kernelbase/main.c       |  1 +
+ 3 files changed, 25 insertions(+)
+
+diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
+index 8dbb677..a054e0d 100644
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -670,6 +670,19 @@ exit:
+     return ret;
+ }
+ 
++/* A PS5 title is a single process (ntdll fails process creation there), so
++ * winedbg never starts. start_debugger's registry and heap work then only
++ * waits on locks the crashed game may hold: Call of Juarez Gunslinger froze
++ * on the process heap lock instead of ending. The title's Wine starter sets
++ * WINE_PS5_NTDLL_DIR; it is read at start, not on the crash path. */
++static BOOL no_debugger;
++
++void init_debugger(void)
++{
++    no_debugger = GetEnvironmentVariableW( L"WINE_PS5_NTDLL_DIR", NULL, 0 ) > 0;
++}
++
++
+ /******************************************************************
+  *		start_debugger_atomic
+  *
+@@ -782,6 +795,16 @@ LONG WINAPI UnhandledExceptionFilter( EXCEPTION_POINTERS *epointers )
+             if (ret != EXCEPTION_CONTINUE_SEARCH) return ret;
+         }
+ 
++        if (no_debugger)
++        {
++            char buffer[256];
++
++            format_exception_msg( epointers, buffer, sizeof(buffer) );
++            MESSAGE( "wine: %s (thread %04lx), no debugger, ending the process\n",
++                     buffer, GetCurrentThreadId() );
++            return nested ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER;
++        }
++
+         if ((GetErrorMode() & SEM_NOGPFAULTERRORBOX) ||
+             !start_debugger_atomic( epointers ) || !NtCurrentTeb()->Peb->BeingDebugged)
+             return nested ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER;
+diff --git a/dlls/kernelbase/kernelbase.h b/dlls/kernelbase/kernelbase.h
+index e46ca0f..1b08f14 100644
+--- a/dlls/kernelbase/kernelbase.h
++++ b/dlls/kernelbase/kernelbase.h
+@@ -37,6 +37,7 @@ extern void init_global_data(void);
+ extern void init_startup_info( RTL_USER_PROCESS_PARAMETERS *params );
+ extern void init_locale( HMODULE module );
+ extern void init_console(void);
++extern void init_debugger(void);
+ extern BOOL is_console_handle( HANDLE );
+ 
+ extern const WCHAR windows_dir[];
+diff --git a/dlls/kernelbase/main.c b/dlls/kernelbase/main.c
+index 8c37e5d..9598c4c 100644
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -49,6 +49,7 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
+         init_locale( hinst );
+         init_startup_info( NtCurrentTeb()->Peb->ProcessParameters );
+         init_console();
++        init_debugger();
+     }
+     return TRUE;
+ }

@@ -15,10 +15,13 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <string.h>
+#include <time.h>
 #include <vulkan/vulkan.h>
 #if defined(__PROSPERO__)
 #include <x86intrin.h>
 #endif
+#include "pw_vk_radv_profile_wrap.h"
+#include "pw_framegen.h"
 
 PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
 PFN_vkVoidFunction VKAPI_CALL vk_common_GetDeviceProcAddr(VkDevice device, const char *name);
@@ -30,14 +33,22 @@ int pw_videoout_show_tiled(const void *tiled, uint64_t bytes, uint32_t width, ui
 int pw_videoout_cursor(const uint32_t *argb, uint32_t width, uint32_t height, int32_t x, int32_t y,
                        uint32_t space_width, uint32_t space_height);
 
+/* win32u asks the instance for vkGetDeviceProcAddr and then loads every
+ * device entry point through it, so both lookups go through frame
+ * generation's step (pw_framegen.cpp: its wrappers when a profile turns it
+ * on) and then the profile's resolver (pw_vk_radv_profile_wrap.c), which
+ * returns a timing wrapper for the entry points it times while the profile
+ * is on, and the pointer it was given otherwise. */
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char *name)
 {
-    return vk_icdGetInstanceProcAddr(instance, name);
+    if (name && !strcmp(name, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
+    return pw_vk_radv_profile_resolve(name, pw_framegen_resolve(instance, name, vk_icdGetInstanceProcAddr(instance, name)));
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char *name)
 {
-    return vk_common_GetDeviceProcAddr(device, name);
+    return pw_vk_radv_profile_resolve(name, pw_framegen_resolve(VK_NULL_HANDLE, name,
+                                                                vk_common_GetDeviceProcAddr(device, name)));
 }
 
 /* 1 when a frame given to pw_videoout_show_tiled would show: the video
@@ -215,4 +226,54 @@ ssize_t readlink(const char *path, char *buffer, size_t capacity)
     (void)capacity;
     errno = ENOENT;
     return -1;
+}
+
+/* --- leaving the process ---------------------------------------------------
+ * The title replaces the process with sceSystemServiceLoadExec once Wine
+ * has exited. Wine ends the game's threads with a signal, so the last
+ * frames they presented are still on their way: the WSI's flip thread, a
+ * thread of this library's own, submits a flip once the frame's fence
+ * signals, and VideoOut shows it at a vblank. A process replaced while such
+ * a flip is queued stayed at the system's "Closing" screen (Project Eagle,
+ * 2026-10-12: three exits from the world hung; the same exits with a few
+ * milliseconds more before the replacement did not). This waits until no
+ * flip has been pending for a refresh period. It takes none of the WSI's
+ * locks, which a thread Wine ended may still hold. 1 with no output open,
+ * 0 drained, -1 when timeout_ms passed with flips still pending;
+ * *waited_ms says how long it took and *pending_last what VideoOut
+ * answered last. */
+extern int sceVideoOutIsFlipPending(int32_t handle);
+
+static uint64_t quiesce_now_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+int pw_videoout_quiesce(unsigned timeout_ms, unsigned *waited_ms, int *pending_last)
+{
+    /* Polled, never waited for a vblank: a wait that the output does not
+     * answer would hold the exit; 20 ms of no flip pending is more than one
+     * refresh at 60 Hz. */
+    enum { POLL_US = 4000, SETTLED_POLLS = 5 };
+    int handle = __atomic_load_n(&videoout_handle, __ATOMIC_ACQUIRE);
+    uint64_t started = quiesce_now_ms(), deadline = started + timeout_ms;
+    unsigned settled = 0;
+    int pending = 0, status = -1;
+
+    if (waited_ms) *waited_ms = 0;
+    if (pending_last) *pending_last = 0;
+    if (handle < 0) return 1;
+    for (;;) {
+        pending = sceVideoOutIsFlipPending(handle);
+        if (pending <= 0) settled++;
+        else settled = 0;
+        if (settled >= SETTLED_POLLS) { status = 0; break; }
+        if (quiesce_now_ms() >= deadline) break;
+        usleep(POLL_US);
+    }
+    if (waited_ms) *waited_ms = (unsigned)(quiesce_now_ms() - started);
+    if (pending_last) *pending_last = pending;
+    return status;
 }

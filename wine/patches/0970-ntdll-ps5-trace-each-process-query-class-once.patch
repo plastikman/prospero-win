@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Fri, 16 Oct 2026 08:50:41 +0200
+Subject: [PATCH] ntdll: Trace each process query class once on PS5.
+
+The title's default WINEDEBUG keeps +process for process creation and
+exit. NtQueryInformationProcess traced every call, and a game that asks
+for ProcessAffinityMask every frame (Call of Juarez Gunslinger, 60 times
+a second) filled the title log with that one line, so the +loaddll
+lines that place a crash address were gone.
+
+Each class below 128, which covers every class Windows defines, is now
+traced the first time it is queried. Wine's own classes above that keep
+a line per call; the PS5 clock anchor (ProcessWineQpcAnchor) is queried
+only when its anchor runs out.
+---
+ dlls/ntdll/unix/process.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index 7a7b3be..394a46e 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -1132,12 +1132,31 @@ static BOOL ps5_is_own_process( HANDLE handle )
+ extern NTSTATUS ps5_qpc_anchor( void *args );
+ #include "../pw_qpc_clock.h"
+ 
++#ifdef __PROSPERO__
++/* Games poll some classes every frame: Call of Juarez Gunslinger asks for
++ * ProcessAffinityMask 60 times a second, and with the title's +process
++ * default that one line filled its whole log, so the +loaddll lines that
++ * place a crash address were gone. Trace each class the first time only. */
++static BOOL first_query( PROCESSINFOCLASS class )
++{
++    static unsigned int queried[4];
++    unsigned int bit;
++
++    if ((unsigned int)class >= 32 * ARRAY_SIZE(queried)) return TRUE;
++    bit = 1u << (class % 32);
++    return !(__atomic_fetch_or( &queried[class / 32], bit, __ATOMIC_RELAXED ) & bit);
++}
++#endif
++
+ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class, void *info,
+                                            ULONG size, ULONG *ret_len )
+ {
+     unsigned int ret = STATUS_SUCCESS;
+     ULONG len = 0;
+ 
++#ifdef __PROSPERO__
++    if (TRACE_ON(process) && first_query( class ))
++#endif
+     TRACE( "(%p,0x%08x,%p,0x%08x,%p)\n", handle, class, info, size, ret_len );
+ 
+     switch (class)

@@ -22,7 +22,7 @@ FreeBSD headers, so Wine selects its FreeBSD paths (kqueue instead of epoll,
 sysctl), and `__PROSPERO__` selects the PS5 patches. PE modules come from
 the host build that `tools/build_wine_runtime.sh` produces, which also
 supplies winebuild and widl. The exception is the few PE modules a patch
-changes (`PE_MODULES`, today the xinput DLLs), which are built from the
+changes (`PE_MODULES` in `tools/build_wine_ps5.sh`), which are built from the
 patched tree for i386 and x86_64 into `.deps/wine-ps5/pe`. That needs both
 MinGW cross compilers.
 
@@ -75,6 +75,7 @@ before evaluating a candidate built from that cache.
 | 0120 | `server`: when the current user names no audio driver, default `HKCU\Software\Wine\Drivers\Audio` to `ps5`; see [Audio](#audio) |
 | 0130 | `ntdll`: a main program mapped away from its preferred base (the title's image may hold 0x400000) runs in-process, relocated by the PE loader; any other load failure prints the program and the status instead of running `start.exe`, which would need a new process. Both failure paths leave through `exit()`, so the title restarts into its launcher |
 | 0140 | `ntdll`: `NtQueryDirectoryFile` enters a directory by the name the server opened it with when `fchdir()` on the server's descriptor fails. The descriptor has no path in ntdll's working-directory emulation, so no directory could be listed |
+| 0145 | `ntdll`: a name opened relative to a root directory (`ObjectAttributes.RootDirectory`) is looked up with `openat()`/`fstatat()` on the server's descriptor for that directory, which has no path in ntdll's working-directory emulation (as in 0140), so the lookup failed with `EBADF` and the open with `STATUS_INVALID_HANDLE`. ntdll records the name the server opened the directory with before the lookup, by name and by file id. .NET enumerates a tree this way, so a recursive enumeration failed at the first subdirectory |
 | 0150 | `server`: save the registry in 1 MiB writes: each `write()` costs about 3.3 ms on the console whatever its size, and stdio issued one per 64 KiB, so a 3.2 MB `system.reg` took 154 ms, during which the in-process server answers nothing |
 | 0160 | `ntdll`: cheaper lookups of names that are not there. Wine searched the whole directory for another spelling, then again for `name?` (a reparse point), and probed the volume's case sensitivity each time: 24 system calls per missed name in a host trace of the same code. The Ultimate ASI Loader makes such a lookup in its `update` folder before every file a game opens. On PS5 the case probe answers at once (a title has no `fstatfs`, so it always answered case-sensitive), the names come from `pw_cwd_scan_directory()`, which keeps them while the directory cannot have changed (`wine/ps5/pw_wine_cwd.h`), and the `name?` retry is skipped when no name in the directory ends in `?`. A missed name then takes the stats of the path and one of its directory |
 | 0400 | `win32u`: in-process PS5 user driver (`WINE_PS5_USER_DRIVER`, set on PS5); see [User driver](#user-driver) |
@@ -97,10 +98,17 @@ before evaluating a candidate built from that cache.
 | 0580 | `ntdll`: skip the configuration directory's parent ownership check on PS5, as 0111 skips the one after `chdir` |
 | 0600 | `ntdll`: anonymous memory in the reserved areas is direct memory, not flexible memory; a 16 GiB area at `0x1000000000` takes the allocations free to go anywhere; see [Direct memory](#direct-memory) |
 | 0601 | `ntdll`: an i386 image is never mapped above 4 GiB, so a relocatable exe whose preferred base is taken stays in the low reserved areas instead of the high one |
+| 0602 | `ntdll`: a writable shared section that does not start and end on 16 KiB host pages (GameMaker's `.mydata`) is mapped as a private copy instead of failing the image load; with no second process (0550) nothing shares it. The log names each such section with one ERR line |
+| 0604 | `ntdll`: thread and fiber stacks commit what Windows commits, their commit size at the top rounded up to 16 KiB host pages with a guard host page under it, and grow through the guard page; Wine committed each whole stack, and every committed page is direct memory, so Assetto Corsa EVO's 2,750 fibers (1 MiB reserved, 4 KiB committed each) took about 2.7 GiB. A fiber now starts with 16 KiB, a thread with 64 KiB (`signal_start_thread` clears the 60 KiB under its initial context). A fault on a reserved page of the thread's own stack under its guard page commits up to the stack limit, since Wine writes such frames from their low end (that clearing, a user callback's arguments such as a whole `WM_GETTEXT` buffer). A stack whose caller commits all it reserves (the WoW64 CPU's 64-bit stack) is committed whole, as before. `RtlCreateUserStack` does this in a title (`WINE_PS5_NTDLL_DIR`); on a PC, `WINE_HOST_PAGE_SIZE=16384` runs it (`tests/test_wine_fiber_stacks.py`), and with 4 KiB host pages stacks are committed whole |
 | 0610 | `ntdll`: `__wine_ps5_set_segv_hook` lets `wowprospero` resume its own faults (fault markers) from inside Wine's SIGSEGV handler, instead of a second handler chaining to the action `sigaction` reports |
 | 0611 | `wow64`: `WINE_PS5_WOW64_CPU` names the process's CPU backend (`wow64native.dll` or `wowprospero.dll`); when the named one cannot be loaded, the prefix's own choice is used instead of ending the process |
+| 0614 | `wow64`: when the environment's `wow64native.dll` does not start (ntdll reports no native readiness, patch 0883), the process loads `wowprospero.dll` and runs on the translator instead of ending at its first 32-bit instruction; the log has `wow64native.dll did not start (<status>); using wowprospero.dll` |
 | 0770 | `server`, `ntdll`: on PS5, the client thread runs sync-object and handle requests itself under a server lock instead of waking the server thread twice through the pipes; see [Sync requests on the client threads](#sync-requests-on-the-client-threads) |
 | 0790 | `server`, `ntdll`: opt-in immediate mutex acquire/release using the authoritative server object without request marshalling or waiter allocation; see [Immediate mutex calls](#immediate-mutex-calls) |
+| 0871 | `server`: past the first 64 directories open at once, a directory's descriptor is closed once its open is checked ("parked") and opened again by name, with `O_DIRECTORY` and the same device and inode, the first time it is needed. .NET keeps a handle open for every subdirectory still to list, so SMAPI's scan of a large mods folder ran out of descriptors (EMFILE); on a host Wine with a 512-descriptor limit the stock server fails such a listing of 3001 directories (`tests/test_wine_directory_handles.py`, `PROSPERO_TEST_NOFILE=512`) at about 230 queued handles and a server built with `PS5_PARK_DIRECTORIES` completes it. Renaming the directory through another handle gives the parked ones its new name, but a parked handle does not follow a rename of a directory above it, hence the threshold. Whether an fd is parked is tested inline, so one that is not costs no call. `WINE_PS5_PARK_DIRECTORIES=0` parks nothing, `=N` moves the threshold |
+| 0877 | `secur32`: a handshake GnuTLS fails for a reason schannel does not map logs the GnuTLS code and message and the clock through the err channel (and a fatal alert the clock), where the caller saw SEC_E_INTERNAL_ERROR and gnutls_perror went to stderr; on the console a date behind the certificates' makes every chain not yet valid |
+| 0878 | `crypt32`: on PS5 the root store is filled from `share/wine/ca-certificates.crt` beside the runtime, found from crypt32.prx's own path, before the system paths a title cannot see; a bundle that is not there is an error in the log, since no chain then verifies |
+| 0879 | `win32u`: the PS5 driver's ProcessEvents reports the wake pipe as handled whenever it read it; the pipe is every GUI thread's queue fd, so a thread whose events another thread had taken kept QS_DRIVER set with its fd unarmed, and a zero-timeout message wait (DirectInput's GetDeviceState) spun until the next input, so a game stalled while a button was held |
 | 0881 | `ntdll`: the number of processors is the CPUs the process may run on (`cpuset_getaffinity`), 13 for a game on the console, not the 16 online; threads of one priority there never share a CPU, so a program that started a worker per reported CPU had three that did not run until another blocked |
 | 0882 | `server`: Windows threads run SCHED_RR, so threads of one priority take turns on the CPUs, and priorities above normal raise the native priority one step per band (normal and below stay at the title's 700); a title's threads are otherwise SCHED_FIFO at one priority, where a 14th busy thread waits for one of the game's 13 CPUs and a Windows priority change does nothing. Opt-in: `WINE_PS5_SCHED=1` or the file `/data/prospero-win/pw_sched` |
 | 0884 | `server`: a watched directory is polled for changes (25 ms to 2 s apart, slower for a directory that takes long to list) and the differences are reported as inotify would, renames included; the console has no inotify, dnotify or kqueue, and change notifications never fired |
@@ -115,6 +123,15 @@ before evaluating a candidate built from that cache.
 | 0897 | `ntdll`: a reservation at a fixed address outside the reserved areas is handed to the direct-memory allocator until it is unmapped, so committing it backs its pages; the console does not back a bare reservation when it is protected, and the first write to such a commit faulted (Steam's protection layer on 64-bit games) |
 | 0898 | `ntdll`: this process's memory counters (GetProcessMemoryInfo, ProcessVmCounters, SystemProcessInformation) come from its views, also for a handle opened on its own id; the console has no /proc or procstat, and every counter was zero |
 | 0899 | `include`: list the PS5 sync headers (0810, 0820, 0885, 0887) in `include/Makefile.in`, which makedep needs to resolve them; configure failed without it |
+| 0902 | `win32u`: the PS5 driver sends the arrows, Insert, Delete, Home, End, Page Up, Page Down, right Ctrl and Alt, the Windows and menu keys and keypad `/` with `KEYEVENTF_EXTENDEDKEY`; their scan codes are the keypad's without it, so DirectInput reported the keypad's 8 for the up arrow and a game's arrow-key bindings never fired |
+| 0903 | `ntdll`: a signal frame keeps the FS base it was taken with when the thread resumes where it was; the host's is set only where the handler sends a context to Wine's 64-bit code (the exception dispatcher, a different 64-bit context). The native WoW64 CPU sets the guest FS just before it switches to 32-bit code, and a signal in that window used to send the thread into its 32-bit code with the host FS (GTA San Andreas' DXVK workers crashing at startup in `RtlEnterCriticalSection`) |
+| 0965 | `win32u`: setting a pixel format on the desktop window no longer posts `WM_WINE_SETPIXELFORMAT` to it. Nothing owns the server-created desktop on the PS5, so the message came back to the game's own queue and posted itself again forever. `vkCreateWin32SurfaceKHR` sets format -1 on every surface's window, so a Vulkan surface on the desktop (DXVK or Zink) kept the game on a black screen with one core busy (Syndicate) |
+| 0970 | `ntdll`: `NtQueryInformationProcess` traces each information class below 128 (all of Windows' classes) only the first time it is queried; Wine's own classes, such as the rarely queried `ProcessWineQpcAnchor`, keep a line per call. The title's default `+process` then still shows process creation and exit, but a game that polls a class every frame no longer fills the log: Call of Juarez Gunslinger's `ProcessAffinityMask` line, 60 times a second, pushed the `+loaddll` lines out of the title log |
+| 0971 | `kernelbase`: in a PS5 title (`WINE_PS5_NTDLL_DIR` set, read at DLL attach), `UnhandledExceptionFilter` calls the game's own filter, logs `wine: Unhandled ... (thread N), no debugger, ending the process` and returns `EXCEPTION_EXECUTE_HANDLER`, so the process ends through patch 0896. winedbg can never start in a title (0550), and `start_debugger`'s heap allocations before `CreateProcessW` waited forever when another game thread held the process heap lock (Call of Juarez Gunslinger froze) |
+| 0972 | `faudio` (Wine's bundled FAudio 26.09): upstream FAudio a3b49d6 and 2ead980 (2026-09-26). A source voice that played at the output rate never advanced `resampleOffset`, so when it started resampling, the tap loops of `FAudio_INTERNAL_MixSource` ran from the stale offset, `toResample - tap_samples` wrapped and the SSE2 resampler wrote far past `resampled_audio`. Call of Juarez Gunslinger corrupted its process heap and crashed in the mixer, or in the heap. FAudio is a static library, so every `xaudio2_*` and `xactengine*` module is in `PE_MODULES` |
+| 0973 | `ntdll`: a private process information class, `ProcessWineTitleMenu` (0x50574D01), returns the title's in-game menu (`wine/ps5/menu/pw_title_menu.h`): the text and cursor the title stored in the sink with `pw_wine_set_menu`, for DXVK's HUD to draw over the game once a frame. Pointer-free, one layout for PE32 and PE64; WoW64 passes it through as it does the QPC anchor (0900), and it is never traced (0970). On a PC, `PW_TITLE_MENU_DEMO=1` returns a fixed demo menu so the drawing can be checked without a console |
+| 0974 | `ntdll`: outside images, a page made read-only or inaccessible takes writing, or all access, away from its whole 16 KiB host page, so touching it faults as on Windows; the host page used to get the union of its pages' protections, and a write to a protected page beside a writable one raised nothing (DuckStation then ran stale recompiled code). An access that faults only because of such a neighbour is single-stepped with the host page open for that one instruction, unseen by the program. On a PC, `WINE_HOST_PAGE_SIZE=16384` keeps 16 KiB host pages to run this scheme (`tests/test_wine_subpage_protect.py`) |
+| 0982 | `ntdll`: the high reserved area at `0x1000000000` (0600) is as large as the kernel grants: 512 GiB first, halved down to 16 GiB, each try within the address space limits `map_view` honors, and reserved before the view heap's 64 MiB so the kernel cannot place that one inside the range. A 64-bit game's reservation of tens of GiB (Red Dead Redemption 2: 28 GiB, Cyberpunk 2077: 16 GiB, Fellowship: 48 GiB, a .NET runtime: 256 GiB) no longer falls through to `mmap( NULL )`, which the console refuses (`map_view anon mmap error Cannot allocate memory, size 700010000`). `PW_PS5_HIGH_RESERVE_GB` gives the first size tried (0 keeps the single 16 GiB reservation); one `wine-ps5: address space:` line at startup reports the host and user limits and the area granted. The page protection table's leaves (1 MiB per 4 GiB of views) come from the Unix heap, in direct memory, instead of flexible memory |
 
 ## Allocator
 
@@ -131,6 +148,30 @@ The host test checks classes, reuse, large mappings, `realloc` in place and
 across classes, zeroed `calloc`, overflow refusal, foreign and double frees,
 and eight threads of mixed traffic under AddressSanitizer and
 ThreadSanitizer.
+
+Where new spans and large blocks come from is pluggable
+(`pw_wine_heap_set_backing`). On the console, once direct memory passes its
+self-check (see [Direct memory](#direct-memory)), `ntdll`'s heap takes them
+from main direct memory, mapped where the kernel chooses, and freeing a
+large block releases it; the log says `wine-ps5: heap in direct memory`
+with the headroom and spill cap below. With every block in flexible
+memory, OpenGL games used up the title's ~440 MiB through this heap: Slay
+the Spire 2 held 276 MiB of heap when flexible memory reached 0.
+`wineserver`'s own copy of the heap is unchanged.
+
+Direct memory is shared with `ntdll`'s committed memory and the GPU driver,
+which can fill it on their own (Over the Hill at 4K: Wine 6.2 GiB, the GPU
+5.5 GiB of 12). So the heap leaves headroom: when the largest free block
+would drop below 256 MiB (`WINE_PS5_HEAP_HEADROOM_MB`), a new block is an
+anonymous mapping of flexible memory instead, up to 128 MiB of such blocks
+(`WINE_PS5_HEAP_SPILL_MB`); past that, direct memory again. The heap also
+falls back to flexible memory when its table of direct blocks is half full
+(32,768 blocks) or the kernel refuses, and for every block with
+`WINE_PS5_HEAP_FLEXIBLE` set. The largest free block is read from the
+kernel, then kept as a running estimate of what the heap took and gave back
+since; it is read again once the heap has grown by 16 MiB net, so allocating
+and freeing adds no kernel call. The title's `PW_WINE64 memory` line reports
+the heap's direct and spilled bytes as `heap_dmem` and `heap_spill`.
 
 `wine/ps5/pw_wine_heap_libc.c` binds `malloc`, `calloc`, `realloc`, `free`,
 `strdup`, `strndup`, `asprintf` and `vasprintf` to that heap. The build links
@@ -176,14 +217,36 @@ and frees it; if the console refuses any step, every call passes through as
 before and the log says so. The low reserved areas cover 0x10000-0x7fff0000
 whole (patch 0895): Linux's layout leaves 0x68000000-0x7f000000 to its own
 libraries, and there the i386 builtin DLLs and a game's DLLs were fixed
-mappings of flexible memory. A 16 GiB reserved area at `0x1000000000`, where
-the kernel grants the whole range at the hint, takes the views whose limits
+mappings of flexible memory. A reserved area at `0x1000000000`, as large as
+the kernel grants at the hint (512 GiB asked first, halved down to 16 GiB;
+patch 0982, `PW_PS5_HIGH_RESERVE_GB`), takes the views whose limits
 allow it before the low areas are searched, so the i386 guest keeps the low
 4 GiB. An i386 image's limit is 4 GiB (0601): the main exe is mapped where
 it can when its preferred base is taken, and before 0601 that was the high
 area, where the guest saw its base truncated to 32 bits. The host tests run the policy against a model of the kernel (a memfd
 for physical memory, reservations that refuse to overlap, execute refused at
 map time) with 20,000 random operations checked page by page.
+
+Patch 0603 reports the title's direct-memory pool to Windows memory queries
+instead of the BSD sysctls, which can return zero inside the title sandbox.
+`virtual_get_system_info` uses the pool for physical pages;
+`get_performance_info` uses it for physical memory and its page-file budget,
+with the largest free direct-memory block as the availability estimate.
+Wine adds the physical and synthetic page-file budgets when computing commit
+limits, so reported total and available commit are twice the corresponding
+physical estimates.
+The [Windows `MEMORYSTATUSEX` contract](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/ns-sysinfoapi-memorystatusex)
+defines the page-file fields as commit limits and available commit, so this
+budget does not imply disk-backed swap on the console. The helper keeps an
+optimistic 1 GiB availability floor, capped at the total, and a 4 GiB total
+fallback when the pool query returns zero. Neither estimate reserves memory;
+allocation can still fail below the reported availability. Raw kernel and
+BSD readings are logged once. `tests/test_pw_wine_dmem_ps5.c` covers normal
+readings, failed queries, the fallback, the floor and the cap with host kernel
+stubs. With the pinned Wine source present, `tests/test_build_wine_ps5.py`
+also runs the patched queries and Windows field conversion, checking physical
+page counts, commit capacity and bounded memory load. Rebuild `ntdll.prx` to
+use the change.
 
 ## PRX modules
 
@@ -215,7 +278,10 @@ Module conversion publishes exports from foundation commit `5bd0887`
 onward, and binds imports between application PRXs from
 `30597512539e7edfde079cbcaf4a626bc0a948c5` (the name-form export hash) onward. The
 build requires the second. Both are on the foundation's `exp/prx-module`
-branch, and the title's pinned foundation predates them. `PS5_PRX_FOUNDATION` (or `--prx-foundation`) names a checkout
+branch, and the title's pinned foundation predates them. The same commits
+rebased onto the foundation's main also qualify (the name-form hash there is
+`e879c08a408ac17186b4736d86f67bcc1aa9dab8`); that converter writes every
+Wine PRX byte for byte the same. `PS5_PRX_FOUNDATION` (or `--prx-foundation`) names a checkout
 that has it; otherwise the PRX link is skipped and the report says why.
 
 `report.json` gains a `prx` section. For each module it lists whether the
@@ -611,9 +677,9 @@ game (PE) -> DXVK d3d11/dxgi/d3d9/d3d8/d3d10core (PE, beside the game) -> winevu
   SDK's stubs. `wine/ps5/pw_vulkan_libc.c` supplies the few libc functions
   it names that a title lacks (`popen`, `pclose`, `mkstemp`, `__assert`).
   Without the SDK the module is skipped. `winevulkan.prx` and
-  `opengl32.prx` are built either way. Without the optional OpenGL SDK below,
-  `wined3d`, which Wine's `d3d10.dll` imports even over DXVK, needs `opengl32`
-  to initialise, and it does so with no driver. ps5vk is
+  `opengl32.prx` are built either way: `wined3d`, which Wine's `d3d10.dll`
+  imports even over DXVK, needs `opengl32` to initialise, and it does so
+  with no driver. ps5vk is
   GPL-3.0-or-later, so a title that ships ps5vk's `libvulkan.prx` ships a
   GPL work.
 - **RADV.** `tools/build-radv.sh release` in PS5_Vulkan builds RADV's
@@ -657,6 +723,19 @@ game (PE) -> DXVK d3d11/dxgi/d3d9/d3d8/d3d10core (PE, beside the game) -> winevu
   window it adds `VkSwapchainPresentScalingCreateInfoEXT` in front of
   the application's structures (patch 0456); dropping them crashed DXVK's
   swapchain in Mesa's WSI.
+- **One display.** VideoOut has one display, so one swapchain presents at a
+  time. A new swapchain replaces the current one through `oldSwapchain`, or
+  takes the display from one that has never presented; a swapchain that has
+  presented keeps it until it is destroyed or replaced, and another window's
+  is refused (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`). This matters for OpenGL
+  games under Zink that load wined3d: `hl.exe` (Half-Life, Counter-Strike)
+  reads OpenGL's caps from a context on a hidden 10x10 window, Zink makes a
+  swapchain on it and never presents, and before PS5_Mesa `f2ee389`
+  (PS5_Vulkan #4) that swapchain kept the display, so the game's window
+  stayed black with no menu. Counter-Strike 1.6 under Zink, native CPU with
+  batching, showed its menu and cursor and played dust2 at 60 fps with the
+  fix (2026-10-09); the old workaround, `hl.exe`'s Direct3D
+  `renderer=no3d` AppDefault, is not needed with it.
 - **DLLs.** DXVK's DLLs go beside the game, and its profile sets
   `dll_overrides` (`d3d11,dxgi=n`, `d3d9=n`, `d3d8,d3d9=n` or
   `d3d10core,d3d11,dxgi=n`). The unmodified Win32-WSI DXVK build is the one
@@ -682,64 +761,87 @@ back buffer back (`GetRenderTargetData`/`LockRect`, or a staging copy and
 | DXVK 2.6.2 D3D11, D3D10, D3D9, D3D8 pixel controls, x64 and x86 | Both frames read back with the expected centre pixel (`844c1cff`, then `1c4c84ff`) and no mismatches; every call returns `S_OK`; ps5vk logs a completed flip for each frame (`PS5VK_VIDEO_PRESENTED`, tokens 1 and 2) and no refusal |
 | ps5vk's `vkmap` probe, x86 | Two host-visible buffers map at 32-bit addresses (`0x818e0000`, `0x81900000`) through ps5vk's low CPU alias, and a 1,024-byte GPU copy between them has no mismatches |
 
+## Direct3D 12
+
+Direct3D 12 games use [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton)'s
+`d3d12` and `d3d12core` beside DXVK's `dxgi`, which makes their swapchain:
+
+```text
+game (PE) -> vkd3d-proton d3d12/d3d12core + DXVK dxgi (PE, system32) -> winevulkan.dll
+  -> winevulkan.prx -> win32u.prx -> libvulkan.prx (RADV) -> AGC and VideoOut
+```
+
+`tools/pw_install.py` installs them with `wine: {dxvk: true, vkd3d: true}`
+(3.0.1, pinned by hash) and sets `d3d12,d3d12core=n` in the registry and
+the profile. A 64-bit game's Vulkan calls take Wine's plain thunks; only
+32-bit games go through the command-stream batching.
+
+What vkd3d-proton gets from RADV, read from PS5_Mesa's source (PS5_Vulkan's
+pin `1ba9874f`) and vkd3d-proton 3.0.1's device setup:
+
+- **Feature level 11_1.** RADV reports sparse binding and residency but not
+  `shaderResourceResidency` or `residencyNonResidentStrict` (the PS5
+  winsys has no PRT, `has_sparse_prt=false`), so vkd3d-proton offers tiled
+  resources tier 1, and feature level 12_0 needs tier 2. A game that asks
+  `D3D12CreateDevice` for 11_0 or 11_1 gets a device; one that asks for
+  12_0 or later gets `E_INVALIDARG`. Its profile can set
+  `[debug] env = VKD3D_FEATURE_LEVEL=12_0` (or `12_1`): vkd3d-proton then
+  reports tier 2, which is safe only for a game that never uses tiled
+  resources, since RADV maps every unbound page to one shared block.
+  12_2 also needs variable-rate shading, which this GPU does not have.
+- Shader model 6.8, resource binding tier 3, ROVs and conservative
+  rasterization tier 3, DXR 1.1 (`VKD3D_CONFIG=nodxr` turns it off), mesh
+  shaders tier 1 (emulated by RADV), ExecuteIndirect without
+  device-generated commands. Timeline semaphores are Mesa's emulation, and
+  the compute queues share the graphics ring, so async compute does not
+  overlap.
+- The in-game menu and the FPS counter are drawn by DXVK's HUD (patch
+  0973), which a Direct3D 12 game, drawing through vkd3d-proton, does not
+  have.
+
+`tests/d3d12_control.c` is the check: a device at feature level 11_0, its
+highest feature level, shader model and tiers, then two frames on a
+1920x1080 flip-model swapchain, each cleared, drawn with shaders compiled
+on the spot (`d3dcompiler_47`), read back at the centre (the triangle) and a
+corner (the clear colour), and presented. `tests/test_d3d12_control.py`
+runs it under the host Wine with `PROSPERO_TEST_D3D12=1`: on an RTX 3060
+it reports feature level 12_2 and shader model 6.8 and passes. On the
+console it runs as a game, in a prefix `pw_install.py` set up with
+`wine: {dxvk: true, vkd3d: true}`; its result line reaches the log as
+`STDOUT`.
+
+Console result (2026-10-28, the runtime then installed, RADV 26.2.0):
+
+| Check | Result |
+| --- | --- |
+| Device at feature level 11_0 | `S_OK`, on vkd3d-proton's descriptor-buffer path with mutable descriptors |
+| Highest feature level, shader model | 11_1 (`0xb100`) and 6.8, as read from the source above |
+| Tiers | resource binding 3, tiled resources 1, ROVs, conservative rasterization 3, DXR 1.1; no mesh shaders (that runtime's RADV predates barycentrics) and no VRS |
+| Two frames, 1920x1080 flip-model swapchain | both drawn, read back (triangle `ffff0000`, corners `ff1c4c84` then `ff844c1c`) and presented `S_OK`; `KHR_present_wait` in use |
+| Run | no vkd3d-proton warning or error; the program exited and the title went back to the launcher |
+
 ## OpenGL
 
-The optional [PS5 OpenGL SDK](https://github.com/blackbearreloaded/ps5-opengl)
-provides the EGL implementation used by Wine's experimental WGL backend for
-Windows games that need OpenGL instead of Direct3D/DXVK. Build Wine with
-`tools/build_wine_ps5.sh --ps5-opengl-sdk DIR`, where `DIR` is the installed
-SDK prefix. The build links the SDK's static EGL archive into `win32u.prx` and
-resolves its EGL entry points there; without this option, the ordinary build
-remains unchanged.
+OpenGL games draw through Mesa's Zink, which runs OpenGL on top of the
+Vulkan driver. Mesa's Windows WGL frontend and Zink are built as Windows DLLs
+(`opengl32.dll`, `libgallium_wgl.dll`) by `tools/build_mesa_zink.sh` for both
+architectures, and the package carries them under `win/mesa-zink/`. A game
+with `graphics = opengl` gets its architecture's copy installed into its
+prefix before launch, native `opengl32`, and `GALLIUM_DRIVER=zink`. The
+OpenGL calls stay inside the game; only Zink's Vulkan calls cross to the
+Unix side, through the same command-stream batching as DXVK's, so a 32-bit
+OpenGL game runs on the native WoW64 CPU by default. Frames are presented
+through the Vulkan swapchain, so the pointer comes from VideoOut's hardware
+cursor (patch 0740), and the frame rate from Wine's `fps` channel.
 
-To select the backend for one game, set `graphics = opengl` in that game's
-application profile. This selects Wine's builtin `opengl32` and enables the
-PS5 EGL driver for that launch. DXVK and GDI profiles leave EGL initialization
-off. The published SDK 0.6.0 describes experimental OpenGL 4.6 Core support.
-[SDK PR #2](https://github.com/blackbearreloaded/ps5-opengl/pull/2) adds the
-compatibility features used by legacy WGL games; it has not yet been merged
-upstream. An SDK build from that PR rendered Half-Life's `c1a0` map with
-scripted movement and audio on the PS5. Official OpenArena 0.8.8 loaded at
-its fixed `0x00400000` base with the high-address title build, initialized
-`GL_RENDERER: PS5 AGC`, loaded `aggressor`, and ran a bot match.
+`graphics = zink`, the name this path had while it was opt-in, still works.
+Wine's builtin `opengl32` is still built: `wined3d`, which Wine's `d3d10.dll`
+imports even over DXVK, needs it to initialise, with no driver behind it.
 
-On 2026-10-01, one Wine runtime linked against the compatibility SDK and
-RADV ran both backends under their own profiles. OpenArena's profile selected
-`graphics = opengl`; its match produced 98 GPU-present intervals with no
-present failure, input rejection or rejected draw, and its game log recorded
-bots fighting (`ps5log/1` run `20261001T065158237Z`). Warcraft III's
-`graphics = dxvk` run reached its intro or menu on the TV, confirmed by the
-owner, with Vulkan presentation and audio (`20261001T064255256Z`). The
-combined build used `win32u.prx` SHA-256 `48c3a0a6…` and `libvulkan.prx`
-SHA-256 `89a3f17b…`. Wine's EGL driver is gated before initialization when
-`WINE_PS5_OPENGL` is absent; this prevents DirectDraw from probing EGL while
-Vulkan owns VideoOut. The normal
-non-scripted launcher built from the same source also opened its game list
-with VideoOut and pad input ready. These bounded runs restored the prior
-title files and profiles afterward. The SDK is GPL-3.0-or-later, so
-distributed builds must preserve its source and license notices.
-
-### Immediate-mode games
-
-Older OpenGL games draw with `glBegin`, one call per vertex attribute, and
-`glEnd`: Half-Life makes about 25,000 OpenGL calls and over a thousand
-`glBegin`/`glEnd` blocks a frame. Two things keep that fast on the console:
-
-- **Fewer crossings (patch 0720).** Every OpenGL call goes from the game's
-  side of Wine to the Unix side, which costs about 0.4 µs under WoW64.
-  `opengl32` records the calls that only feed vertices and current
-  attributes (`glBegin`, `glEnd`, `glVertex*`, `glTexCoord2f`, `glColor*`,
-  `glNormal3f`, `glMultiTexCoord2f`) in a per-thread buffer and replays them
-  in order with one crossing, before any other call. Its PE and Unix halves
-  must come from the same build, so the build makes `opengl32.dll` too.
-- **Fewer draws, in the SDK.** Mesa draws a run of `glBegin`/`glEnd`
-  primitives as one triangle list, and no longer splits that run when a game
-  switches the active texture unit around each polygon.
-
-On the console, these took Half-Life's `c1a0` from 12 fps to the display's
-60, with about a third of each frame left waiting for the next refresh.
-OpenGL games log their frame rate every five seconds (patch 0721):
-`PW_GL frames=300 fps=60.0`.
+Before Zink, OpenGL went through the PS5 OpenGL SDK (ps5-opengl), linked into
+`win32u.prx` behind Wine's EGL frontend (patches 0660–0662, 0720–0723). Every
+OpenGL call crossed to the Unix side, which on the native CPU costs about
+2.8 µs, so those games had to stay on the translator. That path is removed.
 
 The Vulkan controls above ran on one ps5vk SDK (`libps5vk.a` SHA-256
 `98f8a17c…`),
@@ -803,6 +905,88 @@ Imports bound only to the WebKit process's `libkernel_web` or
 too (`webkit_unbound`), and the build prints a warning for each module that
 has any.
 
+## TLS
+
+Wine's schannel is its GnuTLS backend (`dlls/secur32/schannel_gnutls.c`),
+and the PS5 build was configured `--without-gnutls`: every HTTPS request a
+program made through Windows' own networking failed with
+`SEC_E_SECPKG_NOT_FOUND` (Battle.net's client, through libcurl's schannel),
+and Wine logged `no schannel support`. `tools/build_tls_ps5.sh` cross-builds
+nettle 3.10.2 (with its own mini-gmp, so no GMP) and GnuTLS 3.8.13 (with its
+included libtasn1 and libunistring; no p11-kit, IDN, TPM, zlib, brotli or
+zstd) with the payload SDK into static archives under
+`.deps/wine-ps5/tls/root`, each tarball pinned by SHA-256; the SDK has no
+libm, so an empty one stands in for the `-lm` the builds ask, as the Wine
+build already does for win32u. The pins are the newest 3.8.x and 3.10.x:
+GnuTLS 3.8.10 to 3.8.13 fixed faults in certificate, extension and
+handshake parsing that a client reading an untrusted server's certificates
+is exposed to (CVE-2025-32988, CVE-2025-32989, CVE-2025-6395, the
+2026-04-29 set), so a bump of `GNUTLS_VERSION` and its SHA-256 is the
+answer to the next advisory. Both libraries are portable C: nettle without
+its assembler (`--disable-assembler`) and GnuTLS without hardware
+acceleration, so AES and the hashes run without AES-NI, and public-key
+arithmetic is nettle's mini-gmp (`--enable-mini-gmp`) instead of GMP,
+which nettle documents as slower and not side-channel silent. That is
+acceptable for a client that verifies the server's signatures and makes
+one key exchange per connection with ephemeral keys, and is to be
+revisited before the console serves TLS or holds a long-lived private
+key. GnuTLS's entropy is read from `/dev/urandom`, the one source its
+configure finds for this target (the payload SDK has no `getrandom`,
+`getentropy` or `KERN_ARND`; the libc's `arc4random` is not one GnuTLS
+knows); a title can open it, since handshakes complete on the console.
+Compression is not built. When the archives exist,
+`build_wine_ps5.sh` configures Wine with them (soname `libgnutls.so`, which
+`pw_wine_dl` loads as `libgnutls.prx`), builds `secur32.so`, and links two
+more modules: `libgnutls.prx` from the archives, exporting what
+`schannel_gnutls.c` and crypt32's `unixlib.c` load with dlsym (the list is
+read from the patched sources, so a patch that loads one more symbol
+exports it), with `wine/ps5/pw_gnutls_libc.c` for the `__assert`,
+`gmtime_r`, `getpwuid_r` and `thrd_exit` the system libraries lack and the
+SDK's emulated TLS; and `secur32.prx`. The report covers both. Without the
+TLS build Wine is configured `--without-gnutls`, as before; either way the
+configure arguments differ from the earlier series, so a build tree from
+before this change reconfigures and rebuilds once.
+
+**Trust.** crypt32 fills its root store from system paths a title cannot
+see, so it stayed empty. Patch 0878 reads `share/wine/ca-certificates.crt`
+beside the runtime first, found from `crypt32.prx`'s own path with
+`dladdr`, and logs an error if it is not there. The bundle is Mozilla's
+root store as curl publishes it, a dated file pinned by URL and SHA-256 in
+`build_tls_ps5.sh` (`cacert-2026-10-20.pem`, 118 roots), so a release
+carries the same roots whoever builds it; `PROSPERO_CA_BUNDLE` names
+another, and `SOURCES.txt` then records only its SHA-256. The pinned bundle
+ages with Mozilla's store (roots are added and withdrawn a few times a
+year), so a release bumps `CA_BUNDLE_DATE` and its SHA-256 to curl's
+current extract first, see [Making a release](DEVELOPMENT.md#making-a-release).
+`build_tls_ps5.sh`
+also stages the licence texts of what `libgnutls.prx` links, which
+`package_release.sh` ships under `LICENSES/gnutls` and `LICENSES/nettle`
+with the bundle's `LICENSES/MPL-2.0.txt` (THIRD_PARTY.md). Wine's schannel
+does not verify the peer's chain itself: the program does, through crypt32
+(`CertGetCertificateChain`), which is why Chromium (Battle.net's login page)
+refused every connection with `ERR_CERT_AUTHORITY_INVALID` until the store
+had roots, and why the console's clock matters: validation uses Windows
+time, the console's, and a date behind the certificates' makes every chain
+not yet valid while the handshake itself still completes.
+
+**Diagnostics.** Patch 0877 logs the GnuTLS code and message and the clock
+through the err channel when a handshake fails for a reason schannel does
+not map (`err:secur32:schan_handshake handshake failed: gnutls -NN (...),
+clock 2026-10-06 ...`), and the clock with a fatal alert; before, the
+caller saw `SEC_E_INTERNAL_ERROR` and `gnutls_perror` wrote to stderr.
+`GNUTLS_DEBUG_LEVEL` in the environment turns on GnuTLS's own log in both
+secur32 and crypt32. One Battle.net request in one console run failed with
+status `0x824200B0`, which is no `SEC_E` code and not what `schan_handshake`
+returns; the next such failure names its GnuTLS code, or shows that the
+status did not come from the handshake at all.
+
+**Console checks still open.** A validating client (Chromium) against a
+host with an untrusted root, `untrusted-root.badssl.com`, must be refused
+while a normal site passes, which shows the store is consulted and not only
+that handshakes complete; `PFXImportCertStore` (crypt32's GnuTLS side,
+PKCS#12), which this build turns on too; and a strict-validation run with
+the console's date checked.
+
 ## Data directory
 
 A title can write only its own `/download0` sandbox, where `/data` is absent,
@@ -819,6 +1003,19 @@ continuing. If elfldr or the helper does not complete successfully, the title
 logs the failure and returns to Home without loading profiles or starting
 Wine. Each launcher/game `LoadExec` process performs its own request through
 the same startup point.
+
+Some loaders show `/data` to every app without elevating it: ShadowMountPlus
+1.7beta4 mounts it into the sandbox, and PS5SXHelper's "mountroot" does the
+same. Such a title can `stat()` `/data` but gets `EPERM` from `lstat()` on
+every path, and Wine then exits in `server_init_process`. A `/data` that is
+already visible therefore counts as an existing grant only when `lstat()`
+works on it too (`lstat()` failing with `EPERM` is the only sign of "not
+elevated"); otherwise the title asks the helper as above and then waits for
+`lstat()` to work, not only for `/data` to be visible. If the helper refuses,
+or says yes but the title is still not elevated after the wait, the title keeps
+the visible `/data` and goes on as before (`data_mount data_before=1
+elevated_before=0 helper_completed=0` or `helper_completed=1 elevated_after=0`
+in the log).
 
 The title build fetches the helper and manifest from one pinned release of
 `mpereiraesaa/PS5-Lapy-JB-Daemon` every time: `lapy_release` in
@@ -886,27 +1083,25 @@ The title runs one game per process (`src/pw_wine_launch.h`):
   - `[display] show_fps` shows a frame-rate counter in the top-left corner,
     drawn by the game's own graphics backend. A DXVK game gets
     DXVK's counter (`DXVK_HUD=fps`). A `graphics = opengl` game gets Mesa's
-    (`GALLIUM_HUD=fps`), which appears once the PS5 OpenGL SDK draws Mesa's
-    HUD in the compatibility SDK candidate from PR #2. The published SDK
-    0.6.0 does not include that HUD. It's on by default; `show_fps = false`
-    turns it off;
-  - `[display] refresh = 120` asks the display for 120 Hz when the game uses
-    `graphics = opengl` (Wine patch 0722). It needs an OpenGL SDK built with
-    runtime display modes (`PS5_DYNAMIC_SCANOUT=1`), and a title that
-    declares 120 Hz output in `sce_sys/param.json`: `attribute3` bit `0x40`,
-    which this title sets; without it the console refuses 120 Hz. Measured
-    on FW 12.02: the title still starts at 60 Hz, and a game left at 60 stays
-    held to the display's refresh. Don't add bit `0x80000` as well (the SDK's
-    `native-display-metadata.py` sets both): with it, frames were no longer
-    paced at 60 Hz, which looks like variable refresh. A display without
-    120 Hz keeps presenting at 60. The default is 60. Half-Life at 1080p ran
-    at 93–98 fps with `refresh = 120`;
-  - `[display] opengl_thread = true` sets `PS5_GLTHREAD=1` for a
-    `graphics = opengl` game: Mesa's glthread then runs the game's OpenGL
-    calls on a worker thread, so the driver's per-draw work overlaps the
-    game's own. Counter-Strike 1.6 with nine bots kept more of each frame
-    free with it (the game thread waited 44–55% of the time at 60 fps,
-    against 11–25% without). It's off by default;
+    (`GALLIUM_HUD=simple,fps`), drawn by Zink. It's on by default;
+    `show_fps = false` turns it off. With `framegen` on, the counter is
+    frame generation's own instead (`PW_FRAMEGEN_HUD=1`), for any backend:
+    the game's frames and the pictures shown each second, `30 -> 60`;
+  - `[display] framegen = 2`, `3` or `4` (default `off`) sets `PW_FRAMEGEN`:
+    `libvulkan.prx` (`wine/ps5/pw_framegen.cpp`) gives the screen that many
+    pictures for each frame the game presents, the ones between made by
+    MihawkGen's neural interpolation (`third_party/mihawkgen`). It works
+    on any game that presents through Vulkan (DXVK, Zink or Vulkan itself),
+    adds extra images to the swapchain and forces FIFO, so the console's
+    60 Hz paces them: `2` takes a 30 fps game to 60. A game that already
+    presents 60 is slowed by it. The generated picture needs the next
+    frame, so the game's frames are shown about one frame later. Once a
+    second the log has `pw_framegen: N frames/s from the program, M
+    pictures/s presented`;
+  - `[display] refresh` and `opengl_thread` set the PS5 OpenGL SDK's output
+    rate and glthread worker. Zink has neither, so they are accepted for
+    existing profiles and ignored; the launcher logs
+    `PW_WINE64 ignored display refresh=… opengl_thread=…`;
   - `[input]` binds each DualSense button to a key or a mouse button, and a
     stick moves the pointer. `preset = <name>` shares a mapping from
     `<root>/input/<name>.input`.
@@ -915,6 +1110,19 @@ The title runs one game per process (`src/pw_wine_launch.h`):
     `winedebug = err+all,+seh` for one run. Only a channel list is taken
     (letters, digits and `_ + - , = .`), and the log names it
     (`PW_WINE64 winedebug=`). Change it and push the profile again.
+  - `[debug] env = NAME=VALUE` adds one variable to Wine's environment for
+    that game, up to five lines, for diagnostics such as
+    `env = PW_NATIVE_PROFILE=1` or `env = PW_VK_BATCH_STATS=1`. Names start
+    with `PW_`, `DXVK_`, `VKD3D_` (vkd3d-proton's, such as
+    `VKD3D_FEATURE_LEVEL=12_0`), `MESA_`, `GALLIUM_`, `ZINK_` (Zink's own
+    options, such as `ZINK_DESCRIPTORS=lazy`), `RADV_` or `VK_`; values take
+    letters, digits and `_ + - , . = : /`. A name the title sets itself is
+    refused, so these only add: `PW_VK_BATCH`, `PW_INPUT_SHARED_FAST`,
+    `PW_QPC_TSC_*`, `GALLIUM_DRIVER`, `DXVK_HUD` or `GALLIUM_HUD` while
+    `show_fps` is on (set `show_fps = false` to choose the HUD), and
+    `PW_FRAMEGEN` and `PW_FRAMEGEN_HUD` while `framegen` is on. The log
+    names them (`PW_WINE64 debug_env=`).
+    Titles built before the limit went up to five accept four lines.
   - `[runtime]` sets runtime behavior for that game only:
     - `thread_scheduling = true` sets `WINE_PS5_SCHED=1` (Wine patch 0882):
       the game's threads take turns on the CPUs, and threads the game raises
@@ -923,24 +1131,31 @@ The title runs one game per process (`src/pw_wine_launch.h`):
       to `true` (or `1`); the log shows it (`PW_WINE64 runtime`).
     - `cpu = native` or `cpu = translator` chooses a 32-bit game's CPU
       backend. Without it, a 32-bit game runs on the native WoW64 CPU
-      (`wow64native.dll`), unless its `[application]` says
-      `graphics = opengl`; those keep the translator (`wowprospero.dll`),
-      because every OpenGL call crosses from the game to the host one at a
-      time and a crossing costs about ten times more on the native CPU.
+      (`wow64native.dll`); `cpu = translator` selects `wowprospero.dll`.
       The native CPU always comes with the 32-bit Vulkan batching
-      (`PW_VK_BATCH=1`), which queues DXVK's Vulkan commands and sends them
-      to the host together. The launcher sets `WINE_PS5_WOW64_CPU`
+      (`PW_VK_BATCH=1`), which queues the Vulkan commands of DXVK and of
+      Zink (OpenGL games) and sends them to the host together. The launcher sets `WINE_PS5_WOW64_CPU`
       (Wine patch 0611) and copies the runtime's `wow64native.dll` into the
       prefix's `system32` when it is missing or differs; if that copy
       fails, the game runs on the prefix's own CPU. The log shows the
       choice (`PW_WINE64 cpu=native prefix_cpu=1`: copied, `0`: already
-      there, `-1`: not copied). 64-bit games never use the WoW64 CPU.
-    - `native_profile = true` is a targeted diagnostic for native WoW64.
-      It enables the per-thread watcher (`PW_NATIVE_WATCH=1`) and SIGPROF PC
-      sampler (`PW_NATIVE_PC=1`), reporting sampled native instruction
-      pointers for CPU-busy guest threads. Leave it off for ordinary runs: if
-      the PS4 signal bridge cannot safely handle the sample signal, Wine exits
-      the title rather than continuing with corrupted thread state.
+      there, `-1`: not copied). On a console where the native CPU does
+      not start (ntdll's readiness checks fail, patch 0883), the game runs
+      on the translator instead (Wine patch 0614; still with the batching).
+      64-bit games never use the WoW64 CPU.
+    - `shared_input = true` sets `PW_INPUT_SHARED_FAST=1` (Wine patch
+      0901): `GetKeyState` reads Wine's shared input memory in the game
+      instead of crossing to the host each time
+      ([shared-input-fastpath.md](shared-input-fastpath.md)). Off unless set.
+    - `fast_clock = true` lets `QueryPerformanceCounter` (and
+      `timeGetTime`) read the TSC in the game (Wine patch 0900,
+      [shared-clock-fastpath.md](shared-clock-fastpath.md)). The launcher
+      measures the TSC frequency twice against `CLOCK_MONOTONIC`, about
+      25 ms each, and sets `PW_QPC_TSC_VALIDATED=1` and `PW_QPC_TSC_HZ` only
+      when both measurements agree within 0.05% (`src/pw_tsc_calibrate.c`);
+      otherwise the game keeps Wine's normal counter. The log shows the
+      result (`PW_WINE64 fast_clock=on tsc_hz=... calibration=ok`). Off
+      unless set.
   - `mode = xinput` also makes the DualSense the game's XInput controller
     0 (see [XInput controller](#xinput-controller)).
     - Cross, Circle, Square and Triangle are A, B, X and Y. L1/R1 are the
@@ -956,7 +1171,7 @@ The title runs one game per process (`src/pw_wine_launch.h`):
       no pointer.
     - The game log's `PW_WINE64 display` line shows `xinput=1` when the
       runtime's ntdll has the gamepad slot.
-- **Closing.** Holding Options+Create for a second sends the game Alt+F4. When
+- **Closing.** Holding Options+Create for 3 s sends the game Alt+F4. When
   Wine exits, the title restarts into the launcher. If the game has not
   closed after 5 s, the title restarts into the launcher anyway.
 - **Unattended validation.** `-DPW_WINE64_SCRIPT=1` makes the launcher open
@@ -1039,10 +1254,33 @@ The runtime is staged beside the title:
   `getnameinfo` and `gethostbyname` in `libScePosixForWebKit`, which only
   the WebKit process gets, so in a title they stayed NULL and every lookup
   faulted (GTA IV, tens of thousands a minute). `wine/ps5/pw_ws2_32_libc.c`
-  provides them, with `gethostbyaddr` and `h_errno`. There is no DNS: they
-  answer numeric addresses, the wildcard and loopback addresses, and
-  `localhost` and the console's own host name (loopback); any other name is
-  not found, and a service must be a port number; and `crypt32.prx`, CryptoAPI's
+  provides them, with `gethostbyaddr` and `h_errno`. They answer numeric
+  addresses, the wildcard and loopback addresses, and `localhost` and the
+  console's own host name (loopback) themselves, and take a name with a dot
+  in it to the console's own resolver, libSceNet's (`sceNetResolverStartNtoa`
+  and `Ntoa6`, a pool and a resolver per lookup, as the payload SDK's libc
+  does, 5 s and two retries per attempt, so a lookup ends within 15 s per
+  address family; the AAAA question is only asked when IPv6 was asked for
+  or there was no A, and one address per family is returned, so a program
+  does not fail over between a host's several A records). `gethostname`
+  reports the stable name `PS5`, which resolves to loopback before any
+  resolver is reached: a game's probe of its own host name (GTA IV, tens
+  of thousands of times a minute) stays local and instant. Any other name
+  without a dot is not found at once: the computer name a prefix made on a
+  PC carries is one, and a router that resolved it would make the game
+  believe it is online. A dotted name the console did not know, or did not
+  answer for in time, is not found either, and is remembered for 5 s (16
+  names, per address family) so asking again does not block on another
+  lookup. DNS answers are not authenticated, as for any client on a LAN;
+  what a program then trusts rests on TLS validation, schannel's
+  (`secur32.prx`) with crypt32's root store, see [TLS](#tls). A service
+  must be a port number. `ws2_32.prx` therefore needs `libSceNet.sprx`;
+  `secur32.prx`, schannel's Unix side, with `libgnutls.prx`, GnuTLS and
+  nettle built by `tools/build_tls_ps5.sh` into static archives that the
+  module exports from (what `schannel_gnutls.c` and crypt32's `unixlib.c`
+  load with dlsym), and `share/wine/ca-certificates.crt`, the root
+  certificates crypt32 reads on the console (patch 0878); without the TLS
+  build, as before, there is no schannel; and `crypt32.prx`, CryptoAPI's
   Unix side, without which `crypt32.dll` refuses to load: FFmpeg's
   `avformat` imports it, so LAV Filters, the DirectShow splitter and
   decoders Warcraft III's cinematics play through, need it (the console's

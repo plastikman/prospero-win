@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Fri, 16 Oct 2026 12:00:00 +0000
+Subject: [PATCH] ntdll: Resolve names under a root directory on PS5.
+
+A name opened relative to a root directory (ObjectAttributes.RootDirectory)
+is looked up with openat() and fstatat() on the descriptor the server sent
+for that directory. A PS5 title cannot use the kernel's *at() calls, so the
+working-directory emulation resolves them from the path each descriptor was
+opened by; a descriptor received from the in-process server has no recorded
+path in ntdll, the lookup fails with EBADF and the open with
+STATUS_INVALID_HANDLE. .NET enumerates a directory tree this way, opening
+each subdirectory relative to its parent, so a recursive enumeration failed
+at the first subdirectory. On PS5, record the name the server opened the
+root directory with before looking a name up under it, for both lookups by
+name and by file id.
+---
+ dlls/ntdll/unix/file.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index ec35dea..48b58c3 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -2929,6 +2929,31 @@ static int enter_directory( HANDLE handle, int fd )
+ }
+ 
+ 
++#ifdef __PROSPERO__
++extern void pw_cwd_track( int fd, const char *absolute );
++#endif
++
++/***********************************************************************
++ *           track_root_directory
++ *
++ * Let the *at() calls resolve names relative to a root directory's descriptor.
++ */
++static void track_root_directory( HANDLE handle, int fd )
++{
++#ifdef __PROSPERO__
++    char *unix_name;
++
++    /* The descriptor came from the in-process server, so this module's
++     * working-directory emulation knows no path for it, and openat() or
++     * fstatat() relative to it fail with EBADF, which callers see as
++     * STATUS_INVALID_HANDLE: record the name the server opened it with. */
++    if (server_get_unix_name( handle, &unix_name )) return;
++    pw_cwd_track( fd, unix_name );
++    free( unix_name );
++#endif
++}
++
++
+ /******************************************************************************
+  *              NtQueryDirectoryFile   (NTDLL.@)
+  */
+@@ -3626,6 +3651,7 @@ static NTSTATUS file_id_to_unix_file_name( const OBJECT_ATTRIBUTES *attr, char *
+         goto done;
+     }
+ 
++    track_root_directory( attr->RootDirectory, root_fd );
+     fstat( root_fd, &root_st );
+     if (root_st.st_ino == file_id)  /* shortcut for "." */
+     {
+@@ -3987,6 +4013,7 @@ static NTSTATUS nt_to_unix_file_name( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *n
+         }
+         else
+         {
++            track_root_directory( attr->RootDirectory, root_fd );
+             status = lookup_unix_name( root_fd, attr, nt_name, 0, &unix_name, unix_len,
+                                        1, disposition, open_reparse, FALSE, 0 );
+             if (needs_close) close( root_fd );

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "../src/pw_game_profile.h"
+#include "../src/pw_wine_start.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,6 +21,88 @@ static int preset(const char *text, PwGameInput *input)
 
 enum { CROSS, CIRCLE, SQUARE, TRIANGLE, L1, R1, L2, R2, L3, R3, UP, DOWN, LEFT, RIGHT, OPTIONS,
        CREATE, TOUCHPAD };
+
+static void test_graphics_env(void)
+{
+    PwGameProfile p;
+    PwGameEnv env[PW_GAME_GRAPHICS_ENV_MAX], cpu[PW_GAME_CPU_ENV_MAX], runtime[PW_GAME_RUNTIME_ENV_MAX];
+    assert(parse(APP, &p) == PW_OK);
+    assert(pw_game_graphics_env(NULL, env) == 0 && pw_game_graphics_env(&p, NULL) == 0);
+    for (int graphics = PW_APP_GRAPHICS_AUTO; graphics <= PW_APP_GRAPHICS_ZINK; graphics++) {
+        for (int fps = 0; fps < 2; fps++) {
+            p.app.graphics = (PwAppGraphics)graphics; p.display.show_fps = fps;
+            p.display.refresh = 120; p.display.opengl_thread = 1;
+            p.runtime.thread_scheduling = 1; p.runtime.shared_input = 1; p.runtime.fast_clock = 1;
+            p.runtime.cpu = PW_GAME_CPU_NATIVE; /* worst-case explicit override */
+            size_t count = pw_game_graphics_env(&p, env);
+            assert(count <= PW_GAME_GRAPHICS_ENV_MAX);
+            /* Fixed6, desktop/override/XInput3, graphics, runtime, clock and CPU. */
+            assert(6 + 3 + count + pw_game_cpu_env(&p, cpu) + pw_game_runtime_env(&p.runtime, runtime) +
+                   PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX <= PW_WINE_START_MAX_ENV);
+            /* refresh and opengl_thread no longer set anything */
+            if (graphics == PW_APP_GRAPHICS_ZINK) {
+                assert(count == (size_t)(2 + fps));
+                assert(!strcmp(env[0].name, "GALLIUM_DRIVER") && !strcmp(env[0].value, "zink"));
+                assert(!strcmp(env[1].name, "PW_VK_DEFER_DESCRIPTORS") && !strcmp(env[1].value, "1"));
+                if (fps) assert(!strcmp(env[2].name, "GALLIUM_HUD"));
+            } else {
+                assert(count == (size_t)fps);
+                if (fps) assert(!strcmp(env[0].name, "DXVK_HUD"));
+            }
+        }
+    }
+    /* The menu is a DXVK HUD item beside or instead of the frame rate; Mesa's
+     * HUD has none. */
+    assert(parse(APP "[display]\nmenu = true\n", &p) == PW_OK && p.display.menu == 1 && p.display.show_fps == 1);
+    assert(pw_game_graphics_env(&p, env) == 1 && !strcmp(env[0].name, "DXVK_HUD") &&
+           !strcmp(env[0].value, "fps,menu"));
+    assert(parse(APP "[display]\nmenu = true\nshow_fps = false\n", &p) == PW_OK);
+    assert(pw_game_graphics_env(&p, env) == 1 && !strcmp(env[0].value, "menu"));
+    p.app.graphics = PW_APP_GRAPHICS_ZINK;
+    assert(pw_game_graphics_env(&p, env) == 2 && strcmp(env[1].name, "GALLIUM_HUD"));
+    assert(parse(APP "[display]\nmenu = false\n", &p) == PW_OK && p.display.menu == 0);
+    assert(pw_game_graphics_env(&p, env) == 1 && !strcmp(env[0].value, "fps"));
+    assert(parse(APP "[display]\nmenu = yes\n", &p) == PW_ERR_UNSUPPORTED);
+    assert(parse(APP "[display]\nmenu = true\nmenu = false\n", &p) == PW_ERR_MALFORMED);
+    /* A profile with the menu on cannot set the HUD variable itself. */
+    assert(parse(APP "[display]\nmenu = true\nshow_fps = false\n[debug]\nenv = DXVK_HUD=full\n", &p) ==
+           PW_ERR_UNSUPPORTED);
+    assert(parse(APP "[display]\nshow_fps = false\n[debug]\nenv = DXVK_HUD=full\n", &p) == PW_OK);
+    /* framegen: PW_FRAMEGEN for the Vulkan driver, any backend; show_fps
+     * becomes the generator's counter (PW_FRAMEGEN_HUD), not the backend's. */
+    assert(parse(APP "[display]\nshow_fps = false\n", &p) == PW_OK && p.display.framegen == 0);
+    assert(pw_game_graphics_env(&p, env) == 0);
+    assert(parse(APP "[display]\nframegen = off\nshow_fps = false\n", &p) == PW_OK && p.display.framegen == 0);
+    assert(pw_game_graphics_env(&p, env) == 0);
+    static const char *const factors[] = { "2", "3", "4" };
+    for (int f = 2; f <= 4; f++) {
+        char text[256];
+        snprintf(text, sizeof(text), APP "[display]\nframegen = %d\n", f);
+        assert(parse(text, &p) == PW_OK && p.display.framegen == (uint32_t)f);
+        assert(pw_game_graphics_env(&p, env) == 2);
+        assert(!strcmp(env[0].name, "PW_FRAMEGEN") && !strcmp(env[0].value, factors[f - 2]));
+        assert(!strcmp(env[1].name, "PW_FRAMEGEN_HUD") && !strcmp(env[1].value, "1"));
+    }
+    assert(parse(APP "[display]\nframegen = 4\nshow_fps = false\n", &p) == PW_OK);
+    assert(pw_game_graphics_env(&p, env) == 1 && !strcmp(env[0].value, "4"));
+    /* The menu stays DXVK's, without its frame rate. */
+    assert(parse(APP "[display]\nframegen = 2\nmenu = true\n", &p) == PW_OK);
+    assert(pw_game_graphics_env(&p, env) == 3 && !strcmp(env[0].name, "DXVK_HUD") &&
+           !strcmp(env[0].value, "menu") && !strcmp(env[1].name, "PW_FRAMEGEN") &&
+           !strcmp(env[2].name, "PW_FRAMEGEN_HUD"));
+    p.app.graphics = PW_APP_GRAPHICS_ZINK;
+    assert(pw_game_graphics_env(&p, env) == PW_GAME_GRAPHICS_ENV_MAX &&
+           !strcmp(env[0].name, "GALLIUM_DRIVER") && !strcmp(env[2].name, "PW_FRAMEGEN") &&
+           !strcmp(env[2].value, "2") && !strcmp(env[3].name, "PW_FRAMEGEN_HUD"));
+    /* A profile with framegen on cannot set PW_FRAMEGEN itself; without, it can. */
+    assert(parse(APP "[display]\nframegen = 3\n[debug]\nenv = PW_FRAMEGEN=2\n", &p) == PW_ERR_UNSUPPORTED);
+    assert(parse(APP "[display]\nframegen = 3\n[debug]\nenv = PW_FRAMEGEN_HUD=0\n", &p) == PW_ERR_UNSUPPORTED);
+    assert(parse(APP "[debug]\nenv = PW_FRAMEGEN=2\n", &p) == PW_OK && p.display.framegen == 0);
+    /* A Zink game's [debug] env decides the deferral itself: the title adds none. */
+    assert(parse(APP "[debug]\nenv = PW_VK_DEFER_DESCRIPTORS=0\n", &p) == PW_OK);
+    p.app.graphics = PW_APP_GRAPHICS_ZINK; p.display.show_fps = 0;
+    assert(pw_game_graphics_env(&p, env) == 1 && !strcmp(env[0].name, "GALLIUM_DRIVER"));
+}
 
 static void test_profile(void)
 {
@@ -94,21 +177,26 @@ static void test_cpu(void)
     assert(pw_game_cpu_env(&p, env) == 2);
     assert(!strcmp(env[0].name, "WINE_PS5_WOW64_CPU") && !strcmp(env[0].value, "wow64native.dll"));
     assert(!strcmp(env[1].name, "PW_VK_BATCH") && !strcmp(env[1].value, "1"));
-    assert(parse(APP_ARCH("pe32", "dxvk") "[runtime]\nnative_profile = true\n", &p) == PW_OK);
-    assert(pw_game_cpu_env(&p, env) == 4);
-    assert(!strcmp(env[2].name, "PW_NATIVE_WATCH") && !strcmp(env[2].value, "1"));
-    assert(!strcmp(env[3].name, "PW_NATIVE_PC") && !strcmp(env[3].value, "1"));
-    assert(parse(APP_ARCH("pe32", "dxvk") "[runtime]\ncpu = translator\nnative_profile = true\n", &p) == PW_OK);
-    assert(pw_game_cpu_env(&p, env) == 0); /* no native sampler on translator */
 
     assert(parse(APP_ARCH("pe32", "dxvk"), &p) == PW_OK && pw_game_cpu_native(&p) == 1);
     assert(parse(APP_ARCH("pe32", "auto"), &p) == PW_OK && pw_game_cpu_native(&p) == 1);
-    assert(parse(APP_ARCH("pe32", "opengl"), &p) == PW_OK && pw_game_cpu_native(&p) == 0);
-    assert(pw_game_cpu_env(&p, env) == 0);
+    /* OpenGL draws through Zink: native with the batching, like zink */
+    assert(parse(APP_ARCH("pe32", "opengl"), &p) == PW_OK && pw_game_cpu_native(&p) == 1);
+    assert(p.app.graphics == PW_APP_GRAPHICS_ZINK);
+    assert(pw_game_cpu_env(&p, env) == 2 && !strcmp(env[1].name, "PW_VK_BATCH"));
     assert(parse(APP_ARCH("pe64", "dxvk"), &p) == PW_OK && pw_game_cpu_native(&p) == 0);
 
+    assert(parse(APP_ARCH("pe32", "zink"), &p) == PW_OK && pw_game_cpu_native(&p) == 1);
+    assert(pw_game_cpu_env(&p, env) == 2 && !strcmp(env[1].name, "PW_VK_BATCH"));
+    assert(parse(APP_ARCH("pe64", "zink"), &p) == PW_OK && pw_game_cpu_env(&p, env) == 0);
+    assert(parse(APP_ARCH("pe32", "zink") "[runtime]\ncpu=translator\n", &p) == PW_OK &&
+           pw_game_cpu_env(&p, env) == 0);
+
     /* explicit choices override the default both ways */
-    assert(parse(APP_ARCH("pe32", "opengl") "[runtime]\ncpu = native\n", &p) == PW_OK);
+    assert(parse(APP_ARCH("pe32", "opengl") "[runtime]\ncpu = translator\n", &p) == PW_OK);
+    assert(p.runtime.cpu == PW_GAME_CPU_TRANSLATOR && pw_game_cpu_native(&p) == 0 &&
+           pw_game_cpu_env(&p, env) == 0);
+    assert(parse(APP_ARCH("pe32", "gdi") "[runtime]\ncpu = native\n", &p) == PW_OK);
     assert(p.runtime.cpu == PW_GAME_CPU_NATIVE && pw_game_cpu_native(&p) == 1 &&
            pw_game_cpu_env(&p, env) == 2);
     assert(parse(APP_ARCH("pe32", "dxvk") "[runtime]\nCPU = Translator\n", &p) == PW_OK);
@@ -136,17 +224,32 @@ static void test_runtime(void)
     assert(p.runtime.thread_scheduling == 1);
     assert(pw_game_runtime_env(&p.runtime, env) == 1);
     assert(!strcmp(env[0].name, "WINE_PS5_SCHED") && !strcmp(env[0].value, "1"));
-    assert(parse(APP "[runtime]\nnglide_resolution = desktop\nthread_scheduling = true\n", &p) == PW_OK);
-    assert(p.runtime.nglide_desktop_resolution && pw_game_runtime_env(&p.runtime, env) == 1);
     /* Among the other sections, in any case. */
     assert(parse(APP "[display]\nview = desktop\n[runtime]\nThread_Scheduling = 1\n"
                  "[debug]\nwinedebug = +seh\n", &p) == PW_OK);
     assert(p.runtime.thread_scheduling == 1);
     assert(p.display.view == PW_GAME_VIEW_DESKTOP && !strcmp(p.winedebug, "+seh"));
     /* Turned off explicitly: nothing reaches the environment. */
-    assert(parse(APP "[runtime]\nthread_scheduling = FALSE\nnglide_resolution = app\n", &p) == PW_OK);
+    assert(parse(APP "[runtime]\nthread_scheduling = FALSE\n", &p) == PW_OK);
     assert(!p.runtime.thread_scheduling && pw_game_runtime_env(&p.runtime, env) == 0);
     assert(pw_game_runtime_env(NULL, env) == 0 && pw_game_runtime_env(&p.runtime, NULL) == 0);
+
+    /* shared_input reaches Wine; fast_clock is only a flag, the title
+     * measures the TSC and sets the clock variables itself. */
+    assert(parse(APP, &p) == PW_OK && !p.runtime.shared_input && !p.runtime.fast_clock);
+    assert(parse(APP "[runtime]\nshared_input = true\n", &p) == PW_OK);
+    assert(p.runtime.shared_input == 1 && !p.runtime.fast_clock);
+    assert(pw_game_runtime_env(&p.runtime, env) == 1);
+    assert(!strcmp(env[0].name, "PW_INPUT_SHARED_FAST") && !strcmp(env[0].value, "1"));
+    assert(parse(APP "[runtime]\nfast_clock = 1\n", &p) == PW_OK);
+    assert(p.runtime.fast_clock == 1 && !p.runtime.shared_input && pw_game_runtime_env(&p.runtime, env) == 0);
+    assert(parse(APP "[runtime]\nfast_clock = false\nshared_input = 0\n", &p) == PW_OK);
+    assert(!p.runtime.fast_clock && !p.runtime.shared_input);
+    assert(parse(APP "[runtime]\nthread_scheduling = 1\nshared_input = 1\nfast_clock = true\ncpu = native\n",
+                 &p) == PW_OK);
+    assert(p.runtime.fast_clock && p.runtime.cpu == PW_GAME_CPU_NATIVE);
+    assert(pw_game_runtime_env(&p.runtime, env) == PW_GAME_RUNTIME_ENV_MAX);
+    assert(!strcmp(env[0].name, "WINE_PS5_SCHED") && !strcmp(env[1].name, "PW_INPUT_SHARED_FAST"));
 }
 
 static void test_refusals(void)
@@ -164,6 +267,11 @@ static void test_refusals(void)
         APP "[display]\nrefresh = 120\nrefresh = 60\n",         /* twice */
         APP "[display]\nopengl_thread = yes\n",                /* true or false only */
         APP "[display]\nopengl_thread = true\nopengl_thread = false\n", /* twice */
+        APP "[display]\nframegen = 1\n",                     /* off or 2..4 only */
+        APP "[display]\nframegen = 5\n",
+        APP "[display]\nframegen = on\n",
+        APP "[display]\nframegen =\n",
+        APP "[display]\nframegen = 2\nframegen = off\n",     /* twice */
         APP "[debug]\nwinedebug = +seh\n[debug]\n",            /* duplicate section */
         APP "[debug]\nwinedebug =\n",                         /* empty */
         APP "[debug]\nwinedebug = +seh;rm\n",                  /* not a channel list */
@@ -178,11 +286,14 @@ static void test_refusals(void)
         APP "[runtime]\nthread_scheduling = 2\n",
         APP "[runtime]\nthread_scheduling =\n",
         APP "[runtime]\nthread_scheduling = on\n",
-        APP "[runtime]\nnative_profile = maybe\n",
-        APP "[runtime]\nnative_profile = true\nnative_profile = false\n",
         APP "[runtime]\nthread_scheduling = 0\nthread_scheduling = 1\n",
-        APP "[runtime]\nnglide_resolution = 640x480\n",
-        APP "[runtime]\nnglide_resolution = app\nnglide_resolution = desktop\n",
+        APP "[runtime]\nshared_input = yes\n",                  /* true/false or 1/0 only */
+        APP "[runtime]\nshared_input =\n",
+        APP "[runtime]\nshared_input = 1\nshared_input = 0\n",   /* once */
+        APP "[runtime]\nfast_clock = on\n",
+        APP "[runtime]\nfast_clock = 2\n",
+        APP "[runtime]\nfast_clock = true\nfast_clock = true\n",
+        APP "[display]\nfast_clock = 1\n",                      /* another section's key */
         APP "[runtime]\ntrust_code_pages = 1\n",                /* unknown key */
         APP "[runtime]\ncpu = dbt\n",                           /* native or translator only */
         APP "[runtime]\ncpu =\n",
@@ -213,12 +324,6 @@ static void test_refusals(void)
         APP "[input]\nmouse_speed = fast\n",
         APP "[input]\nmouse_speed = 10\nmouse_speed = 10\n",
         APP "[input]\nmouse_speed = 1234567890\n",
-        APP "[input]\nkeyboard_stick = both_sticks\n",
-        APP "[input]\nstick_deadzone = 0\n",
-        APP "[input]\nstick_deadzone = 71\n",
-        APP "[input]\nstick_deadzone = 25\nstick_deadzone = 30\n",
-        APP "[input]\nstick_up = mouse_left\n",
-        APP "[input]\nstick_up = w\nstick_up = i\n",
         APP "[input]\ncross = space\ncross = enter\n",
         APP "[input]\ncross = hyperspace\n",
         APP "[input]\ncross = f0\n",
@@ -232,6 +337,9 @@ static void test_refusals(void)
         APP "[input]\npreset = a/b\n",
         APP "[input]\npreset =\n",
         APP "[input]\npreset = a\npreset = b\n",
+        APP "[input]\nplayer2 = P2\n",
+        APP "[input]\nplayer2 =\n",
+        APP "[input]\nplayer2 = a\nplayer2 = b\n",
         APP "[input]\npreset = 0123456789012345678901234567890123456789012345678901234567890123456789\n",
         APP "[input]\ncross space\n",
         APP "[input]\n = space\n",
@@ -272,8 +380,14 @@ static void test_presets(void)
     pw_game_input_overlay(&input, &overrides);
     assert(input.mouse_speed == 400);
 
+    /* A second pad's preset is named by the profile alone. */
+    assert(parse(APP "[input]\npreset = bomb\nplayer2 = bomb-p2\n", &p) == PW_OK);
+    assert(!strcmp(p.input.preset, "bomb") && !strcmp(p.input.player2, "bomb-p2"));
+    assert(parse(APP "[input]\npreset = bomb\n", &p) == PW_OK && !p.input.player2[0]);
+
     /* A preset holds only [input] and cannot chain another preset. */
     assert(preset("[input]\npreset = other\n", &input) == PW_ERR_MALFORMED);
+    assert(preset("[input]\nplayer2 = other\n", &input) == PW_ERR_MALFORMED);
     assert(preset("[display]\ndesktop = 800x600\n", &input) == PW_ERR_MALFORMED);
     assert(preset(APP, &input) == PW_ERR_MALFORMED);
     assert(preset("; nothing\n", &input) == PW_ERR_MALFORMED);
@@ -343,18 +457,6 @@ static void test_published_forms(void)
     PwGameProfile p;
     PwGameInput input;
 
-    assert(parse(APP "[input]\nkeyboard_stick = right_stick\nstick_deadzone = 30\n"
-                      "stick_up = i\nstick_down = k\nstick_left = j\nstick_right = l\n", &p) == PW_OK);
-    assert(p.input.keyboard_stick == PW_GAME_STICK_RIGHT && p.input.stick_deadzone == 30);
-    assert(p.input.stick_keys[0] == 'I' && p.input.stick_keys[1] == 'K' &&
-           p.input.stick_keys[2] == 'J' && p.input.stick_keys[3] == 'L');
-    pw_game_input_init(&input);
-    assert(preset("[input]\nstick_up = f\nkeyboard_stick = left_stick\n", &input) == PW_OK);
-    pw_game_input_overlay(&input, &p.input);
-    assert(input.keyboard_stick == PW_GAME_STICK_RIGHT && input.stick_deadzone == 30);
-    assert(input.stick_keys[0] == 'I' && input.stick_keys[1] == 'K' &&
-           input.stick_keys[2] == 'J' && input.stick_keys[3] == 'L');
-
     assert(parse(APP "\n[display]\ndesktop = 800x600\nscaling = fit\n\n[input]\npreset = pinball\n",
                  &p) == PW_OK);
     assert(!strcmp(p.app.id, "pinball") && !strcmp(p.input.preset, "pinball"));
@@ -395,16 +497,88 @@ static void test_published_forms(void)
     for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++) assert(input.bindings[i].kind == PW_GAME_BIND_UNSET);
 }
 
+/* [debug] env: extra diagnostics variables, only of the families graphics
+ * and the native CPU read, never one the title sets itself. */
+static void test_debug_env(void)
+{
+    PwGameProfile p;
+    PwGameEnv env[PW_GAME_DEBUG_ENV_MAX];
+
+    assert(parse(APP, &p) == PW_OK && p.debug_env_count == 0 && pw_game_debug_env(&p, env) == 0);
+    assert(parse(APP "[debug]\nwinedebug = +fps\nenv = PW_NATIVE_PROFILE=1\n"
+                 "env = PW_VK_BATCH_STATS=1\nenv = DXVK_LOG_PATH=C:/logs\nenv = MESA_LOADER_DRIVER_OVERRIDE=zink\n",
+                 &p) == PW_OK);
+    assert(!strcmp(p.winedebug, "+fps") && pw_game_debug_env(&p, env) == 4);
+    assert(!strcmp(env[0].name, "PW_NATIVE_PROFILE") && !strcmp(env[0].value, "1"));
+    assert(!strcmp(env[1].name, "PW_VK_BATCH_STATS") && !strcmp(env[1].value, "1"));
+    assert(!strcmp(env[2].name, "DXVK_LOG_PATH") && !strcmp(env[2].value, "C:/logs"));
+    assert(!strcmp(env[3].name, "MESA_LOADER_DRIVER_OVERRIDE") && !strcmp(env[3].value, "zink"));
+    assert(parse(APP "[debug]\nenv = RADV_DEBUG=nocache,hang\nenv = VK_LOADER_DEBUG=all\n"
+                 "env = GALLIUM_PRINT_OPTIONS=1\nenv = PW_VK_BATCH_MASK=0x7f\n", &p) == PW_OK);
+    assert(p.debug_env_count == 4 && !strcmp(p.debug_env[0].value, "nocache,hang"));
+    /* Zink's own options, for the OpenGL games it draws. */
+    assert(parse(APP "[debug]\nenv = ZINK_DESCRIPTORS=lazy\n", &p) == PW_OK);
+    assert(p.debug_env_count == 1 && !strcmp(p.debug_env[0].name, "ZINK_DESCRIPTORS") &&
+           !strcmp(p.debug_env[0].value, "lazy"));
+    /* vkd3d-proton's own options, the feature level a Direct3D 12 game
+     * insists on among them. */
+    assert(parse(APP "[debug]\nenv = VKD3D_FEATURE_LEVEL=12_0\nenv = VKD3D_CONFIG=nodxr\n", &p) == PW_OK);
+    assert(p.debug_env_count == 2 && !strcmp(p.debug_env[0].name, "VKD3D_FEATURE_LEVEL") &&
+           !strcmp(p.debug_env[0].value, "12_0") && !strcmp(p.debug_env[1].value, "nodxr"));
+    assert(parse(APP "[debug]\nenv = VKD3DX=1\n", &p) == PW_ERR_UNSUPPORTED);
+    /* A value may itself hold '=': only the first one splits. */
+    assert(parse(APP "[debug]\nenv = DXVK_CONFIG=d3d9.maxFrameRate=60\n", &p) == PW_OK);
+    assert(!strcmp(p.debug_env[0].name, "DXVK_CONFIG") && !strcmp(p.debug_env[0].value, "d3d9.maxFrameRate=60"));
+    /* Five lines fit at once: a config file path beside the profiler and timing diagnostics. */
+    assert(parse(APP "[debug]\nenv = DXVK_LOG_LEVEL=info\n"
+                 "env = DXVK_LOG_PATH=Z:/logs\nenv = DXVK_CONFIG_FILE=C:/Games/GTASA/dxvk.conf\n"
+                 "env = PW_VK_BATCH_STATS=1\nenv = PW_NATIVE_PROFILE=1\n", &p) == PW_OK);
+    assert(pw_game_debug_env(&p, env) == 5);
+    assert(!strcmp(env[0].name, "DXVK_LOG_LEVEL") && !strcmp(env[0].value, "info"));
+    assert(!strcmp(env[1].name, "DXVK_LOG_PATH") && !strcmp(env[1].value, "Z:/logs"));
+    assert(!strcmp(env[2].name, "DXVK_CONFIG_FILE") && !strcmp(env[2].value, "C:/Games/GTASA/dxvk.conf"));
+    assert(!strcmp(env[3].name, "PW_VK_BATCH_STATS") && !strcmp(env[3].value, "1"));
+    assert(!strcmp(env[4].name, "PW_NATIVE_PROFILE") && !strcmp(env[4].value, "1"));
+    /* The HUD variables only when show_fps does not set them already. */
+    assert(parse(APP "[debug]\nenv = DXVK_HUD=fps,gpuload\n", &p) == PW_ERR_UNSUPPORTED);
+    assert(parse(APP "[display]\nshow_fps = false\n[debug]\nenv = DXVK_HUD=fps,gpuload\n", &p) == PW_OK);
+    assert(!strcmp(p.debug_env[0].value, "fps,gpuload"));
+    assert(parse(APP "[debug]\nenv = GALLIUM_HUD=fps\n[display]\nshow_fps = true\n", &p) == PW_ERR_UNSUPPORTED);
+    /* Refused: names the title sets, other families, bad names and values,
+     * duplicates, a sixth line, empty or oversized parts. */
+    const char *refused[] = {
+        "env = PW_VK_BATCH=0\n", "env = PW_INPUT_SHARED_FAST=1\n", "env = PW_QPC_TSC_HZ=1\n",
+        "env = PW_QPC_TSC_VALIDATED=1\n", "env = GALLIUM_DRIVER=llvmpipe\n", "env = WINEDEBUG=+all\n",
+        "env = WINE_PS5_WOW64_CPU=wowprospero.dll\n", "env = LD_PRELOAD=/x\n", "env = SDL_X=1\n",
+        "env = pw_native_profile=1\n", "env = PW_X Y=1\n", "env = PW_X=a b\n", "env = PW_X=$HOME\n",
+        "env = PW_X=\n", "env = =1\n", "env = PW_X\n", "env = PW_X=1\nenv = PW_X=2\n",
+        "env = PW_A=1\nenv = PW_B=1\nenv = PW_C=1\nenv = PW_D=1\nenv = PW_E=1\nenv = PW_F=1\n",
+        "env = PW_" "0123456789012345678901234567890123456789012345=1\n",
+        "env = PW_X=" "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456\n",
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        char text[2048];
+        snprintf(text, sizeof(text), APP "[debug]\n%s", refused[i]);
+        assert(parse(text, &p) != PW_OK);
+    }
+    /* The title's environment has room for every profile variable at once. */
+    assert(PW_GAME_DEBUG_ENV_MAX == 5);
+    assert(7 + 3 + PW_GAME_GRAPHICS_ENV_MAX + PW_GAME_RUNTIME_ENV_MAX +
+           PW_GAME_CPU_ENV_MAX + PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX <= PW_WINE_START_MAX_ENV);
+}
+
 int main(void)
 {
+    test_graphics_env();
     test_published_forms();
     test_profile();
     test_runtime();
     test_cpu();
+    test_debug_env();
     test_refusals();
     test_presets();
     test_default_mode();
     printf("game profile passed: application plus display and input, every binding kind, "
-           "runtime settings and their environment, the CPU backend choice, refusals, shared presets overridden by the profile\n");
+           "runtime settings and their environment, the CPU backend choice, debug env variables, refusals, shared presets overridden by the profile\n");
     return 0;
 }

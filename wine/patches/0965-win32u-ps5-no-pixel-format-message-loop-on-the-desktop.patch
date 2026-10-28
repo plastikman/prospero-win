@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Fri, 16 Oct 2026 10:00:00 +0200
+Subject: [PATCH] win32u: Don't post a pixel format to the PS5's desktop.
+
+set_window_pixel_format() can't set a format on a window it holds no WND
+for, so it posts WM_WINE_SETPIXELFORMAT and lets the owner's thread set
+it. On a desktop Wine that owner is explorer. On the PS5 the server
+creates the desktop and nothing owns it, so the message comes back to
+this process, whose handler calls set_window_pixel_format() again, which
+posts the message again. The game's message loop never finds an empty
+queue: a black screen with one core busy (Syndicate).
+
+A game reaches this when it creates a Vulkan surface on the desktop
+window: vkCreateWin32SurfaceKHR() calls set_window_pixel_format() with
+-1 for every surface, so DXVK and Zink both hang. The desktop now keeps
+no format; get_window_pixel_format() already gives up on it.
+---
+
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -1734,6 +1734,11 @@ BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
+     if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS)
+     {
+         WARN( "setting format %d on win %p semi-stub!\n", format, hwnd );
++#ifdef WINE_PS5_USER_DRIVER
++        /* no explorer owns the server-created desktop: a message posted to
++         * it comes back to this process, lands here and is posted again */
++        if (win == WND_DESKTOP) return FALSE;
++#endif
+         NtUserPostMessage( hwnd, WM_WINE_SETPIXELFORMAT, format, internal );
+         return FALSE;
+     }
+-- 
+2.43.0

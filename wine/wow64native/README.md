@@ -82,20 +82,79 @@ and actual access-violation/illegal-instruction recovery through Win32 handlers
 before Minesweeper and the game sequence.
 
 
-Opt-in transition diagnostics use ABI version 3 (32-byte thread state).
-Set `PW_NATIVE_PROFILE=1` in the title environment to enable per-thread
+Opt-in transition diagnostics use ABI version 4 (32-byte thread state; the
+thread parameters carry the Windows thread id). Set `PW_NATIVE_PROFILE=1` in
+the title environment (a profile's `[debug] env`) to enable per-thread
 host/guest FS-switch counts and serialized TSC ticks around the `sysarch`
-call, plus aggregate Unix-call and syscall entry counts. Other values leave
-the profile pointer NULL. Rebuild the PE and Unix backend together; version 2
-modules cannot participate in the new contract.
+call, aggregate Unix-call and syscall entry counts, and the time each thread
+spends on the host side. Other values leave the profile pointer NULL, and
+every transition then pays only the NULL check. Rebuild the PE and Unix
+backend together; version 3 modules cannot participate in the new contract.
 
-`PW_NATIVE_PROFILE version=1` reports cumulative counters and the raw TSC
-at the first host-FS switch, every 262144 host switches thereafter, and on
-thread cleanup. The report runs only with host FS restored, inside the
-existing full register/flags/x87/SSE/YMM save. Guest-FS restoration never
-calls the reporter. The tick measurement excludes FP saving/restoring and
-logging; it includes timestamp/branch overhead and interruptions. Counter
-intervals must be aligned to actual gameplay and a console TSC calibration.
-Compare profile-off/on runs before attributing FPS changes. Counters are not
-per-opcode attribution or proof that FS alone explains a regression. No
-WRFSBASE fast path is enabled by these diagnostics.
+The host-side time runs from the end of a guest-to-host FS switch to the
+start of the next host-to-guest one, so it excludes both `sysarch` calls. It
+is filed by what entered the host: the Unix-call entry marks a stay as a
+Unix call, the syscall entry as a syscall, and the way back to the guest
+clears the mark; any other entry (exception dispatch, a callback's return)
+counts as other. A Unix call that calls back into the guest therefore splits:
+the part after the callback counts as a syscall.
+
+`PW_NATIVE_PROFILE version=2` reports, per thread:
+
+    PW_NATIVE_PROFILE version=2 tid=004c teb=7ffd0000 tsc=… tsc_hz=… host_calls=…
+      guest_calls=… host_sysarch_ticks=… guest_sysarch_ticks=… unix_calls=…
+      syscall_calls=… unix_host_ticks=… syscall_host_ticks=… other_host_ticks=…
+
+(one line). Counters are cumulative. A report is written at the first
+host-FS switch, every 262144 host switches, whenever two seconds of TSC time
+have passed since the thread's last report (checked at host switches), and
+on thread cleanup. `tsc_hz` is `PW_QPC_TSC_HZ` when the title measured it,
+otherwise a 20 ms measurement against `CLOCK_MONOTONIC` at process start;
+with neither, only the switch-count cadence applies. The report runs only
+with host FS restored, inside the existing full register/flags/x87/SSE/YMM
+save. Guest-FS restoration never calls the reporter. Tick measurements
+exclude FP saving/restoring and logging; they include timestamp/branch
+overhead and interruptions.
+
+The profile also measures the core clock: at process start and then about
+once a minute, from whichever thread reports first, a chain of 16M dependent
+1-cycle adds is timed with `CLOCK_MONOTONIC` (under 5 ms at 3.5 GHz, about
+10 ms at 1.6 GHz), and logged as
+
+    PW_NATIVE_PROFILE cpu_clock_mhz=3500 cpu=3 tid=004c
+
+`cpu` is RDTSCP's TSC_AUX (the CPU number where the kernel sets it); `tid` is
+0 for the startup measurement. The TSC runs at a fixed rate whatever the core
+does, so only this shows whether the game's cores run at full clock or in a
+lower power state. A thread preempted during the loop reads low; compare
+several samples.
+
+`tools/native_profile_split.py LOG [--from S] [--to S]` turns the first and
+last report of each thread in a window into shares of wall time: on the host
+in Unix calls, in syscalls (waiting included), other host time, the FS
+switches, and the remainder in guest code, with Unix calls and syscalls per
+second. DXVK's CS thread is the one with the highest Unix-call rate. Guest
+time includes any time the thread was descheduled while in guest code.
+Compare profile-off/on runs before attributing FPS changes; these counters
+are not per-opcode attribution. No WRFSBASE fast path is enabled by these
+diagnostics.
+
+The same switch also reports per frame. RADV's `libvulkan.prx` counts
+presents and, on each thread's first entry into the driver after a present,
+calls a frame hook with the present count and the TSC
+(`pw_vk_radv_profile_set_frame_hook`, wine/ps5/pw_vk_radv_profile.h). The
+Unix side looks that setter up by name at each report until the driver is
+loaded, installs its hook (logging `PW_NATIVE_PROFILE frame_hook=installed`),
+and the hook then writes, per thread and frame:
+
+    PW_NATIVE_PROFILE version=3 frame=1234 frames=1 tid=004c tsc=… tsc_hz=…
+      wall=… unix=… syscall=… other=… fs=… unix_calls=… syscall_calls=…
+
+(one line): the ticks since the thread's previous frame line, by bucket, with
+the guest share as the remainder of `wall`. `frame` is the present count the
+thread has just noticed and `frames` how many presents passed since its
+previous line, 1 when the thread entered the driver every frame. The hook runs
+inside a Unix call, so the stay that made it is still open: its ticks land in
+the next frame's line, an error of at most one call. Threads that never enter
+the driver, and 64-bit games, get no frame lines. `tools/native_profile_frames.py`
+joins these with the driver's own per-frame lines; see docs/cs-thread-profile.md.

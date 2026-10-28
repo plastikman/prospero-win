@@ -10,7 +10,7 @@ For portable code and documentation:
 
 ```sh
 sudo apt-get update
-sudo apt-get install build-essential clang git python3 python3-yaml gcc-mingw-w64-i686
+sudo apt-get install build-essential clang git python3 python3-yaml gcc-mingw-w64-i686 unzip
 python3 tools/check_setup.py
 make -j2 all
 make -j2 sanitize
@@ -91,6 +91,7 @@ are absent.
 
 ```sh
 tools/build_native.sh                     # the title: dist/PPSA99995/eboot.bin
+tools/build_tls_ps5.sh                    # GnuTLS and nettle for schannel (optional)
 tools/build_wine_ps5.sh --check-patches   # validate the Wine patch series
 tools/build_wine_ps5.sh                   # Wine's PRXs, fonts and report.json
 ```
@@ -134,7 +135,7 @@ hardware claim needs the exact artifacts and the title's `ps5log/1` records
 ## Packaging the app
 
 The folder a player uploads to `/data/homebrew` is the title with its Wine
-runtime beside it. `tools/package_release.sh` puts it together from four
+runtime beside it. `tools/package_release.sh` puts it together from these
 builds:
 
 ```sh
@@ -142,9 +143,12 @@ tools/build_native.sh                  # the title: dist/PPSA99995
 tools/build_wine_ps5.sh --radv <PS5_Vulkan checkout>   # Wine's PS5 modules, RADV
 tools/build_host_wine.sh               # the same Wine for the PC: its PE modules
 tools/build_wowprospero.sh             # the 32-bit CPU: wowprospero.dll
+tools/build_wow64native.sh ...         # the native WoW64 CPU (with its PS5 inputs)
+tools/build_mesa_zink.sh               # OpenGL: Mesa WGL/Zink, PE32 and PE64
 tools/package_release.sh --title dist/PPSA99995 --wine-ps5 .deps/wine-ps5 \
     --host-wine <host Wine install>/usr \
     --cpu-dll <Wine build>/dlls/wowprospero/x86_64-windows/wowprospero.dll \
+    --native-cpu <wow64native output> --mesa-zink <build_mesa_zink artifacts> \
     --lapy-release build/native/lapy-helper-release.json \
     --out release --zip
 ```
@@ -165,10 +169,34 @@ ship to the ones in this repository. `SOURCES.txt` records the source
 revision of each part, read from the builds themselves (the Wine build's
 `report.json` and the helper's `release.json`). Packaging stops if one of
 those is missing, or if `libvulkan.prx` is not the RADV build the notices
-describe. For an OpenGL package, pass `--ps5-opengl-sdk` the SDK that
-ps5-opengl's `make sdk` installed inside its own checkout
-(`build/sdk/ps5-opengl-gl46`), so the report can name the commit it was
-built from.
+describe. `--mesa-zink` is required: OpenGL games draw through it, and its
+manifest names the Mesa commit and compiler for `SOURCES.txt`
+([tools/build_mesa_zink.md](../tools/build_mesa_zink.md)).
+
+### Single-program titles
+
+The same title can be built to run one Windows program with no launcher,
+under its own name and icon on the home screen. `tools/build_native.sh` takes
+its identity from the environment:
+
+| Variable | What it sets |
+|---|---|
+| `PW_TITLE_ID` | the title ID (`AAAA00000`); `dist/` and the app folder are named after it |
+| `PW_TITLE_NAME` | the name on the home screen; the content ID is derived from it |
+| `PW_TITLE_ICON` | its 512x512 `icon0.png` |
+| `PW_DATA_ROOT` | its data under `/data` in place of `/data/prospero-win`: `profiles/`, `prefixes/`, `logs/` |
+| `PW_FIXED_PROFILE` | the id of the profile it runs |
+| `PW_LAPY_RELEASE`, `PW_LAPY_ELF_SHA256` | the `/data` helper built for that title ID: a helper serves one exact title, so another ID needs its own release |
+
+Started from the home screen, such a title starts its profile as the
+launcher would (`PW_WINE64 ... reason=fixed-profile`). Where the launcher
+title would go back to the launcher (the program ended, it did not close in
+time, it failed to start) it closes instead and the console returns home
+(`PW_WINE64 leave to=home`). Without the profile it logs
+`reason=no-fixed-profile` and closes. `tools/package_release.sh` names the
+app folder and zip after the title ID in `sce_sys/param.json`, and takes
+`--no-mesa-zink` in place of `--mesa-zink` for a program that does not draw
+with OpenGL.
 
 ## Making a release
 
@@ -184,7 +212,13 @@ tools/publish_release.sh --tag v0.1.0 --zip release/PPSA99995.zip --publish
 ```
 
 The zip is built on your machine because the PS5 builds need the payload SDK
-and take hours; GitHub only drafts the release and hosts the file.
+and take hours; GitHub only drafts the release and hosts the file. Before
+the PS5 build, bump `CA_BUNDLE_DATE` and `CA_BUNDLE_SHA256` in
+`tools/build_tls_ps5.sh` to curl's current extract of Mozilla's root store
+(<https://curl.se/docs/caextract.html>; the dated file and its SHA-256 are
+on that page), and check `GNUTLS_VERSION` and `NETTLE_VERSION` against
+their newest point releases: the roots a release trusts, and the TLS code
+behind them, are whatever was pinned when it was built.
 `publish_release.sh` uploads it as `prospero-win-<tag>.zip` with a
 `SHA256SUMS` file, and refuses a zip that holds a `dev.conf` or any `.exe`
 other than Wine's own programs, which sit beside its DLLs.

@@ -146,7 +146,7 @@ static const struct { uint32_t dualsense; uint16_t xinput; } pad_buttons[] = {
     { 0x4000u, 0x1000u }, { 0x2000u, 0x2000u }, { 0x8000u, 0x4000u }, { 0x1000u, 0x8000u },
     { 0x400u, 0x0100u }, { 0x800u, 0x0200u }, { 0x2u, 0x0040u }, { 0x4u, 0x0080u },
     { 0x10u, 0x0001u }, { 0x40u, 0x0002u }, { 0x80u, 0x0004u }, { 0x20u, 0x0008u },
-    { 0x8u, 0x0010u }, { 0x1u, 0x0020u }, { 0x100000u, 0x0400u },
+    { 0x8u, 0x0010u }, { 0x1u, 0x0020u },
 };
 
 /* One stick axis (0..255, 0x80 centred) as XInput's -32768..32767, centre
@@ -162,10 +162,17 @@ int pw_wine_game_pad(const PwPadPs5 *pad, PwWinePad *out)
 {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
-    if (!pad || !pad->core.connected) return 0;
+    /* While the system has the pad the controller stays connected, idle: a
+     * game told it was unplugged pauses or drops it (DuckStation did, and
+     * did not take it back). */
+    if (!pad || (!pad->core.connected && !pad->intercepted)) return 0;
     out->connected = 1;
+    if (pad->intercepted) return 1;
     for (size_t i = 0; i < sizeof(pad_buttons) / sizeof(pad_buttons[0]); i++)
         if (pad->core.previous_buttons & pad_buttons[i].dualsense) out->buttons |= pad_buttons[i].xinput;
+    /* The touchpad is two buttons: Back on its left half, so Select needs
+     * no Create (the system's capture button), Guide on its right. */
+    if (pad->core.previous_buttons & PW_PAD_PS5_TOUCHPAD) out->buttons |= pad->touch_left ? 0x0020u : 0x0400u;
     out->left_trigger = pad->l2;
     out->right_trigger = pad->r2;
     out->thumb_lx = pad_axis(pad->left_stick.x, 0);

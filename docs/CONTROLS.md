@@ -9,8 +9,9 @@ Plug them into the PS5 and they work in every game, alongside the
 controller. You can plug them in after the game has started; the app looks
 for them every few seconds. Keys reach the game just as they would on a PC,
 modifiers included (Ctrl, Shift, Alt, the Windows keys), and the mouse moves
-the same pointer the DualSense's stick does. The mouse wheel doesn't work
-yet.
+the same pointer the DualSense's stick does. The vertical mouse wheel is
+forwarded as Windows wheel input (one detent is 120 units). Horizontal scrolling and Logitech-specific gestures are not
+yet supported.
 
 ## The DualSense
 
@@ -86,9 +87,13 @@ Games from the Xbox 360 era and later read a controller through XInput. With
 | L3, R3 | stick clicks |
 | Options | Start |
 | Create | Back |
+| touchpad click, left half | Back |
+| touchpad click, right half | Guide (the Xbox button) |
 | sticks, d-pad | sticks, d-pad |
 
-Rumble works: the game's vibration drives the DualSense's motors. The
+The touchpad's left half gives Back without Create, whose press also opens
+the PS5's capture menu; the half is the one the click began on. Rumble
+works: the game's vibration drives the DualSense's motors. The
 `gamepad.input` preset is exactly this. You can still add button lines in an
 XInput preset to send keys as well.
 
@@ -110,12 +115,83 @@ preset instead. Keyboard and mouse input through DirectInput should work,
 since it comes from the same place as normal Windows input, but it hasn't
 been tested.
 
+### A second player
+
+A game that two people play on one PC keyboard, each with their own keys,
+can give the second player a DualSense too. The profile names a second
+keyboard preset in its `[input]` section:
+
+```ini
+[input]
+preset = atomic-bomberman
+player2 = atomic-bomberman-p2
+```
+
+The second DualSense has to be signed in as another PS5 user (a second
+account or a guest): the app opens the pad of a signed-in user other than
+the one who started it, and looks again every few seconds while there is
+none, so the second player can sign in after the game has started. With
+more users signed in, a pick that shows no controller for a few seconds,
+or loses it, makes way for the next user. Its buttons send keys through
+`player2`'s preset only: it never acts as an Xbox controller, the preset's
+mouse buttons and `mouse` stick are ignored, and closing the game with
+Options + Create stays the first player's.
+
 ## Closing a game
 
-Hold **Options + Create** for a second on the DualSense. The game is asked
+Hold **Options + Create** for three seconds on the DualSense (games use
+Start + Select together, so a short press never closes). The game is asked
 to close as with Alt+F4, and you return to the launcher; if it doesn't close
 within a few seconds, the app leaves it. From a keyboard, Alt+F4 or the
 game's own quit option do the same.
+
+## The in-game menu
+
+A profile with `menu = true` in its `[display]` section opens prospero-win's
+menu over the game when you press **L3 + R3** (both sticks) together. While
+it is open the game sees the DualSense idle: the d-pad moves the cursor,
+Cross picks a line and Circle or L3 + R3 closes it. Buttons still held as it
+closes stay away from the game until you let go of them. Closing the game
+with Options + Create works with the menu open.
+
+DXVK's HUD draws the menu, so it appears in Direct3D games only, and only
+with the DXVK build that has the `menu` item (`2.6.2-prospero3` and later;
+an older DXVK draws nothing, and the pad is still the menu's while it is
+open). Its lines are **Keyboard input**, which opens the console's keyboard
+(below), and **Close**.
+
+## The console's keyboard
+
+Click the touchpad with **two fingers** in a game and the PS5's own
+on-screen keyboard opens over it, the same one the console shows for a
+search box. Write with the DualSense or with a USB keyboard, accept, and
+the line is typed into the game as key presses, with Enter at the end — a
+chat line or a console command arrives as it would from a PC keyboard.
+Cancelling types nothing.
+
+The two-finger click never reaches the game, not even for a moment: the
+pad says how many fingers made a click in the click itself, so nothing
+has to wait for a second button, and a one-finger click is the game's as
+before (Back or Guide, or the preset's key). The game sees the DualSense
+idle while the keyboard is up, and the buttons still down when it closes
+stay away from it until you let go of them. A USB keyboard types into the
+console's keyboard while it is up, not into the game.
+
+The line is typed a key at a time, each held down for one tick (16 ms), so
+a game that reads its keyboard once a frame sees every key, and a letter
+typed twice in a row is let go in between: a 20-character line takes about
+a third of a second, the longest (255) about four. Characters a US
+keyboard has no key for (accents, for instance) are skipped: the rest of
+the line is still typed. The in-game menu's "Keyboard input" opens the same
+keyboard; it is shown only when the console's keyboard is available.
+
+The keyboard is the system's, drawn and driven by the console. Its module
+is loaded when the app starts (system modules have to be, before the app
+gets its data folder), and the log's `preload libSceImeDialog` line says
+how much flexible memory that took; the rest of the dialog's setup waits
+for the first time the keyboard is opened. A firmware that refuses it to
+this app leaves everything else as it is; the run's log says `osk=` and
+what the system answered.
 
 ## Writing a preset
 

@@ -6,15 +6,36 @@
  * (measured: GTA IV, tens of thousands of times a minute). gethostbyaddr and
  * h_errno are in no stub at all.
  *
- * A title has no DNS either, so these answer what needs no name server:
- * numeric addresses, the wildcard and loopback addresses, and "localhost"
- * and the console's own host name, both loopback. Any other name is
- * EAI_NONAME, including the computer name a prefix made on a PC carries:
- * resolving that name made GTA IV believe it was online and wait forever on
- * "Starting a new game" (measured), while the failure Wine reports for it
- * (one "Failed to resolve your host name IP" line per lookup) is what lets
- * the game carry on offline. There is no services database, so a service must be a port
- * number. gethostname, inet_pton and inet_ntop are the title's own.
+ * These answer what needs no name server themselves: numeric addresses,
+ * the wildcard and loopback addresses, and "localhost" and the local name
+ * PS5, both loopback. gethostname is this file's too and reports that
+ * stable name (the title's may return an empty one, which Wine would
+ * replace with the PC prefix's registry name), so a program that looks its
+ * own host up (GTA IV, tens of thousands of times a minute) is answered
+ * here, at once, and never reaches a resolver. A name with a dot in it
+ * goes to the console's own resolver, libSceNet's, the way the payload
+ * SDK's libc does it (a pool and a resolver per lookup; libSceNet is the
+ * title's, which ps5log already uses for its sockets), with a timeout and
+ * retries written down below so a lookup has a known upper bound:
+ * Battle.net's client, offline until then, resolved nothing ("Could not
+ * resolve host: account.battle.net"). Any other single-label name is
+ * EAI_NONAME at once, as every name was before: the computer name a prefix
+ * made on a PC carries is one, and resolving it, which a home router that
+ * answers for DHCP host names would, made GTA IV believe it was online and
+ * wait forever on "Starting a new game" (measured), while the failure Wine
+ * reports for it (one "Failed to resolve your host name IP" line per
+ * lookup) is what lets the game carry on offline. A dotted name the
+ * console did not know, or did not answer for in time (a timeout is
+ * EAI_NONAME too), is remembered for a few seconds so a program that asks
+ * again is answered at once instead of blocking on another lookup. There
+ * is no positive cache, and one address per family is returned, the one
+ * libSceNet gives, so a program does not fail over between a host's
+ * several A records. DNS answers are not authenticated, as for any client
+ * on a LAN: what a program then trusts comes from TLS validation
+ * (secur32.prx and crypt32's root store). There is no services database,
+ * so a service must be a port number. inet_pton and inet_ntop are the
+ * title's own. A successful local-address probe must still be checked
+ * against game loading, not just resolver unit tests.
  *
  * The host test builds this file with these names prefixed (Makefile), so
  * glibc's stay in place. */
@@ -22,52 +43,153 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
-#ifdef PW_PS4_DNS
-#include <ifaddrs.h>
-#include <net/if.h>
-#include <orbis/Net.h>
-#include <orbis/NetCtl.h>
-#include <pthread.h>
-#include <time.h>
-#endif
+#include "pw_ws2_32_resolver.h"
 
 /* getnameinfo's buffer sizes: size_t on FreeBSD, socklen_t in glibc. */
-#if defined(__GLIBC__) || defined(PW_PS4_DNS)
+#ifdef __GLIBC__
 typedef socklen_t pw_name_size;
 #else
 typedef size_t pw_name_size;
 #endif
 
-/* The PS4 PRX loader does not initialize C TLS for this helper object:
- * __tls_get_addr returned NULL on the first empty-hostname lookup, faulting
- * while pw_hostent populated its thread-local hostent. Keep this legacy
- * resolver state in static storage instead. Winsock's hostent APIs already
- * return storage that is overwritten by the next lookup. */
-#ifdef PW_PS4_DNS
-#define PW_WS2_THREAD_LOCAL
-#else
-#define PW_WS2_THREAD_LOCAL _Thread_local
-#endif
-
-static PW_WS2_THREAD_LOCAL int pw_h_errno;
+static _Thread_local int pw_h_errno;
 
 int *__h_errno(void)
 {
     return &pw_h_errno;
 }
 
-/* One answer: an address family and the address's bytes. */
-struct pw_address {
+/* One answer, struct pw_ws2_address: an address family and the address's
+ * bytes (pw_ws2_32_resolver.h, shared with the host test's backend). */
+
+#ifdef __PROSPERO__
+/* The console's resolver. libSceNet's declarations are not in the payload
+ * SDK's headers; these are the calls the payload SDK's libc makes. */
+int sceNetInit(void);
+int sceNetPoolCreate(const char *name, int size, int flags);
+int sceNetPoolDestroy(int pool);
+int sceNetResolverCreate(const char *name, int pool, int flags);
+int sceNetResolverDestroy(int resolver);
+int sceNetResolverStartNtoa(int resolver, const char *name, struct in_addr *address,
+                            int timeout_us, int retries, int flags);
+int sceNetResolverStartNtoa6(int resolver, const char *name, struct in6_addr *address,
+                             int timeout_us, int retries, int flags);
+
+/* One attempt waits this long, and is made this many more times: one
+ * question ends within 15 s, whatever the network does. A lookup asks for
+ * an A record, and for an AAAA only when IPv6 was asked for or there was no
+ * A (results are IPv4 first, and that is what a title's sockets use), so a
+ * name that has an address is answered within 15 s and one that has none
+ * within 30 s; either way the answer is one address per family, and a
+ * timeout is reported, and cached, as a name not found. */
+#define PW_RESOLVE_TIMEOUT_US 5000000
+#define PW_RESOLVE_RETRIES 2
+
+static int pw_console_resolve(const char *name, int family, struct pw_ws2_address answers[2], int *count)
+{
+    int pool, resolver, found = 0;
+
+    *count = 0;
+    /* Initialises libSceNet once; every later call returns SCE_NET_EBUSY,
+     * which is the expected answer here, so the result is not looked at. */
+    sceNetInit();
+    if ((pool = sceNetPoolCreate("prospero-win", 0x4000, 0)) < 0)
+        return EAI_FAIL;
+    if ((resolver = sceNetResolverCreate("prospero-win", pool, 0)) < 0) {
+        sceNetPoolDestroy(pool);
+        return EAI_FAIL;
+    }
+    if (family != AF_INET6) {
+        struct in_addr address;
+        if (sceNetResolverStartNtoa(resolver, name, &address, PW_RESOLVE_TIMEOUT_US, PW_RESOLVE_RETRIES, 0) >= 0) {
+            answers[found].family = AF_INET;
+            memcpy(answers[found].bytes, &address, sizeof(address));
+            found++;
+        }
+    }
+    if (family != AF_INET && !found) {
+        struct in6_addr address;
+        if (sceNetResolverStartNtoa6(resolver, name, &address, PW_RESOLVE_TIMEOUT_US, PW_RESOLVE_RETRIES, 0) >= 0) {
+            answers[found].family = AF_INET6;
+            memcpy(answers[found].bytes, &address, sizeof(address));
+            found++;
+        }
+    }
+    sceNetResolverDestroy(resolver);
+    sceNetPoolDestroy(pool);
+    *count = found;
+    return found ? 0 : EAI_NONAME;
+}
+
+int (*pw_ws2_32_resolve)(const char *, int, struct pw_ws2_address[2], int *) = pw_console_resolve;
+#else
+/* The host test installs a backend; without one every other name is unknown. */
+int (*pw_ws2_32_resolve)(const char *, int, struct pw_ws2_address[2], int *) = NULL;
+#endif
+
+static long long pw_monotonic_seconds(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec;
+}
+
+long long (*pw_ws2_32_now)(void) = pw_monotonic_seconds;
+
+/* The names the backend did not know, each for the family it was asked
+ * for, kept PW_WS2_32_NEGATIVE_SECONDS: a small table, the oldest entry
+ * replaced, under a lock since Winsock is called from any thread. */
+#define PW_NEGATIVE_SLOTS 16
+struct pw_negative {
+    char name[256];
     int family;
-    unsigned char bytes[sizeof(struct in6_addr)];
+    long long until;
 };
+static struct pw_negative pw_negatives[PW_NEGATIVE_SLOTS];
+static unsigned pw_negative_next;
+static pthread_mutex_t pw_negative_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int pw_negative_known(const char *name, int family)
+{
+    long long now = pw_ws2_32_now();
+    int known = 0;
+    unsigned i;
+
+    pthread_mutex_lock(&pw_negative_lock);
+    for (i = 0; i < PW_NEGATIVE_SLOTS; i++) {
+        if (pw_negatives[i].until > now && pw_negatives[i].family == family &&
+            !strcasecmp(pw_negatives[i].name, name)) {
+            known = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&pw_negative_lock);
+    return known;
+}
+
+static void pw_negative_remember(const char *name, int family)
+{
+    struct pw_negative *slot;
+
+    if (strlen(name) >= sizeof(slot->name))
+        return;
+    pthread_mutex_lock(&pw_negative_lock);
+    slot = &pw_negatives[pw_negative_next++ % PW_NEGATIVE_SLOTS];
+    strcpy(slot->name, name);
+    slot->family = family;
+    slot->until = pw_ws2_32_now() + PW_WS2_32_NEGATIVE_SECONDS;
+    pthread_mutex_unlock(&pw_negative_lock);
+}
 
 /* An addrinfo and everything it points to, freed in one piece. */
 struct pw_addrinfo {
@@ -76,93 +198,7 @@ struct pw_addrinfo {
     char name[];
 };
 
-#ifdef PW_PS4_DNS
-/* The PS4 title cannot use the WebKit-only POSIX resolver. Resolve A records
- * through libSceNet instead. Cache successful answers briefly and failures
- * for only a few seconds: THQNO polls repeatedly while it initializes, but a
- * transient DNS/network error must not permanently disable networking. */
-#define PW_DNS_CACHE_SIZE 8
-#define PW_DNS_POOL_SIZE (16 * 1024)
-#define PW_DNS_TIMEOUT_US 1000000
-
-struct pw_dns_cache_entry {
-    char name[256];
-    struct in_addr address;
-    time_t expires;
-    int result;
-    int valid;
-};
-
-static pthread_mutex_t pw_dns_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct pw_dns_cache_entry pw_dns_cache[PW_DNS_CACHE_SIZE];
-static unsigned int pw_dns_next_cache;
-static OrbisNetId pw_dns_pool = -1;
-
-static int pw_resolve_ipv4(const char *name, struct in_addr *address)
-{
-    OrbisNetInAddr resolved = {0};
-    OrbisNetId resolver;
-    time_t now = time(NULL);
-    int raw_result = 0, result = EAI_AGAIN;
-    char numeric[INET_ADDRSTRLEN] = "?";
-
-    pthread_mutex_lock(&pw_dns_lock);
-    for (unsigned int i = 0; i < PW_DNS_CACHE_SIZE; ++i) {
-        struct pw_dns_cache_entry *entry = &pw_dns_cache[i];
-
-        if (!entry->valid || strcasecmp(entry->name, name))
-            continue;
-        if (entry->result == 0 || now < entry->expires) {
-            result = entry->result;
-            if (!result)
-                *address = entry->address;
-            pthread_mutex_unlock(&pw_dns_lock);
-            return result;
-        }
-        entry->valid = 0;
-    }
-
-    if (pw_dns_pool < 0) {
-        pw_dns_pool = sceNetPoolCreate("wine-ws2-resolver", PW_DNS_POOL_SIZE, 0);
-        if (pw_dns_pool < 0) {
-            raw_result = pw_dns_pool;
-            goto cache_result;
-        }
-    }
-
-    resolver = sceNetResolverCreate("wine-ws2-resolver", pw_dns_pool, 0);
-    if (resolver < 0) {
-        raw_result = resolver;
-        goto cache_result;
-    }
-    raw_result = sceNetResolverStartNtoa(resolver, name, &resolved,
-                                         PW_DNS_TIMEOUT_US, 1, 0);
-    sceNetResolverDestroy(resolver);
-    if (!raw_result) {
-        memcpy(&address->s_addr, &resolved.s_addr, sizeof(address->s_addr));
-        result = 0;
-        inet_ntop(AF_INET, address, numeric, sizeof(numeric));
-    }
-
-cache_result:
-    {
-        struct pw_dns_cache_entry *entry = &pw_dns_cache[pw_dns_next_cache++ % PW_DNS_CACHE_SIZE];
-
-        snprintf(entry->name, sizeof(entry->name), "%s", name);
-        if (!result)
-            entry->address = *address;
-        entry->result = result;
-        entry->expires = now + (result ? 3 : 60);
-        entry->valid = 1;
-    }
-    fprintf(stderr, "PW_SCE_NET_DNS host=%s result=%d sce=%d ip=%s\n",
-            name, result, raw_result, numeric);
-    pthread_mutex_unlock(&pw_dns_lock);
-    return result;
-}
-#endif
-
-static socklen_t pw_sockaddr(struct sockaddr_storage *storage, const struct pw_address *address,
+static socklen_t pw_sockaddr(struct sockaddr_storage *storage, const struct pw_ws2_address *address,
                              unsigned short port)
 {
     memset(storage, 0, sizeof(*storage));
@@ -186,22 +222,29 @@ static socklen_t pw_sockaddr(struct sockaddr_storage *storage, const struct pw_a
     return sizeof(*in6);
 }
 
-/* "localhost" or the name gethostname reports. */
+/* The title's gethostname may return an empty name. Wine then substitutes
+ * the PC prefix's registry name for an empty lookup, which is not resolvable
+ * here. Keep the name returned by Winsock and our local resolver identical. */
+static const char pw_hostname[] = "PS5";
+
+int gethostname(char *name, size_t size)
+{
+    if (size < sizeof(pw_hostname)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(name, pw_hostname, sizeof(pw_hostname));
+    return 0;
+}
+
 static int pw_is_local_name(const char *name)
 {
-    char own[256];
-
-    if (!strcasecmp(name, "localhost"))
-        return 1;
-    if (gethostname(own, sizeof(own)))
-        return 0;
-    own[sizeof(own) - 1] = 0;
-    return own[0] && !strcasecmp(name, own);
+    return !strcasecmp(name, "localhost") || !strcasecmp(name, pw_hostname);
 }
 
 /* The addresses NODE stands for in FAMILY, IPv4 first: that is what a
  * title's sockets use. */
-static int pw_lookup(const char *node, int family, int flags, struct pw_address addresses[2], int *count)
+static int pw_lookup(const char *node, int family, int flags, struct pw_ws2_address addresses[2], int *count)
 {
     int wildcard = !node && (flags & AI_PASSIVE);
 
@@ -216,26 +259,21 @@ static int pw_lookup(const char *node, int family, int flags, struct pw_address 
             addresses[0].family = AF_INET6;
             return 0;
         }
-        if ((flags & AI_NUMERICHOST) || !node[0]) {
-#ifdef PW_PS4_DNS
-            if (!node[0])
-                fprintf(stderr, "PW_SCE_NET_DNS empty-name family=%d flags=%x result=%d\n",
-                        family, flags, EAI_NONAME);
-#endif
+        if (flags & AI_NUMERICHOST)
             return EAI_NONAME;
-        }
         if (!pw_is_local_name(node)) {
-#ifdef PW_PS4_DNS
-            struct in_addr resolved;
-
-            if (family == AF_INET6 || pw_resolve_ipv4(node, &resolved))
-                return family == AF_INET6 ? EAI_NONAME : EAI_AGAIN;
-            addresses[0].family = AF_INET;
-            memcpy(addresses[0].bytes, &resolved, sizeof(resolved));
+            int error;
+            /* Only a dotted name is asked of the resolver (see the top). */
+            if (!*node || !strchr(node, '.') || !pw_ws2_32_resolve)
+                return EAI_NONAME;
+            if (pw_negative_known(node, family))
+                return EAI_NONAME;
+            if ((error = pw_ws2_32_resolve(node, family, addresses, count)) || !*count) {
+                if (!error || error == EAI_NONAME)
+                    pw_negative_remember(node, family);
+                return error ? error : EAI_NONAME;
+            }
             return 0;
-#else
-            return EAI_NONAME;
-#endif
         }
     }
     *count = 0;
@@ -289,7 +327,7 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
 {
     static const struct addrinfo no_hints;
     struct pw_kind { int socktype, protocol; } kinds[2];
-    struct pw_address addresses[2];
+    struct pw_ws2_address addresses[2];
     struct addrinfo *head = NULL, **tail = &head;
     unsigned short port;
     int count, kind_count = 0, error;
@@ -399,11 +437,11 @@ int getnameinfo(const struct sockaddr *address, socklen_t length, char *host, pw
 /* The old resolver's single answer, in per-thread storage as FreeBSD's is. */
 static struct hostent *pw_hostent(const char *name, int family, const void *address, int length)
 {
-    static PW_WS2_THREAD_LOCAL struct hostent host;
-    static PW_WS2_THREAD_LOCAL char host_name[NI_MAXHOST];
-    static PW_WS2_THREAD_LOCAL char addresses[1][sizeof(struct in6_addr)];
-    static PW_WS2_THREAD_LOCAL char *address_list[2];
-    static PW_WS2_THREAD_LOCAL char *aliases[1];
+    static _Thread_local struct hostent host;
+    static _Thread_local char host_name[NI_MAXHOST];
+    static _Thread_local char addresses[1][sizeof(struct in6_addr)];
+    static _Thread_local char *address_list[2];
+    static _Thread_local char *aliases[1];
 
     snprintf(host_name, sizeof(host_name), "%s", name);
     memcpy(addresses[0], address, length);
@@ -418,49 +456,10 @@ static struct hostent *pw_hostent(const char *name, int family, const void *addr
     return &host;
 }
 
-static struct hostent *pw_local_hostent(void)
-{
-    OrbisNetCtlInfo info;
-    struct in_addr address = {0};
-    char numeric[INET_ADDRSTRLEN] = "127.0.0.1";
-    int result;
-
-    memset(&info, 0, sizeof(info));
-    result = sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_IP_ADDRESS, &info);
-
-    /* getifaddrs is absent in this title runtime: calling its unresolved
-     * import faults inside ws2_32. The title initializes NetCtl before Wine,
-     * so use the same console API that supplies GetAdaptersAddresses. */
-    if (result < 0 || !info.ip_address[0] ||
-        inet_pton(AF_INET, info.ip_address, &address) != 1) {
-        if (result < 0) {
-            (void)sceNetCtlInit();
-            memset(&info, 0, sizeof(info));
-            result = sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_IP_ADDRESS, &info);
-        }
-        if (result >= 0 && info.ip_address[0])
-            (void)inet_pton(AF_INET, info.ip_address, &address);
-    }
-
-    if (result < 0 || address.s_addr == htonl(INADDR_ANY)) {
-        address.s_addr = htonl(INADDR_LOOPBACK);
-        snprintf(numeric, sizeof(numeric), "127.0.0.1");
-    } else {
-        (void)inet_ntop(AF_INET, &address, numeric, sizeof(numeric));
-    }
-    fprintf(stderr, "PW_PS4_LOCAL_HOST result=%d source=%s ip=%s\n",
-            result, address.s_addr == htonl(INADDR_LOOPBACK) ? "loopback" : "netctl", numeric);
-    pw_h_errno = 0;
-    return pw_hostent("orbis", AF_INET, &address, sizeof(address));
-}
-
-struct hostent *pw_ps4_gethostbyname(const char *name)
+struct hostent *gethostbyname(const char *name)
 {
     struct addrinfo hints = {0}, *info;
     struct hostent *host;
-
-    if (!name || !name[0])
-        return pw_local_hostent();
 
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -475,16 +474,13 @@ struct hostent *pw_ps4_gethostbyname(const char *name)
     return host;
 }
 
-struct hostent *gethostbyname(const char *name)
-{
-    return pw_ps4_gethostbyname(name);
-}
-
 /* A reverse lookup through getnameinfo. */
 struct hostent *gethostbyaddr(const void *address, socklen_t length, int family)
 {
-    struct sockaddr_storage storage;
-    struct pw_address answer = { family, {0} };
+    /* Zeroed: pw_sockaddr() fills it while getnameinfo()'s arguments are
+     * evaluated, which Clang 21 cannot see (-Wuninitialized-const-pointer). */
+    struct sockaddr_storage storage = {0};
+    struct pw_ws2_address answer = { family, {0} };
     char name[NI_MAXHOST];
 
     if ((family != AF_INET || length != sizeof(struct in_addr)) &&

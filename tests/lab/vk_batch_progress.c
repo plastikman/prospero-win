@@ -1,4 +1,6 @@
-/* Actual PE gate/Win32 threads, mocked synchronous Unix/driver boundary. */
+/* Actual PE gate/Win32 threads, mocked synchronous Unix/driver boundary.
+ * Progress (wait/submit) and compile (pipeline creation) calls must run with
+ * the gate released while another thread records and flushes. */
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -14,6 +16,11 @@ static NTSTATUS mock_call(unsigned int,void *);
 #undef WINE_MESSAGE
 #define WINE_MESSAGE(...) fprintf(stderr,__VA_ARGS__)
 #include "pw_vk_batch_pe.c"
+/* raw_call reaches the Unix side through the present-interval wrapper
+ * (pw_vk_present_pe.c), which this test does not link: route it to the mock. */
+NTSTATUS pw_vk_present_call(unsigned int code,void *args){return mock_call(code,args);}
+void pw_vk_present_observe(unsigned int code,void *args,NTSTATUS status){(void)code;(void)args;(void)status;}
+void pw_vk_present_forget(void){}
 static HANDLE wait_entered,signal_seen;
 static unsigned wait_code,signal_code,trace[8],trace_count,replayed;
 static DWORD wait_result;
@@ -50,7 +57,10 @@ static void draw(unsigned n)
 }
 static DWORD WINAPI waiter(void *unused)
 {
- (void)unused;worker_status=pw_vk_batch_call(wait_code,wait_code==unix_vkQueuePresentKHR?&present_args:NULL);pw_vk_batch_thread_detach();return 0;
+ /* Compile calls are creators: the allocator guard reads their parameters, so
+  * they get a zeroed block (pAllocator NULL, as DXVK passes). */
+ static unsigned char compile_args[256];
+ (void)unused;worker_status=pw_vk_batch_call(wait_code,wait_code==unix_vkQueuePresentKHR?&present_args:pw_vk_stream_compile_call(wait_code)?(void *)compile_args:NULL);pw_vk_batch_thread_detach();return 0;
 }
 static DWORD WINAPI signaler(void *unused)
 {
@@ -58,7 +68,7 @@ static DWORD WINAPI signaler(void *unused)
 }
 int main(int argc,char **argv)
 {
- static const unsigned codes[]={unix_vkWaitForFences,unix_vkWaitSemaphores,unix_vkWaitSemaphoresKHR,unix_vkQueueWaitIdle,unix_vkDeviceWaitIdle,unix_vkAcquireNextImageKHR,unix_vkAcquireNextImage2KHR,unix_vkWaitForPresentKHR,unix_vkWaitForPresent2KHR,unix_vkGetQueryPoolResults,unix_vkAcquireProfilingLockKHR,unix_vkDeferredOperationJoinKHR,unix_vkLatencySleepNV,unix_vkLatencySleepLegacyNV,unix_vkQueueSubmit,unix_vkQueueSubmit2,unix_vkQueueSubmit2KHR,unix_vkQueueBindSparse,unix_vkQueuePresentKHR,unix_vkSignalSemaphore,unix_vkSignalSemaphoreKHR};
+ static const unsigned codes[]={unix_vkWaitForFences,unix_vkWaitSemaphores,unix_vkWaitSemaphoresKHR,unix_vkQueueWaitIdle,unix_vkDeviceWaitIdle,unix_vkAcquireNextImageKHR,unix_vkAcquireNextImage2KHR,unix_vkWaitForPresentKHR,unix_vkWaitForPresent2KHR,unix_vkGetQueryPoolResults,unix_vkAcquireProfilingLockKHR,unix_vkDeferredOperationJoinKHR,unix_vkLatencySleepNV,unix_vkLatencySleepLegacyNV,unix_vkQueueSubmit,unix_vkQueueSubmit2,unix_vkQueueSubmit2KHR,unix_vkQueueBindSparse,unix_vkQueuePresentKHR,unix_vkSignalSemaphore,unix_vkSignalSemaphoreKHR,unix_vkCreateGraphicsPipelines,unix_vkCreateComputePipelines,unix_vkCreateRayTracingPipelinesKHR,unix_vkCreateShadersEXT};
  VkInstance handle;VkInstanceCreateInfo info={0};struct vkCreateInstance_params create={0};unsigned i,pending;HANDLE a,b;BOOL stats;
  assert(argc==2);stats=!strcmp(argv[1],"stats");SetEnvironmentVariableA("PW_VK_BATCH","1");SetEnvironmentVariableA("PW_VK_BATCH_STATS",stats?"1":"0");create.pCreateInfo=&info;create.pInstance=&handle;assert(!pw_vk_batch_call(unix_vkCreateInstance,&create));assert(enabled&&negotiated);
  if(!strcmp(argv[1],"replay-failure")){
@@ -78,5 +88,6 @@ int main(int argc,char **argv)
  assert(present_args.result==VK_ERROR_DEVICE_LOST);assert(present==(stats?2:0));
  failing=TRUE;wait_code=unix_vkWaitForFences;draw(1);assert(pw_vk_batch_call(wait_code,NULL)==STATUS_NOT_SUPPORTED);assert(!depth);failing=FALSE;
  assert(!pw_vk_stream_progress_call(unix_vkDestroyDevice));assert(!pw_vk_stream_progress_call(unix_vkResetCommandBuffer));assert(!pw_vk_stream_progress_call(unix_vkCmdWaitEvents));
- printf("PASS 21 progress APIs pending/empty replay, concurrent signal and second replay, owned bytes, status/device-loss preservation, stats=%u\n",stats);return 0;
+ assert(!pw_vk_stream_compile_call(unix_vkCreateShaderModule));assert(!pw_vk_stream_compile_call(unix_vkCreatePipelineLayout));assert(!pw_vk_stream_compile_call(unix_vkDestroyPipeline));assert(!pw_vk_stream_compile_call(unix_vkCmdBindPipeline));
+ printf("PASS 21 progress and 4 compile APIs pending/empty replay, concurrent signal and second replay, owned bytes, status/device-loss preservation, stats=%u\n",stats);return 0;
 }

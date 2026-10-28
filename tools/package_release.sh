@@ -10,6 +10,7 @@
 #     win/wine/lib/wine/x86_64-windows/
 #     win/wine/lib/wine/x86_64-unix/*.prx       Wine's PS5 side
 #     win/wine/share/wine/nls/, fonts/
+#     win/mesa-zink/{i386,x86_64}-windows/      Mesa WGL/Zink: OpenGL
 #     LICENSE, THIRD_PARTY.md, LICENSES/       the licences of everything above
 #     SOURCES.txt                               the source revision of each part
 #
@@ -33,18 +34,27 @@
 #                    games run on by default.
 #   --lapy-release FILE  the release.json tools/build_native.sh saved for the
 #                    lapy.elf it fetched (build/native/lapy-helper-release.json).
-#   --out DIR        where PPSA99995/ is written (replaced).
-#   --zip            also write DIR/PPSA99995.zip.
+#   --mesa-zink DIR  tools/build_mesa_zink.sh's artifacts/ directory:
+#                    PE32/PE64 WGL/Zink, hashes and component licence texts.
+#                    OpenGL games draw through it (graphics = opengl). A
+#                    single-program title that does not use OpenGL may leave
+#                    it out with --no-mesa-zink.
+#   --out DIR        where the app folder is written (replaced), named after
+#                    the title's ID: PPSA99995/, or a single-program title's
+#                    (tools/build_native.sh, PW_TITLE_ID).
+#   --zip            also write DIR/<title ID>.zip.
 #
 # A game's prefix gets its own copy of wowprospero.dll from
 # tools/pw_prefix.py push --cpu-dll.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-title= wine_ps5= host_wine= cpu_dll= native_cpu= lapy_release= out= zip=0
+mesa_zink= no_mesa_zink=0 title= wine_ps5= host_wine= cpu_dll= native_cpu= lapy_release= out= zip=0
 fail() { echo "package_release: $*" >&2; exit 2; }
 while [ $# -gt 0 ]; do
     case $1 in
+    --mesa-zink) mesa_zink=$2; shift 2 ;;
+    --no-mesa-zink) no_mesa_zink=1; shift ;;
     --title) title=$2; shift 2 ;;
     --wine-ps5) wine_ps5=$2; shift 2 ;;
     --host-wine) host_wine=$2; shift 2 ;;
@@ -72,9 +82,31 @@ for file in LICENSE COPYING.LIB AUTHORS NOTICES.md; do
 done
 [ -f "$wine_ps5/freetype/src/docs/FTL.TXT" ] ||
     fail "--wine-ps5: no FreeType source (freetype/src/docs/FTL.TXT) in '$wine_ps5'"
+# A PS5 build with schannel (tools/build_tls_ps5.sh) carries the root
+# certificates and the licence texts of what libgnutls.prx links.
+tls=0
+if [ -f "$wine_ps5/prx/sce_module/libgnutls.prx" ]; then
+    tls=1
+    [ -f "$wine_ps5/prx/ca-certificates.crt" ] ||
+        fail "--wine-ps5: libgnutls.prx without prx/ca-certificates.crt in '$wine_ps5'"
+    for file in gnutls/COPYING.LESSERv2 nettle/COPYING.LESSERv3; do
+        [ -f "$wine_ps5/prx/licenses/$file" ] ||
+            fail "--wine-ps5: libgnutls.prx without prx/licenses/$file in '$wine_ps5'"
+    done
+fi
 [ -n "$out" ] || fail "--out DIR is required"
+if [ "$no_mesa_zink" = 1 ]; then
+    [ -z "$mesa_zink" ] || fail "--mesa-zink and --no-mesa-zink are exclusive"
+else
+    [ -n "$mesa_zink" ] || fail "--mesa-zink DIR is required: OpenGL games draw through Zink"
+    python3 "$root/tools/package_mesa_zink.py" "$mesa_zink" || fail "--mesa-zink: invalid artifact directory '$mesa_zink'"
+fi
 
-app=$out/PPSA99995
+# The app folder is named after the title's ID (sce_sys/param.json).
+title_id=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["titleId"])' "$title/sce_sys/param.json") ||
+    fail "--title: unreadable sce_sys/param.json"
+printf '%s\n' "$title_id" | grep -Eq '^[A-Z]{4}[0-9]{5}$' || fail "--title: bad title ID '$title_id'"
+app=$out/$title_id
 rm -rf "$app"
 mkdir -p "$app"
 # The title, without the builder's log destination.
@@ -97,7 +129,7 @@ for arch in i386-windows x86_64-windows; do
         esac
         cp "$file" "$lib/$arch/$name"
     done
-    # The PE modules the PS5 patches change (the xinput DLLs).
+    # The PE modules the PS5 patches change (PE_MODULES in build_wine_ps5.sh).
     if [ -d "$wine_ps5/pe/$arch" ]; then cp "$wine_ps5/pe/$arch"/*.dll "$lib/$arch/"; fi
 done
 cp "$cpu_dll" "$lib/x86_64-windows/wowprospero.dll"
@@ -111,9 +143,13 @@ cp "$wine_ps5"/prx/fonts/* "$share/fonts/"
 # loader refuses a PRX without it, so every executable module is 0755.
 chmod 755 "$app/eboot.bin"
 find "$app" -type f -name '*.prx' -exec chmod 755 {} +
+# The root certificates crypt32 reads on the console (patch 0878), when
+# the PS5 build has schannel.
+if [ "$tls" = 1 ]; then cp "$wine_ps5/prx/ca-certificates.crt" "$share/"; fi
 
 # The licences (THIRD_PARTY.md says which covers what): the project's own
-# texts, then Wine's and FreeType's from the sources that were built.
+# texts, then Wine's, FreeType's and, with schannel, GnuTLS's and nettle's
+# from the sources that were built.
 cp "$root/LICENSE" "$root/THIRD_PARTY.md" "$app/"
 cp -R "$root/LICENSES" "$app/LICENSES"
 mkdir -p "$app/LICENSES/wine/libs" "$app/LICENSES/freetype"
@@ -126,10 +162,14 @@ for file in "$wine_ps5"/source/libs/*/LICENSE* "$wine_ps5"/source/libs/*/COPYING
     cp "$file" "$app/LICENSES/wine/libs/$library/"
 done
 cp "$wine_ps5/freetype/src/LICENSE.TXT" "$wine_ps5/freetype/src/docs/FTL.TXT" "$app/LICENSES/freetype/"
+if [ "$tls" = 1 ]; then
+    cp -R "$wine_ps5/prx/licenses/gnutls" "$app/LICENSES/gnutls"
+    cp -R "$wine_ps5/prx/licenses/nettle" "$app/LICENSES/nettle"
+fi
 
 # SOURCES.txt: the revision of each part, from the build's own records.
 python3 - "$root" "$wine_ps5/report.json" "$lapy_release" "$app" <<'PY' || exit 2
-import json, re, subprocess, sys
+import hashlib, json, re, subprocess, sys
 from pathlib import Path
 root, report, lapy, app = Path(sys.argv[1]), json.loads(Path(sys.argv[2]).read_text()), \
     json.loads(Path(sys.argv[3]).read_text()), Path(sys.argv[4])
@@ -169,20 +209,43 @@ if vulkan:
               f"  linked by https://github.com/mpereiraesaa/PS5_Vulkan  commit {sources.get('ps5_vulkan') or 'not recorded'}",
               "  with the payload SDK and platform layer  https://github.com/mihawk-99/PS5_PayloadSDK"
               f"  commit {sources.get('radv_payload_sdk') or 'not recorded'}"]
-if sources.get("ps5_opengl_sdk"):
-    lines += ["OpenGL (in win32u.prx)  https://github.com/mpereiraesaa/ps5-opengl"
-              f"  commit {sources.get('ps5_opengl') or 'not recorded'}",
-              f"  SDK manifest SHA-256 {sources['ps5_opengl_sdk']}"]
+# schannel: the libraries libgnutls.prx links and the root certificates,
+# as tools/build_tls_ps5.sh pins them; the bundle staged is the pinned one
+# unless the build named another (PROSPERO_CA_BUNDLE), in which case only
+# its SHA-256 is known.
+bundle = app / "win/wine/share/wine/ca-certificates.crt"
+if (app / "win/wine/lib/wine/x86_64-unix/libgnutls.prx").exists():
+    tls = "build_tls_ps5.sh"
+    staged = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    pinned = pin(tls, "CA_BUNDLE_SHA256")
+    date = pin(tls, "CA_BUNDLE_DATE")
+    for name, url in (("GnuTLS", "GNUTLS_URL"), ("nettle", "NETTLE_URL")):
+        version = pin(tls, f"{name.upper()}_VERSION")
+        lines += [f"{name} {version} (libgnutls.prx)  "
+                  f"{pin(tls, url).replace(f'${name.upper()}_VERSION', version)}",
+                  f"  SHA-256 {pin(tls, f'{name.upper()}_SHA256')}"]
+    if staged == pinned:
+        lines += [f"Root certificates (share/wine/ca-certificates.crt)  "
+                  f"{pin(tls, 'CA_BUNDLE_URL').replace('$CA_BUNDLE_DATE', date)}",
+                  f"  SHA-256 {staged}"]
+    else:
+        lines += ["Root certificates (share/wine/ca-certificates.crt)  the builder's own bundle,"
+                  f" not curl's cacert-{date}.pem", f"  SHA-256 {staged}"]
 else:
-    lines += ["OpenGL  not included"]
+    lines += ["schannel (GnuTLS, nettle, root certificates)  not included"]
 (app / "SOURCES.txt").write_text("\n".join(lines) + "\n")
 PY
+
+if [ "$no_mesa_zink" = 0 ]; then
+    python3 "$root/tools/package_mesa_zink.py" "$mesa_zink" --app "$app" || fail 'Mesa packaging failed'
+fi
+
 
 files=$(find "$app" -type f | wc -l)
 size=$(du -sh "$app" | cut -f1)
 echo "package_release: $app: $files files, $size"
 if [ "$zip" = 1 ]; then
-    rm -f "$out/PPSA99995.zip"
-    ( cd "$out" && zip -qr PPSA99995.zip PPSA99995 )
-    echo "package_release: $out/PPSA99995.zip"
+    rm -f "$out/$title_id.zip"
+    ( cd "$out" && zip -qr "$title_id.zip" "$title_id" )
+    echo "package_release: $out/$title_id.zip"
 fi

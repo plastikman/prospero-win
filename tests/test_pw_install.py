@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -49,6 +51,104 @@ def pe(bits: int) -> bytes:
     return bytes(data)
 
 
+
+def mesa_pe(bits: int, dependency: str | None = None) -> bytes:
+    data = bytearray(1024); data[:2] = b"MZ"
+    struct.pack_into("<I", data, 60, 0x80); data[0x80:0x84] = b"PE\0\0"
+    struct.pack_into("<H", data, 0x84, 0x14c if bits == 32 else 0x8664)
+    struct.pack_into("<H", data, 0x94, 240)
+    optional = 0x98; directory = 96 if bits == 32 else 112
+    struct.pack_into("<H", data, optional, 0x10b if bits == 32 else 0x20b)
+    struct.pack_into("<I", data, optional + 60, len(data))
+    struct.pack_into("<I", data, optional + directory - 4, 16)
+    if dependency:
+        struct.pack_into("<II", data, optional + directory + 8, 0x200, 40)
+        struct.pack_into("<I", data, 0x20c, 0x260)
+        data[0x260:0x260 + len(dependency)] = dependency.encode()
+    return bytes(data)
+
+
+def fake_mesa(root: Path, runtime: bool = True) -> Path:
+    root.mkdir(); records = {}
+    for arch, bits in (("i386-windows", 32), ("x86_64-windows", 64)):
+        (root / arch).mkdir()
+        for name, dependency in (("opengl32.dll", "libgallium_wgl.dll"), ("libgallium_wgl.dll", "libc++.dll" if runtime else None), ("libc++.dll", None)):
+            data = mesa_pe(bits, dependency); path = root / arch / name; path.write_bytes(data)
+            records[arch + "/" + name] = {"sha256": hashlib.sha256(data).hexdigest(), "machine": 0x14c if bits == 32 else 0x8664, "imports": [dependency] if dependency else []}
+    (root / "manifest.json").write_text(json.dumps({"driver":"zink", "architectures":["i386-windows","x86_64-windows"], "mesa_commit":"1" * 40, "llvm_mingw_archive_sha256":"2" * 64, "files":records}))
+    return root
+
+
+def mesa_rehash(root: Path, relative: str) -> None:
+    manifest = json.loads((root / "manifest.json").read_text())
+    manifest["files"][relative]["sha256"] = hashlib.sha256((root / relative).read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest))
+
+
+def check_mesa() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        package = fake_mesa(root / "valid")
+        result = pw_install.mesa_provider(package)
+        assert set(result) == {"i386-windows", "x86_64-windows"}
+        assert all(len(x) == 3 for x in result.values())
+        # Section-backed PE32/PE64 import RVAs are mapped by raw extent.
+        for bits, machine in ((32,0x14c),(64,0x8664)):
+            path = root / f"section-{bits}.dll"
+            data = bytearray(mesa_pe(bits,"libgallium_wgl.dll"));directory=96 if bits==32 else 112
+            struct.pack_into("<H",data,0x86,1)
+            struct.pack_into("<I",data,0x98+60,0x200)
+            struct.pack_into("<II",data,0x98+directory+8,0x1000,40)
+            struct.pack_into("<III",data,0x188+12,0x1000,0x200,0x200)
+            struct.pack_into("<I",data,0x20c,0x1060);path.write_bytes(data)
+            assert pw_install.mesa_pe(path,machine)==["libgallium_wgl.dll"]
+            struct.pack_into("<I",data,0x20c,0x1300);path.write_bytes(data)
+            try: pw_install.mesa_pe(path,machine)
+            except pw_install.InstallError:pass
+            else:raise AssertionError("Unreadable section import accepted")
+        # Python IGNORECASE must not admit Unicode outliers rejected by native names.
+        for index, character in enumerate(("K", "İ", "ı", "ſ")):
+            package=fake_mesa(root / f"unicode-{index}")
+            relative="i386-windows/"+character+"compiler.dll";data=mesa_pe(32);(package/relative).write_bytes(data)
+            manifest=json.loads((package/"manifest.json").read_text())
+            manifest["files"][relative]={"sha256":hashlib.sha256(data).hexdigest(),"machine":0x14c,"imports":[]}
+            (package/"manifest.json").write_text(json.dumps(manifest))
+            try:pw_install.mesa_provider(package)
+            except pw_install.InstallError:pass
+            else:raise AssertionError("Unicode compiler name accepted")
+        for kind in ("hash", "machine", "missing", "runtime", "symlink", "unsafe", "unmanifested", "case-extra", "long-name", "imports", "name", "descriptors", "count"):
+            package = fake_mesa(root / kind)
+            path = package / "i386-windows/opengl32.dll"
+            manifest = json.loads((package / "manifest.json").read_text())
+            if kind == "hash": path.write_bytes(path.read_bytes() + b"changed")
+            elif kind == "machine":
+                data = bytearray(path.read_bytes()); struct.pack_into("<H",data,0x84,0x8664);path.write_bytes(data);mesa_rehash(package,"i386-windows/opengl32.dll")
+            elif kind in ("missing", "runtime"):
+                name = "libgallium_wgl.dll" if kind == "missing" else "libc++.dll"
+                (package / "i386-windows" / name).unlink(); del manifest["files"]["i386-windows/" + name]
+            elif kind == "symlink": path.unlink();path.symlink_to(package / "x86_64-windows/opengl32.dll")
+            elif kind == "unsafe": manifest["files"]["i386-windows/../escape.dll"] = manifest["files"].pop("i386-windows/opengl32.dll")
+            elif kind == "unmanifested": (package / "i386-windows/extra.dll").write_bytes(mesa_pe(32))
+            elif kind == "case-extra": (package / "i386-windows/OPENGL32.dll").write_bytes(mesa_pe(32))
+            elif kind == "long-name":
+                relative="i386-windows/"+"a"*124+".dll";data=mesa_pe(32);(package/relative).write_bytes(data)
+                manifest["files"][relative]={"sha256":hashlib.sha256(data).hexdigest(),"machine":0x14c,"imports":[]}
+            elif kind == "imports": manifest["files"]["i386-windows/opengl32.dll"]["imports"] = []
+            elif kind in ("name", "descriptors"):
+                data = bytearray(path.read_bytes())
+                if kind == "name": data[0x260:0x260+128] = b"x" * 128
+                else: struct.pack_into("<I",data,0x98+96+12,20)
+                path.write_bytes(data);mesa_rehash(package,"i386-windows/opengl32.dll")
+            elif kind == "count":
+                for index in range(30):
+                    name = f"extra{index}.dll";data=mesa_pe(32);(package / "i386-windows" / name).write_bytes(data)
+                    manifest["files"]["i386-windows/"+name]={"sha256":hashlib.sha256(data).hexdigest(),"machine":0x14c,"imports":[]}
+            if kind not in ("machine", "name", "descriptors"):
+                (package / "manifest.json").write_text(json.dumps(manifest))
+            try: pw_install.mesa_provider(package)
+            except pw_install.InstallError: pass
+            else: raise AssertionError("Accepted bad Mesa package: " + kind)
+
 def fake_dxvk(root: Path) -> tuple[Path, str]:
     archive = root / "dxvk.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
@@ -61,13 +161,53 @@ def fake_dxvk(root: Path) -> tuple[Path, str]:
     return archive, hashlib.sha256(archive.read_bytes()).hexdigest()
 
 
+def fake_vkd3d(root: Path) -> tuple[Path, str]:
+    archive = root / "vkd3d.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        for bits in ("x64", "x86"):
+            for dll in pw_install.VKD3D_PROTON_DLLS:
+                payload = f"{bits}/{dll}".encode()
+                info = tarfile.TarInfo(f"vkd3d-proton-9.9/{bits}/{dll}.dll")
+                info.size = len(payload)
+                tar.addfile(info, io.BytesIO(payload))
+    return archive, hashlib.sha256(archive.read_bytes()).hexdigest()
+
+
+def check_vkd3d_releases(root: Path) -> None:
+    url, digest = pw_install.vkd3d_proton_release("3.0.1")
+    assert url == ("https://github.com/HansKristian-Work/vkd3d-proton/releases/download/"
+                   "v3.0.1/vkd3d-proton-3.0.1.tar.zst")
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+    for version in ("3.0.2", "latest"):
+        try:
+            pw_install.vkd3d_proton_release(version)
+        except pw_install.InstallError as error:
+            assert f"vkd3d_version {version} is not pinned" in str(error)
+        else:
+            raise AssertionError(f"vkd3d_version {version!r} should not resolve")
+    # Release tarballs open plain, and zstd-compressed when a reader exists.
+    archive, _ = fake_vkd3d(root)
+    with pw_install.open_release_tar(archive) as tar:
+        assert tar.extractfile("vkd3d-proton-9.9/x64/d3d12.dll").read() == b"x64/d3d12"
+    if shutil.which("zstd"):
+        plain = root / "plain.tar"
+        with tarfile.open(plain, "w") as tar:
+            info = tarfile.TarInfo("vkd3d-proton-9.9/x86/d3d12core.dll")
+            info.size = 3
+            tar.addfile(info, io.BytesIO(b"abc"))
+        compressed = root / "plain.tar.zst"
+        subprocess.run(["zstd", "-q", "-f", str(plain), "-o", str(compressed)], check=True)
+        with pw_install.open_release_tar(compressed) as tar:
+            assert tar.extractfile("vkd3d-proton-9.9/x86/d3d12core.dll").read() == b"abc"
+
+
 SCRIPT = r"""
 name: Test Game
 game_slug: test-game
 runner: wine
 prospero:
-  display: {desktop: 1920x1080, scaling: fit, show_fps: true, refresh: 120, opengl_thread: true}
-  input: {preset: mouse}
+  display: {desktop: 1920x1080, scaling: fit, show_fps: true, framegen: 2, refresh: 120, opengl_thread: true}
+  input: {preset: mouse, player2: mouse-p2}
 script:
   game:
     exe: drive_c/Games/Test/game.exe
@@ -107,6 +247,14 @@ def check_dxvk_releases() -> None:
     assert url == ("https://github.com/mpereiraesaa/dxvk/releases/download/"
                    "v2.6.2-prospero1/dxvk-2.6.2-prospero1.tar.gz")
     assert digest == "72a4d7e279f522ad9bac420caf13665bcdd28b297337e1364c31c5bda24ef3f2"
+    url, digest = pw_install.dxvk_release("2.6.2-prospero2")
+    assert url == ("https://github.com/mpereiraesaa/dxvk/releases/download/"
+                   "v2.6.2-prospero2/dxvk-2.6.2-prospero2.tar.gz")
+    assert digest == "c00c1cd7df7ce70e89130b61c1fcd2d3a18ac473f274a219da4478147e4f3c90"
+    url, digest = pw_install.dxvk_release("2.6.2-prospero3")
+    assert url == ("https://github.com/mpereiraesaa/dxvk/releases/download/"
+                   "v2.6.2-prospero3/dxvk-2.6.2-prospero3.tar.gz")
+    assert digest == "e1596b4fd763c5f770634b133f798b5ef7df235cfbbbabc245050b4cca514d6b"
     # install_dxvk reads dxvk-<version>/x32 and x64 from an archive named
     # after the release, upstream's layout, which every pinned one follows.
     for version, (url, digest) in pw_install.DXVK_RELEASES.items():
@@ -120,15 +268,17 @@ def check_dxvk_releases() -> None:
             pw_install.dxvk_release(version)
         except pw_install.InstallError as error:
             assert f"dxvk_version {version} is not pinned" in str(error)
-            assert "'2.6.2-prospero1'" in str(error)
+            assert "'2.6.2-prospero1'" in str(error) and "'2.6.2-prospero2'" in str(error)
         else:
             raise AssertionError(f"dxvk_version {version!r} should not resolve")
 
 
 def main() -> int:
     check_dxvk_releases()
+    check_mesa()
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
+        check_vkd3d_releases(root)
         wine = root / "wine" / "wine"
         wine.parent.mkdir()
         wine.write_text(FAKE_WINE)
@@ -153,6 +303,9 @@ def main() -> int:
         pw_install.DOWNLOADS = root / "downloads"
         pw_install.DOWNLOADS.mkdir()
         os.link(archive, pw_install.DOWNLOADS / "dxvk-9.9.tar.gz")
+        vkd3d_archive, vkd3d_digest = fake_vkd3d(root)
+        pw_install.VKD3D_PROTON_RELEASES["9.9"] = ("file:///unused/vkd3d-proton-9.9.tar.gz", vkd3d_digest)
+        os.link(vkd3d_archive, pw_install.DOWNLOADS / "vkd3d-proton-9.9.tar.gz")
         script = root / "test.yml"
         script.write_text(SCRIPT)
         library = root / "library"
@@ -183,6 +336,7 @@ def main() -> int:
         assert '"d3d8"="native"' in registry and '"dxgi"="native"' in registry
         assert (prefix / "drive_c/windows/syswow64/d3d8.dll").read_bytes() == b"x32/d3d8"
         assert (prefix / "drive_c/windows/system32/d3d11.dll").read_bytes() == b"x64/d3d11"
+        assert "d3d12" not in registry and not (prefix / "drive_c/windows/system32/d3d12.dll").exists()
         assert "Height=1440" in (prefix / "drive_c/Games/Test/game.ini").read_text()
         assert not (library / ".cache" / "test-game").exists()
         profile = (library / "profiles" / "test-game.profile").read_text()
@@ -190,22 +344,45 @@ def main() -> int:
                      "working_directory = C:\\Games\\Test", "arguments = -window -opengl",
                      "dll_overrides = d3d8,d3d9,d3d10core,d3d11,dxgi,ddraw=n", "prefix = test-game",
                      "runtime = wine-wow64", "architecture = pe32", "graphics = dxvk",
-                     "[display]", "desktop = 1920x1080", "scaling = fit", "show_fps = true", "refresh = 120", "opengl_thread = true", "[input]", "preset = mouse"):
+                     "[display]", "desktop = 1920x1080", "scaling = fit", "show_fps = true", "framegen = 2", "refresh = 120", "opengl_thread = true", "[input]", "preset = mouse", "player2 = mouse-p2"):
             assert line in profile.splitlines(), (line, profile)
 
         # A PS5 backend choice overrides Lutris's DXVK setting for this game.
+        # OpenGL draws through Zink, so it needs the Mesa package.
+        mesa = fake_mesa(root / "mesa")
+        # vkd3d-proton adds Direct3D 12 on top of DXVK, and only on top of it.
+        vkd3d_script = root / "vkd3d.yml"
+        vkd3d_script.write_text(SCRIPT.replace('dxvk_version: "9.9"',
+                                               'dxvk_version: "9.9"\n    vkd3d: true\n    vkd3d_version: "9.9"'))
+        vkd3d_args = [str(vkd3d_script), "--library", str(library), "--wine", str(wine),
+                      "--file", f"setup={setup}", "--input", "LANG=en"]
+        assert pw_install.main(vkd3d_args + ["--slug", "vkd3d-game"]) == 0
+        vkd3d_prefix = library / "prefixes" / "vkd3d-game"
+        vkd3d_registry = (vkd3d_prefix / "user.reg").read_text()
+        assert '"d3d12"="native"' in vkd3d_registry and '"d3d12core"="native"' in vkd3d_registry
+        assert (vkd3d_prefix / "drive_c/windows/system32/d3d12.dll").read_bytes() == b"x64/d3d12"
+        assert (vkd3d_prefix / "drive_c/windows/syswow64/d3d12core.dll").read_bytes() == b"x86/d3d12core"
+        assert "dxgi,d3d12,d3d12core,ddraw=n" in (library / "profiles" / "vkd3d-game.profile").read_text()
+        no_dxvk = root / "vkd3d-no-dxvk.yml"
+        no_dxvk.write_text(vkd3d_script.read_text().replace("dxvk: true", "dxvk: false"))
+        assert pw_install.main([str(no_dxvk)] + vkd3d_args[1:] + ["--slug", "vkd3d-no-dxvk"]) == 1
         opengl_script = root / "opengl.yml"
         opengl_script.write_text(SCRIPT.replace("  display:", "  graphics: opengl\n  display:", 1)
                                  .replace("overrides: {ddraw.dll: n}",
                                           "overrides: {ddraw.dll: n, opengl32.dll: n}"))
-        assert pw_install.main([str(opengl_script), "--library", str(library), "--wine", str(wine),
-                                "--slug", "opengl-game", "--file", f"setup={setup}"]) == 0
+        opengl_args = [str(opengl_script), "--library", str(library), "--wine", str(wine),
+                       "--file", f"setup={setup}"]
+        assert pw_install.main(opengl_args + ["--slug", "opengl-no-mesa"]) == 1
+        assert not (library / "prefixes" / "opengl-no-mesa").exists()
+        assert pw_install.main(opengl_args + ["--slug", "opengl-game", "--mesa-zink", str(mesa)]) == 0
         opengl_prefix = library / "prefixes" / "opengl-game"
         opengl_profile = (library / "profiles" / "opengl-game.profile").read_text()
         assert "graphics = opengl" in opengl_profile.splitlines()
         assert "d3d8=n" not in opengl_profile
-        assert "opengl32=b" in opengl_profile
-        assert "opengl32=n" not in opengl_profile
+        assert "opengl32=n" in opengl_profile
+        assert "opengl32=b" not in opengl_profile
+        assert (opengl_prefix / "drive_c/windows/syswow64/opengl32.dll").read_bytes() == \
+            (mesa / "i386-windows/opengl32.dll").read_bytes()
         assert not (opengl_prefix / "drive_c/windows/syswow64/d3d8.dll").exists()
         assert '"d3d8"="native"' not in (opengl_prefix / "user.reg").read_text()
 
@@ -218,11 +395,68 @@ def main() -> int:
         assert "graphics = dxvk" in (library / "profiles" / "forced-dxvk.profile").read_text()
         assert (forced_prefix / "drive_c/windows/syswow64/d3d8.dll").read_bytes() == b"x32/d3d8"
 
+        # framegen: off arrives from YAML as false and is written as off.
+        off_script = root / "framegen-off.yml"
+        off_script.write_text(SCRIPT.replace("framegen: 2", "framegen: off", 1))
+        assert pw_install.main([str(off_script), "--library", str(library), "--wine", str(wine),
+                                "--slug", "framegen-off", "--file", f"setup={setup}"]) == 0
+        assert "framegen = off" in (library / "profiles" / "framegen-off.profile").read_text().splitlines()
+
         invalid_script = root / "invalid-graphics.yml"
         invalid_script.write_text(SCRIPT.replace("  display:", "  graphics: metal\n  display:", 1))
         assert pw_install.main([str(invalid_script), "--library", str(library), "--wine", str(wine),
                                 "--slug", "invalid-graphics", "--file", f"setup={setup}"]) == 1
         assert not (library / "prefixes" / "invalid-graphics").exists()
+
+        # Explicit local Zink packages install only the game's architecture.
+        zink_script = root / "zink.yml"
+        zink_script.write_text(SCRIPT.replace("  display:", "  graphics: zink\n  display:", 1))
+        zink_args = [str(zink_script), "--library", str(library), "--wine", str(wine), "--file", f"setup={setup}"]
+        assert pw_install.main(zink_args + ["--slug", "zink-missing"]) == 1
+        assert not (library / "prefixes/zink-missing").exists()
+        assert pw_install.main(common + ["--slug", "unused-mesa", "--mesa-zink", str(mesa)]) == 1
+        assert not (library / "prefixes/unused-mesa").exists()
+        for bits, folder, other in ((32,"syswow64","system32"), (64,"system32","syswow64")):
+            setup.write_bytes(pe(bits));slug = f"zink-{bits}"
+            assert pw_install.main(zink_args + ["--slug",slug,"--mesa-zink",str(mesa)]) == 0
+            win = library / "prefixes" / slug / "drive_c/windows"
+            arch = "i386-windows" if bits == 32 else "x86_64-windows"
+            for name in ("opengl32.dll","libgallium_wgl.dll","libc++.dll"):
+                assert (win/folder/name).read_bytes() == (mesa/arch/name).read_bytes()
+                assert not (win/other/name).exists()
+            assert not (win/folder/"d3d9.dll").exists()
+            profile = (library/"profiles"/(slug+".profile")).read_text()
+            # zink is the older name for opengl
+            assert "graphics = opengl" in profile and "opengl32=n" in profile
+            assert '\"opengl32\"=\"native\"' in (library/"prefixes"/slug/"user.reg").read_text()
+        setup.write_bytes(pe(32))
+        # Conflicting case/grouped overrides are rejected before creating a prefix.
+        conflict = root / "zink-conflict.yml"
+        conflict.write_text(zink_script.read_text().replace("overrides: {ddraw.dll: n}", "overrides: {\"ddraw,OPENGL32.dll\": b}"))
+        assert pw_install.main([str(conflict),"--library",str(library),"--wine",str(wine),"--slug","zink-conflict","--mesa-zink",str(mesa)]) == 1
+        assert not (library/"prefixes/zink-conflict").exists()
+        conflict.write_text(zink_script.read_text().replace("overrides: {ddraw.dll: n}", "overrides: {\"ddraw, OPENGL32.dll\": b}"))
+        assert pw_install.main([str(conflict),"--library",str(library),"--wine",str(wine),"--slug","zink-space-conflict","--mesa-zink",str(mesa)]) == 1
+        assert not (library/"prefixes/zink-space-conflict").exists()
+        # A failed provider replacement never emits a usable profile; own temps removed.
+        original_replace = pw_install.os.replace
+        def fail_mesa_replace(source, destination):
+            if str(source).endswith(".mesa-new"): raise OSError("fixture replacement failure")
+            return original_replace(source,destination)
+        pw_install.os.replace = fail_mesa_replace
+        try:
+            assert pw_install.main(zink_args+["--slug","zink-copy-failed","--mesa-zink",str(mesa)]) == 1
+        finally: pw_install.os.replace = original_replace
+        assert not (library/"profiles/zink-copy-failed.profile").exists()
+        assert not list((library/"prefixes/zink-copy-failed").rglob("*.mesa-new"))
+
+        original_setup = (root/"setup.exe.sh").read_text()
+        (root/"setup.exe.sh").write_text(original_setup+'echo original-stale > "$WINEPREFIX/drive_c/windows/syswow64/opengl32.dll.mesa-new"\n')
+        try:
+            assert pw_install.main(zink_args+["--slug","zink-stale","--mesa-zink",str(mesa)]) == 1
+        finally:(root/"setup.exe.sh").write_text(original_setup)
+        assert (library/"prefixes/zink-stale/drive_c/windows/syswow64/opengl32.dll.mesa-new").read_text()=="original-stale\n"
+        assert not (library/"profiles/zink-stale.profile").exists()
 
         # An installed game is never overwritten.
         assert pw_install.main(common + ["--file", f"setup={setup}"]) == 1

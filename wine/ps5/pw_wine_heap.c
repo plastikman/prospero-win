@@ -3,7 +3,6 @@
 #include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <errno.h>
 
 #if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
 #define MAP_ANONYMOUS MAP_ANON
@@ -36,20 +35,14 @@ static uint8_t *carve,*carve_end;
 static void *larges[MAX_LARGE];
 static uint32_t large_count;
 static PwWineHeapStats stats;
-static PwWineHeapFailures failures;
-static PwWineHeapBacking backing;
 
+static PwWineHeapBacking backing;
 static void *map(size_t bytes)
 {
     void *p=backing.map?backing.map(backing.context,bytes):NULL;
     if(p)return p;
-    /* The backing declined (or there is none): this mapping comes from
-     * flexible memory instead of direct memory. Counted, because the glue
-     * only prints its reason for the first refusal in the process. */
-    failures.backing_refusals++;
     p=mmap(NULL,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    if(p==MAP_FAILED){failures.last_map_bytes=bytes;failures.last_map_errno=(uint64_t)errno;return NULL;}
-    return p;
+    return p==MAP_FAILED?NULL:p;
 }
 static void unmap(void *address,size_t bytes)
 {
@@ -133,16 +126,16 @@ static Header *large_header(const void *pointer)
 }
 static void *allocate(size_t bytes)
 {
-    if(bytes>UINT32_MAX-PAGE){stats.failures++;failures.last_failed_bytes=bytes;failures.last_failure_reason=1;return NULL;}
+    if(bytes>UINT32_MAX-PAGE){stats.failures++;return NULL;}
     Header *header;
     if(bytes+HEADER<=class_bytes(CLASSES-1)) {
         unsigned index=class_for(bytes);
-        if(!(header=small_alloc(index))){stats.failures++;failures.last_failed_bytes=bytes;failures.last_failure_reason=2;return NULL;}
+        if(!(header=small_alloc(index))){stats.failures++;return NULL;}
         *header=(Header){MAGIC_SMALL,index,(uint32_t)bytes};
     } else {
         size_t mapped=(bytes+HEADER+sizeof(LargeHeader)+PAGE-1)/PAGE*PAGE;
         LargeHeader *large=large_count<MAX_LARGE?map(mapped):NULL;
-        if(!large){stats.failures++;failures.last_failed_bytes=bytes;failures.last_failure_reason=large_count<MAX_LARGE?3:4;return NULL;}
+        if(!large){stats.failures++;return NULL;}
         *large=(LargeHeader){mapped,bytes};note_mapped((int64_t)mapped);stats.large_live++;
         header=(Header *)(large+1);*header=(Header){MAGIC_LARGE,CLASSES,(uint32_t)bytes};
         uint32_t slot=large_slot(header+1);
@@ -199,7 +192,7 @@ void *pw_wine_heap_malloc(size_t bytes)
 void *pw_wine_heap_calloc(size_t count,size_t bytes)
 {
     if(bytes && count>SIZE_MAX/bytes) {
-        pthread_mutex_lock(&lock);stats.failures++;failures.last_failed_bytes=SIZE_MAX;failures.last_failure_reason=5;pthread_mutex_unlock(&lock);return NULL;
+        pthread_mutex_lock(&lock);stats.failures++;pthread_mutex_unlock(&lock);return NULL;
     }
     void *result=pw_wine_heap_malloc(count*bytes);
     if(result)memset(result,0,count*bytes);
@@ -210,7 +203,7 @@ void *pw_wine_heap_memalign(size_t alignment,size_t bytes)
     if(!alignment || (alignment&(alignment-1)))return NULL;
     if(alignment<=HEADER)return pw_wine_heap_malloc(bytes);
     if(bytes>SIZE_MAX-alignment || alignment>UINT32_MAX) {
-        pthread_mutex_lock(&lock);stats.failures++;failures.last_failed_bytes=bytes;failures.last_failure_reason=6;pthread_mutex_unlock(&lock);return NULL;
+        pthread_mutex_lock(&lock);stats.failures++;pthread_mutex_unlock(&lock);return NULL;
     }
     pthread_mutex_lock(&lock);
     uint8_t *base=allocate(bytes+alignment),*result=NULL;
@@ -254,7 +247,7 @@ void *pw_wine_heap_realloc(void *pointer,size_t bytes)
     }
     if(!header) {
         /* Not ours: its size is unknown, so it cannot be moved safely. */
-        stats.failures++;failures.last_failed_bytes=bytes;failures.last_failure_reason=7;pthread_mutex_unlock(&lock);return NULL;
+        stats.failures++;pthread_mutex_unlock(&lock);return NULL;
     }
     size_t old=header->requested;
     if(header->magic==MAGIC_SMALL && bytes+HEADER<=class_bytes(header->class_index) &&
@@ -283,8 +276,4 @@ void pw_wine_heap_stats(PwWineHeapStats *out)
 {
     if(!out)return;
     pthread_mutex_lock(&lock);*out=stats;pthread_mutex_unlock(&lock);
-}
-void pw_wine_heap_failures(PwWineHeapFailures *out)
-{
-    pthread_mutex_lock(&lock);*out=failures;pthread_mutex_unlock(&lock);
 }

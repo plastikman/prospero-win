@@ -4,11 +4,13 @@
  * direct memory is a memfd, a reservation is a PROT_NONE mapping that
  * refuses to overlap, and, as on the console, execute permission is
  * refused at map time. Checks what ntdll's calls do inside and outside the
- * regions, and that a console refusing the recipe leaves every call to the
- * host.
+ * regions, that a console refusing the recipe leaves every call to the
+ * host, and where the Unix-side heap takes its blocks from. Built with a
+ * 16-slot block table so the heap's lookups collide.
  */
 #define _GNU_SOURCE
 #include "../wine/ps5/pw_wine_dmem.h"
+#include "../wine/ps5/pw_wine_heap.h"
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -24,10 +26,66 @@ void *__wine_ps5_mmap(void *address, size_t bytes, int protection, int flags, in
 int __wine_ps5_munmap(void *address, size_t bytes);
 int __wine_ps5_mprotect(void *address, size_t bytes, int protection);
 unsigned int __wine_ps5_memory_stats(uint64_t *out, unsigned int count);
+void __wine_ps5_memory_budget(unsigned long long *total, unsigned long long *available);
 
-enum { PAGE = 0x4000, PHYS_PAGES = 256 };
+enum { PAGE = 0x4000, PHYS_PAGES = 1024, COUNTERS = 10 };
 static int phys_fd, refuse_map, cpu_only_refused;
 static unsigned char allocated[PHYS_PAGES];
+static size_t budget_pool, budget_free;
+/* budget_from_pages: the free block is the largest run of free pages. */
+static int budget_status, budget_queries, budget_from_pages;
+
+size_t sceKernelGetDirectMemorySize(void) { return budget_pool; }
+int sceKernelAvailableDirectMemorySize(int64_t start, int64_t end, size_t alignment, int64_t *address,
+                                      size_t *bytes)
+{
+    assert(start == 0 && end == (int64_t)budget_pool && alignment == PAGE);
+    budget_queries++;
+    *address = PAGE;
+    *bytes = budget_free;
+    if (budget_from_pages) {
+        unsigned run = 0, largest = 0;
+        for (unsigned p = 0; p < PHYS_PAGES; p++) {
+            run = allocated[p] ? 0 : run + 1;
+            if (run > largest) largest = run;
+        }
+        *bytes = (size_t)largest * PAGE;
+    }
+    return budget_status;
+}
+
+static void test_memory_budget(void)
+{
+    const unsigned long long gib = 1024ull * 1024 * 1024;
+    const struct {
+        size_t pool, free;
+        int status;
+        unsigned long long total, available;
+    } cases[] = {
+        /* Console readings replace the sandbox's zero BSD readings. */
+        { 12 * gib, 12232ull * 1024 * 1024, 0, 12 * gib, 12232ull * 1024 * 1024 },
+        /* Fragmentation or a failed query must not trigger the 512 MiB startup check. */
+        { 12 * gib, 256 * 1024 * 1024, 0, 12 * gib, gib },
+        { 12 * gib, 0, 0, 12 * gib, gib },
+        { 12 * gib, 10 * gib, -1, 12 * gib, gib },
+        /* An unavailable pool query uses the fallback without a free-block query. */
+        { 0, 0, 0, 4 * gib, gib },
+        /* Availability never exceeds the reported pool, even below the floor. */
+        { 256 * 1024 * 1024, 0, 0, 256 * 1024 * 1024, 256 * 1024 * 1024 },
+        { 2 * gib, 3 * gib, 0, 2 * gib, 2 * gib },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        unsigned long long total = 0, available = 0;
+        budget_pool = cases[i].pool;
+        budget_free = cases[i].free;
+        budget_status = cases[i].status;
+        budget_queries = 0;
+        __wine_ps5_memory_budget(&total, &available);
+        assert(total == cases[i].total && available == cases[i].available);
+        assert(budget_queries == (cases[i].pool != 0));
+    }
+}
 
 
 int sceKernelReserveVirtualRange(void **address, size_t bytes, int flags, size_t alignment)
@@ -56,13 +114,17 @@ int sceKernelAllocateMainDirectMemory(size_t bytes, size_t alignment, int type, 
 int sceKernelMapDirectMemory(void **address, size_t bytes, int protection, int flags, int64_t offset,
                              size_t alignment)
 {
+    void *at;
     (void)alignment;
     if (refuse_map || (protection & 4)) return (int)0x80020016;
     /* A kernel that wants the GPU bits refuses CPU-only memory. */
     if (cpu_only_refused && protection == 3) return (int)0x80020016;
-    assert(flags == 0x10 && (protection == 3 || protection == 0xf2));
-    return mmap(*address, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, phys_fd, offset) ==
-           MAP_FAILED;
+    assert((flags == 0x10 || (flags == 0 && !*address)) && (protection == 3 || protection == 0xf2));
+    /* Without the fixed flag the kernel chooses where (the heap's blocks). */
+    at = mmap(*address, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | (flags ? MAP_FIXED : 0), phys_fd, offset);
+    if (at == MAP_FAILED) return (int)0x8002000c;
+    *address = at;
+    return 0;
 }
 int sceKernelMprotect(const void *address, size_t bytes, int protection)
 {
@@ -78,11 +140,14 @@ int sceKernelReleaseDirectMemory(int64_t offset, size_t bytes)
     return 0;
 }
 
+/* Direct memory in use, less the heap's table of blocks, which it holds
+ * from the moment its backing is installed. */
+static unsigned table_pages;
 static unsigned used(void)
 {
     unsigned count = 0;
     for (unsigned p = 0; p < PHYS_PAGES; p++) count += allocated[p];
-    return count;
+    return count - table_pages;
 }
 /* Nothing at all is mapped at [address, +bytes). */
 static int free_space(uint8_t *address, size_t bytes)
@@ -120,9 +185,130 @@ static void test_refused(void)
         assert(used() == 0);
         assert(!__wine_ps5_mprotect(base, PAGE, PROT_READ) && !__wine_ps5_munmap(base, PAGE));
         {
-            uint64_t counters[8] = { 1, 1, 1, 1, 1, 1, 1, 1 };
-            assert(__wine_ps5_memory_stats(counters, 8) == 8 && !counters[0] && !counters[2] && !counters[6]);
+            uint64_t counters[COUNTERS] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+            assert(__wine_ps5_memory_stats(counters, COUNTERS) == COUNTERS && !counters[0] && !counters[2] &&
+                   !counters[6] && !counters[8] && !counters[9]);
         }
+        _exit(0);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+}
+
+static void heap_counters(uint64_t *direct, uint64_t *spilled)
+{
+    uint64_t counters[COUNTERS];
+    assert(__wine_ps5_memory_stats(counters, COUNTERS) == COUNTERS);
+    *direct = counters[8];
+    *spilled = counters[9];
+}
+
+/* With the heap's direct memory installed, headroom 4 MiB and spill cap
+ * 3 MiB (set in main), out of a 16 MiB pool. */
+static void test_heap(void)
+{
+    enum { BLOCK = 2 << 20, BLOCK_PAGES = BLOCK / PAGE + 1, SMALL = 64 << 10, SMALL_PAGES = 5, STEPS = 4000 };
+    void *blocks[7], *live[8], *extra;
+    unsigned count = 0, random = 12345;
+    uint64_t direct, spilled;
+    int queries;
+
+    budget_pool = (size_t)PHYS_PAGES * PAGE;
+    budget_from_pages = 1;
+    budget_status = 0;
+    budget_queries = 0;
+    assert(used() == 0);
+    /* Five blocks fit above the headroom: 1024 free pages, 379 after them. */
+    for (int i = 0; i < 5; i++) {
+        blocks[i] = pw_wine_heap_malloc(BLOCK);
+        assert(blocks[i] && used() == (unsigned)(i + 1) * BLOCK_PAGES);
+        memset(blocks[i], i + 1, BLOCK);
+    }
+    heap_counters(&direct, &spilled);
+    assert(direct == 5ull * BLOCK_PAGES * PAGE && spilled == 0);
+    /* The sixth would leave less than the headroom: flexible memory. */
+    blocks[5] = pw_wine_heap_malloc(BLOCK);
+    assert(blocks[5] && used() == 5 * BLOCK_PAGES);
+    memset(blocks[5], 6, BLOCK);
+    heap_counters(&direct, &spilled);
+    assert(direct == 5ull * BLOCK_PAGES * PAGE && spilled == (uint64_t)BLOCK_PAGES * PAGE);
+    /* A seventh would pass the spill cap: direct memory again. */
+    blocks[6] = pw_wine_heap_malloc(BLOCK);
+    assert(blocks[6] && used() == 6 * BLOCK_PAGES);
+    heap_counters(&direct, &spilled);
+    assert(direct == 6ull * BLOCK_PAGES * PAGE && spilled == (uint64_t)BLOCK_PAGES * PAGE);
+    assert(((uint8_t *)blocks[0])[BLOCK - 1] == 1 && ((uint8_t *)blocks[5])[0] == 6);
+    /* 14 MiB of growth, under the 16 MiB between readings: one reading. */
+    assert(budget_queries == 1);
+    /* Freeing the spilled block unmaps it; a direct one releases its pages. */
+    pw_wine_heap_free(blocks[5]);
+    heap_counters(&direct, &spilled);
+    assert(spilled == 0 && used() == 6 * BLOCK_PAGES);
+    pw_wine_heap_free(blocks[2]);
+    assert(used() == 5 * BLOCK_PAGES);
+    for (int i = 0; i < 7; i++)
+        if (i != 2 && i != 5) pw_wine_heap_free(blocks[i]);
+    heap_counters(&direct, &spilled);
+    assert(used() == 0 && direct == 0 && spilled == 0);
+
+    /* Allocating and freeing, any number of times, reads nothing. */
+    for (int i = 0; i < 100; i++) {
+        void *block = pw_wine_heap_malloc(BLOCK);
+        assert(block && used() == BLOCK_PAGES);
+        pw_wine_heap_free(block);
+    }
+    assert(budget_queries == 1 && used() == 0);
+
+    /* The block table, 16 slots and half of them used at most: blocks freed
+     * in any order each release their own pages. A full table spills. */
+    for (int step = 0; step < STEPS; step++) {
+        random = random * 1103515245u + 12345u;
+        if (count < 8 && (count == 0 || (random >> 16) & 1)) {
+            assert((live[count++] = pw_wine_heap_malloc(SMALL)));
+        } else {
+            unsigned pick = (random >> 8) % count;
+            pw_wine_heap_free(live[pick]);
+            live[pick] = live[--count];
+        }
+        assert(used() == count * SMALL_PAGES);
+        if (count == 8) {
+            assert((extra = pw_wine_heap_malloc(SMALL)) && used() == 8 * SMALL_PAGES);
+            heap_counters(&direct, &spilled);
+            assert(spilled == SMALL_PAGES * PAGE);
+            pw_wine_heap_free(extra);
+        }
+    }
+    queries = budget_queries;
+    while (count) pw_wine_heap_free(live[--count]);
+    heap_counters(&direct, &spilled);
+    assert(used() == 0 && direct == 0 && spilled == 0 && queries == 1);
+    budget_from_pages = 0;
+}
+
+/* Neither variable set: 256 MiB of headroom, more than this 16 MiB pool,
+ * so the heap's first block is flexible memory. */
+static void test_heap_defaults(void)
+{
+    pid_t child = fork();
+    int status;
+
+    if (!child) {
+        uint8_t *base = space_for(8);
+        uint64_t direct, spilled;
+        void *block;
+
+        assert(!getenv("WINE_PS5_HEAP_HEADROOM_MB") && !getenv("WINE_PS5_HEAP_SPILL_MB"));
+        budget_pool = (size_t)PHYS_PAGES * PAGE;
+        budget_from_pages = 1;
+        budget_status = 0;
+        assert(!sceKernelReserveVirtualRange((void **)&base, 8 * PAGE, 0x90, PAGE));
+        __wine_ps5_dmem_region(base, 8 * PAGE);
+        table_pages = used();
+        assert(table_pages == 1);
+        block = pw_wine_heap_malloc(2 << 20);
+        assert(block && used() == 0);
+        heap_counters(&direct, &spilled);
+        assert(direct == 0 && spilled == (2 << 20) + PAGE);
+        pw_wine_heap_free(block);
         _exit(0);
     }
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
@@ -134,9 +320,13 @@ int main(void)
     char path[] = "/tmp/pw_wine_dmem_ps5_XXXXXX";
     int file;
 
+    test_memory_budget();
     phys_fd = memfd_create("pw_wine_dmem_ps5", 0);
     assert(phys_fd >= 0 && !ftruncate(phys_fd, (off_t)PHYS_PAGES * PAGE));
     test_refused();
+    test_heap_defaults();
+    setenv("WINE_PS5_HEAP_HEADROOM_MB", "4", 1);
+    setenv("WINE_PS5_HEAP_SPILL_MB", "3", 1);
 
     /* Before any region every call is the host's. */
     outside = space_for(16);
@@ -151,7 +341,10 @@ int main(void)
     assert(!sceKernelReserveVirtualRange((void **)&base, 8 * PAGE, 0x90, PAGE));
     cpu_only_refused = 1;  /* the self-check finds the GPU-bits variant */
     __wine_ps5_dmem_region(base, 8 * PAGE);
-    assert(used() == 0);   /* the self-check gave its page back */
+    /* The self-check gave its page back; the heap's table (16 slots here)
+     * took one, for good. */
+    assert(used() == 1);
+    table_pages = 1;
 
     /* A fixed anonymous mapping is direct memory, zeroed. */
     assert(__wine_ps5_mmap(base, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
@@ -161,12 +354,12 @@ int main(void)
         /* The title's counters: backed now, peak (the self-check's page was
          * the first), runs, refusals; then the heap's; then the part below
          * 4 GiB, all of it for a region below 4 GiB. */
-        uint64_t counters[8] = { 0 };
+        uint64_t counters[COUNTERS] = { 0 };
         const uint64_t low = (uintptr_t)base < ((uintptr_t)1 << 32) ? 2 * PAGE : 0;
-        assert(__wine_ps5_memory_stats(counters, 8) == 8);
+        assert(__wine_ps5_memory_stats(counters, COUNTERS) == COUNTERS);
         assert(counters[0] == 2 * PAGE && counters[1] == 2 * PAGE && counters[2] == 1 && counters[3] == 0);
-        assert(counters[6] == low && counters[7] == low);
-        assert(__wine_ps5_memory_stats(counters, 1) == 8);
+        assert(counters[6] == low && counters[7] == low && counters[8] == 0 && counters[9] == 0);
+        assert(__wine_ps5_memory_stats(counters, 1) == COUNTERS);
     }
     memset(base, 0x33, 2 * PAGE);
     /* Read-execute, then back: the bytes stay. */
@@ -243,8 +436,9 @@ int main(void)
         refuse_map = 0;
     }
     assert(!__wine_ps5_munmap(base, 8 * PAGE) && used() == 0);
+    test_heap();
     printf("wine dmem ps5 glue passed: pass-through before and outside the regions, commit, protect, "
            "a mapping across the edge, private and shared file views, munmap, a region given back and taken again, "
-           "and a refused self-check\n");
+           "a refused self-check, and the heap's blocks in direct memory with headroom and spill\n");
     return 0;
 }

@@ -109,6 +109,42 @@ from the BDF driver. Their notices, from the FreeType source:
  * THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
+## TLS: `libgnutls.prx`, `secur32.prx` and `share/wine/ca-certificates.crt`
+
+A package built with `tools/build_tls_ps5.sh` gives Wine's schannel
+(`secur32.prx`, Wine's own code, covered above) its TLS library.
+`libgnutls.prx` statically links [GnuTLS](https://www.gnutls.org) 3.8.13,
+under the GNU Lesser General Public License version 2.1 or later
+(`LICENSES/gnutls/COPYING.LESSERv2`; `COPYING` is the GPL-3.0 text GnuTLS's
+other parts name, and `AUTHORS` its authors), with the libraries GnuTLS
+includes in that build:
+
+- [libtasn1](https://www.gnu.org/software/libtasn1/), LGPL-2.1-or-later
+  (the same text);
+- parts of [libunistring](https://www.gnu.org/software/libunistring/),
+  LGPL-2.1-or-later, its Unicode tables dual-licensed LGPL-3.0-or-later or
+  GPL-2.0-or-later;
+- inih, Ben Hoyt's INI parser, under the BSD-3-Clause licence
+  (`LICENSES/gnutls/lib-inih-LICENSE.txt`).
+
+It also links [GNU Nettle](https://www.lysator.liu.se/~nisse/nettle/)
+3.10.2, with its hogweed public-key library and its copy of GMP's mini-gmp,
+each dual-licensed LGPL-3.0-or-later (`LICENSES/nettle/COPYING.LESSERv3`)
+or GPL-2.0-or-later (`LICENSES/nettle/COPYINGv2`; `COPYINGv3` is the GPL-3
+text, `AUTHORS` its authors); prospero-win uses them under the LGPL. Like
+the other PS5 modules, `libgnutls.prx` links the payload SDK's emulated TLS
+from LLVM's runtime (above). Both are built in portable C, without nettle's
+assembler or GnuTLS's hardware acceleration, and with mini-gmp in place of
+GMP, which nettle documents as slower and not side-channel silent; the
+[TLS section](docs/WINE_PS5_BUILD.md#tls) of the build notes says what
+that means for the console.
+
+`share/wine/ca-certificates.crt` is Mozilla's root certificate store as
+[curl publishes it](https://curl.se/docs/caextract.html), under the Mozilla
+Public License 2.0 (`LICENSES/MPL-2.0.txt`); `SOURCES.txt` names the dated
+file and its SHA-256. A package without `libgnutls.prx` carries none of
+these.
+
 ## The Vulkan driver: `libvulkan.prx`
 
 `libvulkan.prx` is RADV, Mesa's Vulkan driver for AMD GPUs, from the
@@ -122,14 +158,37 @@ revision in `SOURCES.txt`). It is linked for the console by
 layer, both GPL-3.0-or-later, so `libvulkan.prx` as a whole is distributed
 under the GPL, version 3.
 
-## OpenGL, when included
+Frame generation (a profile's `[display] framegen`) is
+[PS5 MihawkGen](https://github.com/mihawk-99/PS5_MihawkGen) by Mihawk,
+GPL-3.0-or-later, vendored in `third_party/mihawkgen/` at the commit in its
+`COMMIT` file (the generator, its compute shaders and its trained network),
+and linked into `libvulkan.prx` only, with prospero-win's shim
+`wine/ps5/pw_framegen.cpp` (GPL-3.0-or-later too).
 
-A package built with OpenGL support links the
-[ps5-opengl](https://github.com/mpereiraesaa/ps5-opengl) SDK, itself built
-on Mesa, into `win32u.prx`. That SDK is GPL-3.0-or-later, so in such a
-package `win32u.prx` is distributed under the GPL, version 3, and its Mesa
-parts keep their MIT notices as above. `SOURCES.txt` says whether your
-package includes it.
+## OpenGL: Mesa WGL/Zink, `win/mesa-zink/`
+
+OpenGL games draw through Mesa's Windows WGL frontend and its Zink driver,
+which runs OpenGL on top of the Vulkan driver above. `opengl32.dll`,
+`libgallium_wgl.dll` and their runtime DLLs are under
+`win/mesa-zink/i386-windows/` and `win/mesa-zink/x86_64-windows/`, built
+from the [PS5_Mesa](https://github.com/mpereiraesaa/PS5_Mesa) revision in
+`SOURCES.txt` with llvm-mingw.
+
+Mesa is primarily MIT-licensed; component-specific licence texts and
+Mesa's licence overview are copied from the pinned source into
+`LICENSES/mesa/`. The llvm-mingw C++ runtime and MinGW runtime notices
+are in `LICENSES/llvm-mingw/`. `SOURCES.txt` and
+`mesa-zink-manifest.json` record the source, compiler archive and DLL hashes.
+
+The packager validates every consumed manifest field before changing the
+output package, including compiler version, hashes, imports and licence
+metadata. Input is a trusted, immutable local builder artifact set; this is
+not manifest authentication. Limits are 1 MiB for the manifest, 32 DLLs per
+architecture (128 MiB each), 256 imports per DLL, and 256 licence files
+(16 MiB each). Provider basenames are ASCII and at most 127 bytes; symlink
+inputs and duplicate case aliases are refused. Copying after successful
+preflight remains nontransactional, so output must not be published if
+copying fails.
 
 ## Getting the source
 

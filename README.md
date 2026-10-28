@@ -26,13 +26,16 @@ Built to bridge generations of Windows gaming—from 2000s classics to newer
   through Wine.
 - **Direct3D 8, 9, 10 and 11** graphics through
   [DXVK](https://github.com/doitsujin/dxvk) and Vulkan.
-- **OpenGL games** with the optional OpenGL-enabled runtime.
+- **OpenGL games** through Mesa's [Zink](https://docs.mesa3d.org/drivers/zink.html)
+  on top of Vulkan.
 - **Classic 2D games and Windows applications** through GDI.
 - **DualSense controls**, including Xbox-style XInput support, analog
   sticks, triggers and rumble.
 - **Custom controller mappings** for games originally designed for
   keyboard and mouse.
 - **USB keyboard and mouse**, usable alongside the controller.
+- **The console's on-screen keyboard** in a game, opened with a two-finger
+  touchpad click, typed into the game as keys.
 - **Game audio** through the PS5's audio output.
 - **A game launcher** with individual profiles, graphics settings and
   control presets.
@@ -130,12 +133,13 @@ binaries, game files or keys.
 
 - [BlackBearReloaded](https://github.com/blackbearreloaded) created the PS5
   Native App Boilerplate the app is built on, and the PS5 OpenGL port that
-  OpenGL games run through.
+  OpenGL games ran through before Zink.
 - [mihawk-99](https://github.com/mihawk-99) found and fixed several problems
   with Wine on the PS5 that prospero-win now includes: the floating-point
   state after a handled exception, memory reserved at a fixed address,
   decommitted memory, memory and processor usage reports, directory change
-  notifications, and how threads share the console's CPUs.
+  notifications, and how threads share the console's CPUs. His Mesa WGL/Zink
+  work for the PS5 is what OpenGL games now draw through.
 
 Third-party code and its licences are listed in the
 [third-party notices](NOTICE.md).

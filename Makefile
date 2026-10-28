@@ -46,7 +46,7 @@ $(eval $(call test_rule,test_pw_profile_catalog,tests/test_pw_profile_catalog.c 
 $(eval $(call test_rule,test_pw_present,tests/test_pw_present.c src/pw_present.c,))
 $(eval $(call test_rule,test_pw_wine_heap,tests/test_pw_wine_heap.c wine/ps5/pw_wine_heap.c,-pthread))
 $(eval $(call test_rule,test_pw_wine_dmem,tests/test_pw_wine_dmem.c wine/ps5/pw_wine_dmem.c,))
-$(eval $(call test_rule,test_pw_wine_dmem_ps5,tests/test_pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem.c wine/ps5/pw_wine_heap.c,-std=gnu11 -pthread))
+$(eval $(call test_rule,test_pw_wine_dmem_ps5,tests/test_pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem_ps5.c wine/ps5/pw_wine_dmem.c wine/ps5/pw_wine_heap.c,-std=gnu11 -pthread -DPW_WINE_HEAP_SLOTS=16))
 $(eval $(call test_rule,test_pw_wine_prx,tests/test_pw_wine_prx.c wine/ps5/pw_wine_prx.c,-I.))
 $(eval $(call test_rule,test_pw_wine_threads,tests/test_pw_wine_threads.c wine/ps5/pw_wine_threads.c,-pthread))
 $(eval $(call test_rule,test_pw_wine_sink,tests/test_pw_wine_sink.c wine/ps5/pw_wine_sink.c,-pthread))
@@ -55,8 +55,18 @@ $(eval $(call test_rule,test_pw_wine_launch,tests/test_pw_wine_launch.c src/pw_w
 $(eval $(call test_rule,test_pw_script_input,tests/test_pw_script_input.c src/pw_script_input.c,))
 $(eval $(call test_rule,test_pw_game_profile,tests/test_pw_game_profile.c src/pw_game_profile.c src/pw_app_profile.c,))
 $(eval $(call test_rule,test_pw_prefix_temp,tests/test_pw_prefix_temp.c src/pw_prefix_temp.c native/pw_wine_prefix.c,-D_DEFAULT_SOURCE))
+$(eval $(call test_rule,test_pw_tsc_calibrate,tests/test_pw_tsc_calibrate.c src/pw_tsc_calibrate.c,))
 $(eval $(call test_rule,test_pw_wine_prefix_cpu,tests/test_pw_wine_prefix_cpu.c src/pw_prefix_temp.c native/pw_wine_prefix.c,-D_DEFAULT_SOURCE))
+$(eval $(call test_rule,test_vk_present_interval,tests/test_vk_present_interval.c,-I.))
+$(BUILD)/test_vk_present_interval: wine/ps5/vulkan/pw_vk_present_interval.h
+$(eval $(call test_rule,test_vk_radv_profile,tests/test_vk_radv_profile.c wine/ps5/pw_vk_radv_profile.c,-Iwine/ps5))
+$(BUILD)/test_vk_radv_profile: wine/ps5/pw_vk_radv_profile.h wine/ps5/pw_vk_radv_profile_list.h
 $(eval $(call test_rule,test_vk_command_stream,tests/test_vk_command_stream.c wine/ps5/pw_vk_command_stream.c,-Iwine/ps5))
+$(eval $(call test_rule,test_vk_spsc,tests/test_vk_spsc.c wine/ps5/pw_vk_spsc.c wine/ps5/pw_vk_command_stream.c,-I. -pthread))
+$(BUILD)/test_vk_spsc: wine/ps5/pw_vk_spsc.h wine/ps5/pw_vk_command_stream.h
+$(eval $(call test_rule,test_vk_replay,tests/test_vk_replay.c wine/ps5/pw_vk_replay.c,-I. -pthread -Xlinker --wrap=pthread_create))
+$(BUILD)/test_vk_replay: wine/ps5/pw_vk_replay.h
+$(eval $(call test_rule,test_vk_codec,tests/test_vk_codec.c wine/ps5/vulkan/pw_vk_codec.c,-Iwine/ps5/vulkan))
 $(eval $(call test_rule,test_vk_wire,tests/test_vk_wire.c wine/ps5/pw_vk_wire.c wine/ps5/pw_vk_template_cache.c,-Iwine/ps5))
 $(eval $(call test_rule,test_pw_wine_library,tests/test_pw_wine_library.c native/pw_wine_library.c src/pw_game_profile.c src/pw_app_profile.c src/pw_profile_catalog.c,-D_DEFAULT_SOURCE))
 $(eval $(call test_rule,test_pw_hid,tests/test_pw_hid.c src/pw_hid.c,))
@@ -75,11 +85,14 @@ $(eval $(call test_rule,test_pw_wine_cwd_listing,tests/test_pw_wine_cwd_listing.
 $(eval $(call test_rule,test_pw_wine_compat,tests/test_pw_wine_compat.c wine/ps5/pw_wine_compat.c,-std=gnu11))
 # The console's resolver keeps the C library's names; the test renames them
 # so glibc's own resolver stays out of the way.
-PW_WS2_32_TEST_FLAGS := -D_DEFAULT_SOURCE $(foreach name,getaddrinfo freeaddrinfo getnameinfo gethostbyname \
-	gethostbyaddr,-D$(name)=pw_test_$(name))
+PW_WS2_32_TEST_FLAGS := -D_DEFAULT_SOURCE -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 $(foreach name,getaddrinfo freeaddrinfo getnameinfo gethostbyname \
+	gethostbyaddr gethostname,-D$(name)=pw_test_$(name))
 $(eval $(call test_rule,test_pw_ws2_32_libc,tests/test_pw_ws2_32_libc.c wine/ps5/pw_ws2_32_libc.c,$(PW_WS2_32_TEST_FLAGS)))
 $(eval $(call test_rule,test_pw_launcher_render,tests/test_pw_launcher_render.c src/pw_launcher_render.c,))
 $(eval $(call test_rule,test_pw_pad,tests/test_pw_pad.c src/pw_pad.c,))
+$(eval $(call test_rule,test_pw_game_menu,tests/test_pw_game_menu.c src/pw_game_menu.c,))
+$(eval $(call test_rule,test_pw_osk,tests/test_pw_osk.c src/pw_osk.c,))
+$(eval $(call test_rule,test_pw_osk_ps5,tests/test_pw_osk_ps5.c native/pw_osk_ps5.c src/pw_osk.c src/pw_result.c,-DPW_OSK_PS5_HOST_TEST))
 $(eval $(call test_rule,test_pw_vm,tests/test_pw_vm.c src/pw_vm.c src/pw_vm_posix.c src/pw_result.c,))
 $(eval $(call test_rule,test_pw_x86_block,tests/test_pw_x86_block.c src/pw_x86_block.c src/pw_x87.c src/pw_guest_fp.c src/pw_guest_call.c src/pw_vm.c src/pw_vm_posix.c,))
 $(eval $(call test_rule,test_pw_x86_flat,tests/test_pw_x86_flat.c src/pw_x86_block.c src/pw_x87.c src/pw_guest_fp.c src/pw_vm.c src/pw_vm_posix.c,))
@@ -129,23 +142,29 @@ box86-catalog: $(BUILD)/pw_x86_decode_probe
 
 $(eval $(call test_rule,test_pw_diagnostics,tests/test_pw_diagnostics.c native/pw_diagnostics.c,-pthread -DPW_DIAGNOSTICS_CHUNK=4096 -DPW_DIAGNOSTICS_TESTING=1))
 
-TESTS := test_pw_diagnostics test_pw_x86_hostexec test_pw_app_profile test_pw_profile_catalog test_pw_present \
-	test_pw_wine_heap test_pw_wine_dmem test_pw_wine_dmem_ps5 test_pw_wine_prx test_pw_wine_start test_pw_wine_launch test_pw_script_input test_pw_game_profile test_pw_prefix_temp test_pw_wine_prefix_cpu test_vk_command_stream test_vk_wire \
+$(eval $(call test_rule,test_pw_qpc_clock,tests/test_pw_qpc_clock.c,))
+$(eval $(call test_rule,test_pw_key_shared,tests/test_pw_key_shared.c,))
+
+TESTS := test_pw_qpc_clock test_pw_key_shared test_pw_diagnostics test_pw_x86_hostexec test_pw_app_profile test_pw_profile_catalog test_pw_present \
+	test_pw_wine_heap test_pw_wine_dmem test_pw_wine_dmem_ps5 test_pw_wine_prx test_pw_wine_start test_pw_wine_launch test_pw_script_input test_pw_game_profile test_pw_prefix_temp test_pw_tsc_calibrate test_pw_wine_prefix_cpu test_vk_command_stream test_vk_spsc test_vk_replay test_vk_wire test_vk_codec \
 	test_pw_wine_library test_pw_wine_display test_pw_hid test_pw_hid_ps5 test_pw_spinner test_pw_wine_dl test_pw_wine_sink \
-	test_pw_wine_threads test_pw_wine_compat test_pw_wine_cwd test_pw_wine_cwd_listing test_pw_ws2_32_libc test_pw_launcher_render test_pw_pad \
+	test_pw_wine_threads test_pw_wine_compat test_pw_wine_cwd test_pw_wine_cwd_listing test_pw_ws2_32_libc test_pw_launcher_render test_pw_pad test_pw_game_menu test_pw_osk test_pw_osk_ps5 \
 	test_pw_guest_fp test_pw_vm test_pw_x86_block test_pw_x86_flat test_pw_x86_cache test_pw_x86_code_pages test_pw_wow_smc_pages test_pw_wow_thread_budget test_pw_wow_tsc_clock test_pw_wow_call_top \
 	test_pw_x86_engine test_pw_x86_chaining test_pw_x86_residency test_pw_x86_global_residency test_pw_x86_reencode test_pw_x86_smc test_pw_x86_fault_markers test_pw_x86_lazyflags \
 	test_pw_guest_call test_pw_x87 test_pw_x87_native test_pw_audio_ps5 test_pw_audio_mix test_pw_agc_submit_lifecycle \
 	test_pw_videoout_layout test_pw_videoout_tile test_pw_pad_ps5 test_pw_data_mount \
-	test_pw_data_mount_native test_pw_lapy_elevation
+	test_pw_data_mount_native test_pw_lapy_elevation \
+	test_vk_present_interval test_vk_radv_profile
 
 # The Python suites drive the built DBT tools and check the contracts the
 # host compiler cannot.
+
 test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differential $(BUILD)/bench_dynarec
 	@set -e; for test in $(addprefix $(BUILD)/,$(TESTS)); do $$test; done
 	python3 tests/test_title_identity.py
 	python3 tests/test_icon.py
 	python3 tests/test_docs_links.py
+	python3 tests/test_check_setup.py
 	python3 tests/test_native_contract.py
 	python3 tests/test_fetch_lapy_helper.py
 	python3 tests/test_package_release.py
@@ -155,9 +174,12 @@ test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differe
 	$(BUILD)/dbt_differential global < tests/fixtures/dbt_differential_forms.txt
 	$(BUILD)/dbt_differential reencode < tests/fixtures/dbt_differential_forms.txt
 	python3 tests/test_pw_sse_matrix.py
+	python3 tests/test_mesa_zink_build.py
+	python3 tests/test_package_mesa_zink.py
 	python3 tests/test_wine_runtime_manifest.py
 	python3 tests/test_wine_protect_writecopy.py
 	python3 tests/test_wine_decommit_zero.py
+	python3 tests/test_wine_subpage_protect.py
 	python3 tests/test_wine_seh_fp_state.py
 	python3 tests/test_wine_narrow_syscall_args.py
 	python3 tests/test_wine_sched_probe.py
@@ -165,17 +187,30 @@ test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differe
 	python3 tests/test_wine_process_counters.py
 	python3 tests/test_wine_processor_times.py
 	python3 tests/test_wine_directory_changes.py
+	python3 tests/test_wine_directory_handles.py
+	python3 tests/test_wine_fiber_stacks.py
+	python3 tests/test_d3d12_control.py
 	python3 tests/test_wine_dib_section.py
 	python3 tests/test_wow64native_scaffold.py
 	python3 tests/test_vk_command_stream.py
 	python3 tests/test_vk_wire.py
+	python3 tests/test_vk_replay_dispatch.py
+	python3 tests/test_vk_generated_stage.py
+	python3 tests/test_vk_retire.py
+	python3 tests/test_vk_codecs.py
 	python3 tests/test_summarize_vk_batch.py
+	python3 tests/test_native_profile_split.py
+	python3 tests/test_native_profile_frames.py
+	python3 tests/test_symbolize_guest_stack.py
+	python3 tests/test_vk_radv_profile.py
 	CC="$(CC)" python3 tests/test_native_wow64_provider.py
 	python3 tests/test_wowprospero_contract.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wowprospero_unmap.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wowprospero_service_return.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_image_view_fds.py
+	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_mouse_wheel.py
 	python3 tests/test_build_wine_ps5.py
+	python3 tests/test_build_tls_ps5.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_ws2_fqdn.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_mutex_fast.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_shared_mutex_word.py
@@ -185,10 +220,13 @@ test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differe
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_shared_mutex_client.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_ws2_fqdn_cache.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_lookup_misses.py
+	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_root_directory.py
 	python3 tests/test_pw_install.py
 	python3 tests/test_pw_prefix.py
 	python3 tests/test_pw_gameplay_run.py
 	python3 tests/test_gen_prx_descriptor.py
+	CC="$(CC)" python3 tests/test_native_system_service_profile.py
+	CC="$(CC)" python3 tests/test_native_slow_syscall_events.py
 	python3 tests/test_test_reachability.py
 	python3 tests/test_status_vocabulary.py
 	python3 tests/test_classify_x86.py
@@ -210,11 +248,13 @@ wine-check: test
 		{ echo "wine-check: no pinned Wine source at $(WINE_SOURCE)" >&2; exit 2; }
 	PROSPERO_WINE_SOURCE="$(WINE_SOURCE)" python3 tests/test_wowprospero_contract.py
 	PROSPERO_WINE_SOURCE="$(WINE_SOURCE)" CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_lookup_misses.py
+	PROSPERO_WINE_SOURCE="$(WINE_SOURCE)" CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_root_directory.py
 	@test -f .deps/wine-runtime/lib/i386-windows/ntdll.dll || \
 		{ echo "wine-check: no staged runtime (tools/build_wine_runtime.sh)" >&2; exit 2; }
 	python3 tests/test_wine_runtime_manifest.py
 	python3 tests/test_wine_protect_writecopy.py
 	python3 tests/test_wine_decommit_zero.py
+	python3 tests/test_wine_subpage_protect.py
 	python3 tests/test_wine_seh_fp_state.py
 	python3 tests/test_wine_narrow_syscall_args.py
 	python3 tests/test_wine_sched_probe.py
@@ -222,6 +262,9 @@ wine-check: test
 	python3 tests/test_wine_process_counters.py
 	python3 tests/test_wine_processor_times.py
 	python3 tests/test_wine_directory_changes.py
+	python3 tests/test_wine_directory_handles.py
+	python3 tests/test_wine_fiber_stacks.py
+	python3 tests/test_d3d12_control.py
 	python3 tests/test_wine_dib_section.py
 
 audit:

@@ -175,6 +175,50 @@ static void *poster(void *arg)
     return NULL;
 }
 
+/* The menu snapshot: closed until the title stores one, renumbered only
+ * when what a renderer draws changes, clamped and terminated. */
+static void test_menu(void)
+{
+    struct pw_title_menu got,menu;
+    memset(&got,0xa5,sizeof(got));
+    pw_wine_menu(&got);
+    assert(got.version==PW_TITLE_MENU_VERSION && got.sequence==0 && !got.open);
+    assert(got.lines==0 && got.selected==0 && !got.title[0] && !got.line[0][0]);
+    pw_wine_menu(NULL);                                   /* ignored */
+
+    memset(&menu,0,sizeof(menu));
+    menu.open=1;menu.lines=2;menu.selected=1;
+    strcpy(menu.title,"Cheats");strcpy(menu.line[0],"Infinite ammo  [on]");strcpy(menu.line[1],"Close");
+    strcpy(menu.line[2],"not in use");                    /* beyond lines: dropped */
+    menu.version=77;menu.sequence=99;                     /* the sink's own */
+    pw_wine_set_menu(&menu);
+    pw_wine_menu(&got);
+    assert(got.version==PW_TITLE_MENU_VERSION && got.sequence==1 && got.open==1);
+    assert(got.lines==2 && got.selected==1 && !strcmp(got.title,"Cheats"));
+    assert(!strcmp(got.line[0],"Infinite ammo  [on]") && !strcmp(got.line[1],"Close") && !got.line[2][0]);
+
+    pw_wine_set_menu(&menu);pw_wine_menu(&got);assert(got.sequence==1);   /* unchanged */
+    menu.selected=0;pw_wine_set_menu(&menu);pw_wine_menu(&got);
+    assert(got.sequence==2 && got.selected==0);
+
+    /* Out-of-range counts are clamped; strings that fill their field are cut. */
+    menu.lines=1000;menu.selected=PW_TITLE_MENU_LINES;
+    memset(menu.title,'T',sizeof(menu.title));
+    memset(menu.line[PW_TITLE_MENU_LINES-1],'L',sizeof(menu.line[0]));
+    pw_wine_set_menu(&menu);pw_wine_menu(&got);
+    assert(got.sequence==3 && got.lines==PW_TITLE_MENU_LINES && got.selected==-1);
+    assert(strlen(got.title)==PW_TITLE_MENU_COLUMNS-1 && got.title[0]=='T');
+    assert(strlen(got.line[PW_TITLE_MENU_LINES-1])==PW_TITLE_MENU_COLUMNS-1);
+    menu.selected=-5;pw_wine_set_menu(&menu);pw_wine_menu(&got);assert(got.selected==-1 && got.sequence==3);
+
+    /* Closing clears everything but version and sequence, by NULL or open=0. */
+    pw_wine_set_menu(NULL);pw_wine_menu(&got);
+    assert(got.sequence==4 && !got.open && got.lines==0 && got.selected==0 && !got.title[0] && !got.line[0][0]);
+    pw_wine_set_menu(NULL);pw_wine_menu(&got);assert(got.sequence==4);
+    pw_wine_set_menu(&menu);menu.open=0;pw_wine_set_menu(&menu);pw_wine_menu(&got);
+    assert(got.sequence==6 && !got.open && !got.title[0]);
+}
+
 int main(void)
 {
     uint32_t frame[4*3];
@@ -227,6 +271,21 @@ int main(void)
     assert(read(fd,drain,sizeof(drain))==1 && pw_wine_next_input(&out) && out.code==0x41);
     assert(pw_wine_post_input(&bad[0])==-1 && read(fd,drain,1)==-1);  /* refused: no wake */
 
+    /* Wheel-only reports wake the driver and retain both direction and count. */
+    for (int ticks=-3; ticks<=3; ticks++) {
+        if (!ticks) continue;
+        e=(PwWineInput){PW_WINE_INPUT_MOUSE_WHEEL,0,ticks,0,0};
+        assert(!pw_wine_post_input(&e));
+        assert(read(fd,drain,sizeof(drain))==1);
+        assert(pw_wine_next_input(&out) && out.type==PW_WINE_INPUT_MOUSE_WHEEL && out.x==ticks);
+    }
+    e=(PwWineInput){PW_WINE_INPUT_MOUSE_WHEEL,0,0,0,0};
+    assert(pw_wine_post_input(&e)==-1);
+    e=(PwWineInput){PW_WINE_INPUT_MOUSE_WHEEL,0,1,0,1};
+    assert(pw_wine_post_input(&e)==-1);
+
+    assert(read(fd,drain,1)==-1);  /* invalid wheel reports do not wake */
+
     /* A producer thread and this consumer: order kept, nothing lost. */
     pthread_t thread;assert(!pthread_create(&thread,NULL,poster,NULL));
     for(int expected=0;expected<100;) if(pw_wine_next_input(&out)) {assert(out.x==expected);expected++;}
@@ -267,5 +326,6 @@ int main(void)
     pw_wine_set_rumble(0x10000,0);assert(pw_wine_rumble(NULL,&right)==1 && right==0);
     assert(!pw_wine_rumble(&left,NULL) && left==0xffff);
     test_display_release();
+    test_menu();
     return 0;
 }

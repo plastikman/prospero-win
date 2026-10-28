@@ -7,31 +7,24 @@
 
 enum { THREADS=8,ROUNDS=20000 };
 
-typedef struct FakeBacking {
-    void *address;
-    unsigned maps, unmaps;
-    int refuse;
-} FakeBacking;
-
-static void *fake_map(void *context,size_t bytes)
+/* A backing that hands out its own mappings: what the console's direct memory does. */
+#include <sys/mman.h>
+static unsigned backed_maps,backed_unmaps,refuse_next;
+static void *backed[64];static size_t backed_bytes[64];
+static void *backing_map(void *context,size_t bytes)
 {
-    FakeBacking *backing=context;
-    backing->maps++;
-    if(backing->refuse)return NULL;
-    backing->address=malloc(bytes);
-    return backing->address;
+    assert(context==&backed_maps);
+    if(refuse_next){refuse_next=0;return NULL;}
+    void *p=mmap(NULL,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);assert(p!=MAP_FAILED);
+    backed[backed_maps%64]=p;backed_bytes[backed_maps%64]=bytes;backed_maps++;return p;
+}
+static int backing_unmap(void *context,void *address,size_t bytes)
+{
+    assert(context==&backed_maps);
+    for(unsigned i=0;i<64;i++)if(backed[i]==address){assert(backed_bytes[i]==bytes);backed[i]=NULL;munmap(address,bytes);backed_unmaps++;return 0;}
+    return 1;
 }
 
-static int fake_unmap(void *context,void *address,size_t bytes)
-{
-    FakeBacking *backing=context;
-    (void)bytes;
-    if(address!=backing->address)return 1;
-    free(address);
-    backing->address=NULL;
-    backing->unmaps++;
-    return 0;
-}
 
 static void *worker(void *seed_pointer)
 {
@@ -131,20 +124,21 @@ int main(void)
     for(unsigned t=0;t<THREADS;t++)assert(!pthread_join(threads[t],NULL));
     pw_wine_heap_stats(&s);
     assert(s.live_bytes==0 && !s.large_live && s.allocations==s.frees && s.peak_live_bytes>1000000);
-    /* Backing allocations are paired with their own unmap callback; refusing
-     * a later allocation falls back to anonymous mmap and munmap. */
-    FakeBacking fake={0};
-    PwWineHeapBacking callbacks={&fake,fake_map,fake_unmap};
-    pw_wine_heap_set_backing(&callbacks);
-    void *backed=pw_wine_heap_malloc(200000);
-    assert(backed && fake.maps==1 && fake.address);
-    pw_wine_heap_free(backed);
-    assert(fake.unmaps==1 && !fake.address);
-    fake.refuse=1;
-    void *fallback=pw_wine_heap_malloc(200000);
-    assert(fallback && fake.maps==2);
-    pw_wine_heap_free(fallback);
-    assert(fake.unmaps==1 && !fake.address);
+    /* A backing gets new large blocks and spans; free gives large ones back to it,
+     * a refusal falls back to an anonymous mapping, and blocks mapped before the
+     * backing was installed are still unmapped as before. */
+    uint8_t *before=pw_wine_heap_malloc(100000);assert(before);
+    const PwWineHeapBacking backing={&backed_maps,backing_map,backing_unmap};
+    pw_wine_heap_set_backing(&backing);
+    uint8_t *big=pw_wine_heap_malloc(150000);assert(big && backed_maps==1);memset(big,1,150000);
+    refuse_next=1;uint8_t *fallback=pw_wine_heap_malloc(150000);assert(fallback && backed_maps==1);
+    pw_wine_heap_free(big);assert(backed_unmaps==1);
+    pw_wine_heap_free(fallback);pw_wine_heap_free(before);assert(backed_unmaps==1);
+    void *small[40000];unsigned spans_before=backed_maps;
+    for(unsigned i=0;i<40000;i++){small[i]=pw_wine_heap_malloc(48);assert(small[i]);}
+    assert(backed_maps>spans_before);
+    for(unsigned i=0;i<40000;i++)pw_wine_heap_free(small[i]);
     pw_wine_heap_set_backing(NULL);
+    pw_wine_heap_stats(&s);assert(s.live_bytes==0 && !s.large_live);
     return 0;
 }

@@ -62,9 +62,11 @@ size_t pw_wine_keyboard_stick_step(const PwGameInput *input, uint8_t stick_x, ui
 
 /* The DualSense as an XInput gamepad: its held buttons (Cross A, Circle B,
  * Square X, Triangle Y, L1/R1 shoulders, L3/R3 thumbs, Options Start,
- * Create Back, the touchpad Guide), the analog triggers, and the sticks
+ * Create Back, a touchpad click Back on its left half and Guide on its
+ * right, by where it began: touch_left), the analog triggers, and the sticks
  * scaled to -32768..32767 with y up. 1 and the state in out while the pad
- * is connected; 0 and a neutral state otherwise. The sink numbers the
+ * is connected, 1 and a neutral state while the system has it
+ * (intercepted); 0 and a neutral state otherwise. The sink numbers the
  * packets. */
 int pw_wine_game_pad(const PwPadPs5 *pad, PwWinePad *out);
 

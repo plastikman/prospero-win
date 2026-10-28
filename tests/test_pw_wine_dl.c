@@ -106,7 +106,7 @@ int main(void)
     assert(pw_wine_dl_addr(image+700,&info) && !strcmp(info.path,"/app0/sce_module/ntdll.prx") &&
            info.base==image);
     assert(pw_wine_dl_addr((const void *)(uintptr_t)module_start,&info) && info.base==image);
-    int local;assert(!pw_wine_dl_addr(&local,&info) &&
+    int local=0;assert(!pw_wine_dl_addr(&local,&info) &&
                      !strcmp(pw_wine_dl_error(),"address not in any module"));
     assert(pw_wine_dl_adopt("/app0/sce_module/ntdll.prx",7)==ntdll);
     assert(!pw_wine_dl_close(ntdll) && !pw_wine_dl_close(ntdll) && unloads==before);

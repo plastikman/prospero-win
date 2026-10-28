@@ -9,6 +9,9 @@ _Static_assert(sizeof(PwPadPs5Data)==120,"ScePad data ABI");
 _Static_assert(offsetof(PwPadPs5Data,connected)==76,"ScePad connected offset");
 _Static_assert(offsetof(PwPadPs5Data,timestamp)==80,"ScePad timestamp offset");
 _Static_assert(offsetof(PwPadPs5Data,connected_count)==104,"ScePad generation offset");
+_Static_assert(sizeof(PwPadPs5TriggerCommand)==56,"ScePad trigger command ABI");
+_Static_assert(sizeof(PwPadPs5TriggerEffect)==120,"ScePad trigger effect ABI");
+_Static_assert(offsetof(PwPadPs5TriggerEffect,command)==8,"ScePad trigger command offset");
 
 #ifndef PW_PAD_PS5_HOST_TEST
 extern int sceUserServiceInitialize(const void *);
@@ -19,6 +22,9 @@ extern int scePadOpen(int32_t,int32_t,int32_t,const void *);
 extern int scePadRead(int32_t,PwPadPs5Data *,int32_t);
 extern int scePadClose(int32_t);
 extern int scePadSetVibration(int32_t,const uint8_t *);
+extern int scePadSetVibrationMode(int32_t,int32_t);
+extern int scePadSetTriggerEffect(int32_t,const PwPadPs5TriggerEffect *);
+extern int sceUserServiceGetLoginUserIdList(int32_t *);
 static int platform_user_initialize(const void *p){return sceUserServiceInitialize(p);}
 static int platform_foreground_user(int32_t *u){return sceUserServiceGetForegroundUser(u);}
 static int platform_user_terminate(void){return sceUserServiceTerminate();}
@@ -29,6 +35,11 @@ static int platform_pad_read(int32_t h,PwPadPs5Data *s,int32_t n)
 {return scePadRead(h,s,n);}
 static int platform_pad_close(int32_t h){return scePadClose(h);}
 static int platform_pad_set_vibration(int32_t h,const uint8_t m[2]){return scePadSetVibration(h,m);}
+static int platform_login_users(int32_t ids[PW_PAD_PS5_USERS])
+{return sceUserServiceGetLoginUserIdList(ids);}
+static int platform_pad_set_vibration_mode(int32_t h,int32_t m){return scePadSetVibrationMode(h,m);}
+static int platform_pad_set_trigger_effect(int32_t h,const PwPadPs5TriggerEffect *e)
+{return scePadSetTriggerEffect(h,e);}
 #endif
 
 int pw_pad_ps5_platform_ops(PwPadPs5Ops *ops)
@@ -39,7 +50,9 @@ int pw_pad_ps5_platform_ops(PwPadPs5Ops *ops)
 #else
     *ops=(PwPadPs5Ops){platform_user_initialize,platform_foreground_user,
         platform_user_terminate,platform_pad_init,platform_pad_open,
-        platform_pad_read,platform_pad_close,platform_pad_set_vibration};return PW_OK;
+        platform_pad_read,platform_pad_close,platform_pad_set_vibration,
+        platform_login_users,platform_pad_set_vibration_mode,
+        platform_pad_set_trigger_effect};return PW_OK;
 #endif
 }
 
@@ -51,7 +64,32 @@ static int valid_ops(const PwPadPs5Ops *ops)
 
 static void centre_analog(PwPadPs5 *pad)
 {
-    pad->left_stick=pad->right_stick=(PwPadPs5Stick){0x80,0x80};pad->l2=pad->r2=0;
+    pad->left_stick=pad->right_stick=(PwPadPs5Stick){0x80,0x80};pad->l2=pad->r2=0;pad->touch_held=pad->finger_down=0;
+}
+
+/* A connected sample's touchpad click: which half it began on. */
+static void track_touch(PwPadPs5 *pad,const PwPadPs5Data *raw)
+{
+    unsigned held=(raw->buttons&PW_PAD_PS5_TOUCHPAD)!=0,fingers=raw->touch_data.fingers;
+    if(held && !pad->touch_held) {
+        /* The fingers that made the click: the click's own sample's, or,
+         * when it comes without a touch, those still down before it. */
+        pad->touch_fingers=fingers?fingers:pad->finger_down?pad->finger_count:0;
+        if(fingers) {
+            pad->touch_x=raw->touch_data.touch[0].x;pad->touch_y=raw->touch_data.touch[0].y;
+            pad->touch_from=PW_PAD_PS5_TOUCH_FROM_CLICK;
+        } else if(pad->finger_down) {
+            pad->touch_x=pad->finger_x;pad->touch_y=pad->finger_y;pad->touch_from=PW_PAD_PS5_TOUCH_FROM_EARLIER;
+        } else {
+            pad->touch_x=PW_PAD_PS5_TOUCH_MIDDLE;pad->touch_y=0;pad->touch_from=PW_PAD_PS5_TOUCH_FROM_NONE;
+        }
+        pad->touch_left=pad->touch_x<PW_PAD_PS5_TOUCH_MIDDLE;
+    }
+    /* A finger lifted ends its position; a click without a touch keeps it. */
+    if(fingers){pad->finger_down=1;pad->finger_count=fingers;
+                pad->finger_x=raw->touch_data.touch[0].x;pad->finger_y=raw->touch_data.touch[0].y;}
+    else if(!held)pad->finger_down=0;
+    pad->touch_held=held;
 }
 
 int pw_pad_ps5_open(PwPadPs5 *pad,const PwPadPs5Ops *ops,
@@ -59,7 +97,7 @@ int pw_pad_ps5_open(PwPadPs5 *pad,const PwPadPs5Ops *ops,
 {
     if(!pad || !valid_ops(ops))return PW_ERR_PRECONDITION;
     memset(pad,0,sizeof(*pad));pad->ops=*ops;pad->user_id=-1;pad->pad_handle=-1;
-    pad->close_rc=INT_MIN;pad->terminate_rc=INT_MIN;
+    pad->close_rc=INT_MIN;pad->terminate_rc=INT_MIN;pad->trigger_rc=INT_MIN;
     int status=pw_pad_init(&pad->core,map,map_count);if(status!=PW_OK)return status;
     pad->user_initialize_rc=pad->ops.user_initialize(NULL);
     pad->owns_user_service=pad->user_initialize_rc==0;
@@ -68,10 +106,36 @@ int pw_pad_ps5_open(PwPadPs5 *pad,const PwPadPs5Ops *ops,
     pad->pad_init_rc=pad->ops.pad_init();if(pad->pad_init_rc<0)goto failed;
     pad->pad_handle=pad->ops.pad_open(pad->user_id,0,0,NULL);
     if(pad->pad_handle<0)goto failed;
-    pad->opened=1;centre_analog(pad);return PW_OK;
+    pad->opened=1;centre_analog(pad);
+    if(pad->ops.pad_set_vibration_mode)
+        pad->ops.pad_set_vibration_mode(pad->pad_handle,PW_PAD_PS5_VIBRATION_COMPATIBLE);
+    return PW_OK;
 failed:
     if(pad->owns_user_service){pad->terminate_rc=pad->ops.user_terminate();pad->owns_user_service=0;}
     return PW_ERR_STATE;
+}
+
+int pw_pad_ps5_open_other(PwPadPs5 *pad,const PwPadPs5 *first,int32_t after,
+                          const PwPadKeyMap *map,size_t map_count)
+{
+    int32_t ids[PW_PAD_PS5_USERS];
+    if(!pad || !first || !first->opened || !valid_ops(&first->ops))return PW_ERR_PRECONDITION;
+    memset(pad,0,sizeof(*pad));pad->ops=first->ops;pad->user_id=-1;pad->pad_handle=-1;
+    pad->close_rc=INT_MIN;pad->terminate_rc=INT_MIN;pad->trigger_rc=INT_MIN;
+    if(!pad->ops.login_users)return PW_ERR_UNSUPPORTED;
+    int status=pw_pad_init(&pad->core,map,map_count);if(status!=PW_OK)return status;
+    for(int i=0;i<PW_PAD_PS5_USERS;i++)ids[i]=-1;
+    if(pad->ops.login_users(ids)<0)return PW_ERR_STATE;
+    int start=0;
+    for(int i=0;i<PW_PAD_PS5_USERS;i++)if(after>=0 && ids[i]==after){start=i+1;break;}
+    for(int k=0;k<PW_PAD_PS5_USERS && pad->user_id<0;k++) {
+        int i=(start+k)%PW_PAD_PS5_USERS;
+        if(ids[i]>=0 && ids[i]!=first->user_id)pad->user_id=ids[i];
+    }
+    if(pad->user_id<0)return PW_ERR_NOT_FOUND;
+    pad->pad_handle=pad->ops.pad_open(pad->user_id,0,0,NULL);
+    if(pad->pad_handle<0)return PW_ERR_STATE;
+    pad->opened=1;centre_analog(pad);return PW_OK;
 }
 
 /* One native read converted to samples; count<0 reports a read error. */
@@ -83,7 +147,7 @@ static int read_batch(PwPadPs5 *pad,PwPadSample samples[PW_PAD_PS5_BATCH])
      * consumed repeatedly by the title lifecycle adapter. */
     pad->core.pressed_edges=0;pad->core.released_edges=0;
     int count=pad->ops.pad_read(pad->pad_handle,raw,PW_PAD_PS5_BATCH);pad->last_read_rc=count;
-    if(count<0){pad->read_errors++;centre_analog(pad);return count;}
+    if(count<0){pad->read_errors++;pad->intercepted=0;centre_analog(pad);return count;}
     if(!count){pad->empty_reads++;return 0;}
     if(count>PW_PAD_PS5_BATCH)count=PW_PAD_PS5_BATCH;
     for(int i=0;i<count;i++) {
@@ -95,11 +159,12 @@ static int read_batch(PwPadPs5 *pad,PwPadSample samples[PW_PAD_PS5_BATCH])
             pad->last_generation=raw[i].connected_count;pad->generation_valid=1;
             pad->generation_changes++;
         }
+        pad->intercepted=intercepted;
         if(intercepted){pad->intercepted_samples++;centre_analog(pad);}
         else if(raw[i].connected) {
             pad->connected_samples++;
             pad->left_stick=raw[i].left_stick;pad->right_stick=raw[i].right_stick;
-            pad->l2=raw[i].l2;pad->r2=raw[i].r2;
+            pad->l2=raw[i].l2;pad->r2=raw[i].r2;track_touch(pad,&raw[i]);
         }
         else{pad->disconnected_samples++;centre_analog(pad);}
     }
@@ -139,5 +204,23 @@ int pw_pad_ps5_vibrate(PwPadPs5 *pad,uint8_t large,uint8_t small)
     if(!pad->ops.pad_set_vibration)return PW_ERR_UNSUPPORTED;
     const uint8_t motors[2]={large,small};
     pad->vibration_rc=pad->ops.pad_set_vibration(pad->pad_handle,motors);
+    /* The triggers: amplitude 0..8 from the stronger motor, 30 Hz when the
+     * large one leads, 60 Hz when the small one does. Sent when that changes,
+     * failed or not: a pad that refuses the effect costs no more calls. */
+    uint8_t strong=large>small?large:small;
+    uint8_t amplitude=(uint8_t)((strong*8+254)/255),frequency=amplitude?(large>=small?30:60):0;
+    if(pad->ops.pad_set_trigger_effect &&
+       (amplitude!=pad->trigger_amplitude || frequency!=pad->trigger_frequency ||
+        pad->trigger_rc==INT_MIN)) {
+        PwPadPs5TriggerEffect effect;memset(&effect,0,sizeof(effect));
+        effect.mask=PW_PAD_PS5_TRIGGER_L2|PW_PAD_PS5_TRIGGER_R2;
+        for(int i=0;i<2 && amplitude;i++) {
+            PwPadPs5TriggerCommand *command=&effect.command[i];
+            command->mode=PW_PAD_PS5_TRIGGER_VIBRATION;
+            command->data[0]=1;command->data[1]=amplitude;command->data[2]=frequency;
+        }
+        pad->trigger_rc=pad->ops.pad_set_trigger_effect(pad->pad_handle,&effect);
+        pad->trigger_amplitude=amplitude;pad->trigger_frequency=frequency;
+    }
     return pad->vibration_rc<0?PW_ERR_STATE:PW_OK;
 }

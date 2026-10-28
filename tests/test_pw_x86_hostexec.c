@@ -301,8 +301,77 @@ static void test_segment_stores(void)
     assert(pw_x86_hostexec_plan(&s, (const uint8_t[]){0x8c, 0xf0}, 2, &plan) == PW_ERR_UNSUPPORTED);
     assert(pw_x86_hostexec_plan(&s, (const uint8_t[]){0x8c}, 1, &plan) == PW_ERR_TRUNCATED);
     assert(pw_x86_hostexec_plan(&s, (const uint8_t[]){0x8c, 0x80, 0}, 3, &plan) == PW_ERR_TRUNCATED);
-    /* Loads (8E) stay refused. */
+    /* Loads (8E) are not planned: segment_load_form emulates them. */
     assert(pw_x86_hostexec_plan(&s, (const uint8_t[]){0x8e, 0xd8}, 2, &plan) == PW_ERR_UNSUPPORTED);
+}
+
+/* Forms from Watcom's runtime (Atomic Bomberman): push/pop FS and GS, segment
+ * loads, ENTER and 16-bit register pushes. */
+static void test_watcom_forms(void)
+{
+    PwX86State s;
+    uint32_t dword;
+    uint16_t word;
+
+    /* push fs; push gs: the guest's selectors, 4 bytes each. */
+    reset_state(&s);
+    assert(run(&s, (const uint8_t[]){0x0f, 0xa0}, 2) == PW_OK && s.eip == 0x1002);
+    assert(run(&s, (const uint8_t[]){0x0f, 0xa8}, 2) == PW_OK && s.eip == 0x1004);
+    memcpy(&dword, guest + 0x8000 - 4, 4);
+    assert(dword == 0x53);
+    memcpy(&dword, guest + 0x8000 - 8, 4);
+    assert(dword == 0x2b && s.gpr[4] == addr(0x8000 - 8));
+    /* pop gs; pop fs take them back and leave the FS base alone. */
+    assert(run(&s, (const uint8_t[]){0x0f, 0xa9}, 2) == PW_OK);
+    assert(run(&s, (const uint8_t[]){0x0f, 0xa1}, 2) == PW_OK);
+    assert(s.gpr[4] == addr(0x8000) && s.fs_base == addr(0x4000) && s.eip == 0x1008);
+    /* A null GS is fine, a stranger is refused. */
+    reset_state(&s);
+    s.gpr[4] = addr(0x7000);
+    memset(guest + 0x7000, 0, 4);
+    assert(run(&s, (const uint8_t[]){0x0f, 0xa9}, 2) == PW_OK && s.gpr[4] == addr(0x7004));
+    s.gpr[4] = addr(0x7000);
+    dword = 0x1234;
+    memcpy(guest + 0x7000, &dword, 4);
+    assert(run(&s, (const uint8_t[]){0x0f, 0xa1}, 2) == PW_ERR_UNSUPPORTED && s.gpr[4] == addr(0x7000));
+
+    /* mov es, eax with DS's selector; mov ds, edx; mov es, [eax]. */
+    reset_state(&s);
+    s.gpr[0] = 0x2b;
+    assert(run(&s, (const uint8_t[]){0x8e, 0xc0}, 2) == PW_OK && s.eip == 0x1002);
+    s.gpr[2] = 0x2b;
+    assert(run(&s, (const uint8_t[]){0x8e, 0xda}, 2) == PW_OK && s.eip == 0x1004);
+    s.gpr[0] = addr(0x300);
+    word = 0x2b;
+    memcpy(guest + 0x300, &word, 2);
+    assert(run(&s, (const uint8_t[]){0x8e, 0x00}, 2) == PW_OK && s.eip == 0x1006);
+    /* Null is fine for ES, not for SS; CS and unknown selectors are refused. */
+    s.gpr[1] = 0;
+    assert(run(&s, (const uint8_t[]){0x8e, 0xc1}, 2) == PW_OK);
+    assert(run(&s, (const uint8_t[]){0x8e, 0xd1}, 2) == PW_ERR_UNSUPPORTED);
+    s.gpr[1] = 0x2b;
+    assert(run(&s, (const uint8_t[]){0x8e, 0xc9}, 2) == PW_ERR_UNSUPPORTED);
+    s.gpr[1] = 0x1234;
+    assert(run(&s, (const uint8_t[]){0x8e, 0xc1}, 2) == PW_ERR_UNSUPPORTED && s.eip == 0x1008);
+
+    /* enter 0x144, 0: EBP pushed, EBP the new frame, ESP below it. */
+    reset_state(&s);
+    s.gpr[5] = 0xcafef00d;
+    assert(run(&s, (const uint8_t[]){0xc8, 0x44, 0x01, 0x00}, 4) == PW_OK && s.eip == 0x1004);
+    memcpy(&dword, guest + 0x8000 - 4, 4);
+    assert(dword == 0xcafef00d && s.gpr[5] == addr(0x8000 - 4) && s.gpr[4] == addr(0x8000 - 4 - 0x144));
+    /* A nesting level is refused. */
+    assert(run(&s, (const uint8_t[]){0xc8, 0x04, 0x00, 0x01}, 4) == PW_ERR_UNSUPPORTED);
+
+    /* push ax; pop cx: 2 bytes, CX's upper half kept. */
+    reset_state(&s);
+    s.gpr[0] = 0x12345678;
+    s.gpr[1] = 0xaaaabbbb;
+    assert(run(&s, (const uint8_t[]){0x66, 0x50}, 2) == PW_OK && s.gpr[4] == addr(0x8000 - 2));
+    assert(run(&s, (const uint8_t[]){0x66, 0x59}, 2) == PW_OK && s.gpr[4] == addr(0x8000));
+    assert(s.gpr[1] == 0xaaaa5678 && s.eip == 0x1004);
+    /* SP is refused. */
+    assert(run(&s, (const uint8_t[]){0x66, 0x5c}, 2) == PW_ERR_UNSUPPORTED);
 }
 
 /* 60/61: pushad stores EAX..EDI with the ESP it started from, the lowest
@@ -389,18 +458,6 @@ static void test_segment_stack(void)
     uint32_t dword, esp;
     uint16_t word;
 
-    /* MDK copies DS to ES before REP string operations (mov eax,ds; mov es,ax). */
-    reset_state(&s);
-    s.gpr[0] = 0x2b;
-    assert(run(&s, (const uint8_t[]){0x8e, 0xc0}, 2) == PW_OK && s.eip == 0x1002);
-    s.gpr[0] = 0x53;
-    assert(run(&s, (const uint8_t[]){0x8e, 0xc0}, 2) == PW_ERR_UNSUPPORTED && s.eip == 0x1002);
-    reset_state(&s);
-    s.gpr[0] = 0x12345678;
-    assert(run(&s, (const uint8_t[]){0x66, 0x50}, 2) == PW_OK);
-    memcpy(&word, guest + 0x8000 - 2, 2);
-    assert(word == 0x5678 && s.gpr[4] == addr(0x8000 - 2) && s.eip == 0x1002);
-
     for (unsigned i = 0; i < 4; i++) {
         reset_state(&s);
         esp = s.gpr[4];
@@ -451,21 +508,6 @@ static void test_segment_stack(void)
     word = 0x2b;
     memcpy(guest + 0x7000, &word, 2);
     assert(run(&s, (const uint8_t[]){0x66, 0x07}, 2) == PW_OK && s.gpr[4] == addr(0x7002) && s.eip == 0x1002);
-    /* PUSH/POP FS and GS use the two-byte 0F encodings. */
-    for (unsigned i = 0; i < 2; i++) {
-        const uint8_t push[] = { 0x0f, i ? 0xa8 : 0xa0 };
-        const uint8_t pop[] = { 0x0f, i ? 0xa9 : 0xa1 };
-        const uint16_t selector = i ? 0x2b : 0x53;
-        reset_state(&s);
-        assert(run(&s, push, sizeof(push)) == PW_OK);
-        memcpy(&dword, guest + 0x8000 - 4, 4);
-        assert(dword == selector && s.gpr[4] == addr(0x8000 - 4) && s.eip == 0x1002);
-        assert(run(&s, pop, sizeof(pop)) == PW_OK && s.gpr[4] == addr(0x8000) && s.eip == 0x1004);
-        reset_state(&s);
-        assert(run(&s, (const uint8_t[]){0x66, 0x0f, i ? 0xa8 : 0xa0}, 3) == PW_OK);
-        memcpy(&word, guest + 0x8000 - 2, 2);
-        assert(word == selector && s.gpr[4] == addr(0x8000 - 2) && s.eip == 0x1003);
-    }
     /* The host's selectors, when the state has them (the PS5's are not
      * Windows'): stores and pushes use them, pops take them. */
     reset_state(&s);
@@ -490,32 +532,6 @@ static void test_segment_stack(void)
     s.eip = 0x1000; s.gpr[4] = addr(0x8000);
     /* A prefix alone is not one of them. */
     assert(run(&s, (const uint8_t[]){0x66}, 1) != PW_OK && s.eip == 0x1000);
-}
-
-static void test_enter(void)
-{
-    PwX86State s;
-    uint32_t saved_bp, old_esp;
-    uint16_t saved_bp16;
-
-    reset_state(&s);
-    old_esp = s.gpr[4];
-    s.gpr[5] = 0x12345678;
-    assert(run(&s, (const uint8_t[]){0xc8, 0x4c, 0x01, 0x00}, 4) == PW_OK);
-    memcpy(&saved_bp, (const void *)(uintptr_t)(old_esp - 4), sizeof(saved_bp));
-    assert(saved_bp == 0x12345678 && s.gpr[5] == old_esp - 4);
-    assert(s.gpr[4] == old_esp - 4 - 0x14c && s.eip == 0x1004);
-
-    reset_state(&s);
-    old_esp = s.gpr[4];
-    s.gpr[5] = 0xabcd9876;
-    assert(run(&s, (const uint8_t[]){0x66, 0xc8, 0x10, 0x00, 0x00}, 5) == PW_OK);
-    memcpy(&saved_bp16, (const void *)(uintptr_t)(old_esp - 2), sizeof(saved_bp16));
-    assert(saved_bp16 == 0x9876 && s.gpr[5] == 0xabcd7ffe);
-    assert(s.gpr[4] == old_esp - 2 - 0x10 && s.eip == 0x1005);
-
-    reset_state(&s);
-    assert(run(&s, (const uint8_t[]){0xc8, 0x10, 0x00, 0x01}, 4) == PW_ERR_UNSUPPORTED);
 }
 
 /* CPUID: the host's, without the VEX/EVEX extensions, XSAVE and the SSE4.2
@@ -607,13 +623,13 @@ int main(void)
     test_guest_mxcsr();
     test_segment_stores();
     test_segment_stack();
-    test_enter();
+    test_watcom_forms();
     test_all_registers();
     test_ecx_branches();
     test_cpuid();
     test_refusals_and_cache();
     assert(pw_x86_hostexec_destroy(&hx) == PW_OK);
-    printf("host-exec fallback passed: integer, x87, SSE, FS and SIB forms, the guest's MXCSR, segment stores, segment push and pop, PUSHAD and POPAD, JECXZ and LOOP, CPUID; %llu stubs\n",
+    printf("host-exec fallback passed: integer, x87, SSE, FS and SIB forms, the guest's MXCSR, segment stores, segment push and pop, segment loads, ENTER, 16-bit register push and pop, PUSHAD and POPAD, JECXZ and LOOP, CPUID; %llu stubs\n",
            (unsigned long long)hx.compiled);
     return 0;
 }

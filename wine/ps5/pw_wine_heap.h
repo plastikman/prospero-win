@@ -26,31 +26,16 @@ void *pw_wine_heap_memalign(size_t alignment,size_t bytes);
 size_t pw_wine_heap_usable_size(const void *pointer);
 void pw_wine_heap_stats(PwWineHeapStats *stats);
 
-/* ⚠ Kept OUT of PwWineHeapStats on purpose. dlls/ntdll/unix/loader.c's
- * pw_report_heap() declares its own 9-field copy of that struct on the stack
- * instead of including this header, so adding a field here makes
- * pw_wine_heap_stats write past its buffer -- a stack smash that crashes the
- * title in the loader's refusal path. Growing this struct requires a full Wine
- * rebuild; this one does not.
- *
- * Why the last allocation was refused, and how often the direct-memory backing
- * declined so the heap fell back to anonymous (flexible) mappings:
- * heap_log_fallback prints only once per process, so a count is the only way
- * to see a repeated fallback. */
-typedef struct PwWineHeapFailures {
-    uint64_t last_failed_bytes,last_failure_reason;
-    uint64_t last_map_bytes,last_map_errno,backing_refusals;
-} PwWineHeapFailures;
-void pw_wine_heap_failures(PwWineHeapFailures *out);
-
-/* Optional backing for new spans and large blocks. map may refuse so the
- * heap can fall back to anonymous mappings. unmap returns 0 when it handled
- * the address, nonzero when the address belongs to the fallback mmap path.
- * Both callbacks run with the heap mutex held and must not allocate here. */
+/* Where new spans and large blocks come from. By default anonymous mappings;
+ * on the console those are flexible memory, of which a title has about
+ * 440 MiB, so pw_wine_dmem_ps5.c installs direct memory instead. map returns
+ * NULL to fall back to an anonymous mapping; unmap returns 0 when it owned
+ * the range and nonzero to have it unmapped as an anonymous mapping. Both
+ * are called with the heap's lock held and must not allocate from it. */
 typedef struct PwWineHeapBacking {
     void *context;
-    void *(*map)(void *context, size_t bytes);
-    int (*unmap)(void *context, void *address, size_t bytes);
+    void *(*map)(void *context,size_t bytes);
+    int (*unmap)(void *context,void *address,size_t bytes);
 } PwWineHeapBacking;
 void pw_wine_heap_set_backing(const PwWineHeapBacking *backing);
 

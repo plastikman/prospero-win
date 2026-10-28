@@ -10,7 +10,8 @@ enum { I0 = 0, IB = 1, IW = 2, IZ = 3, IO = 4 }; /* none, 8, 16, 16/32, moffs32 
 /* Primary-map ModRM presence (M), refusal (X) and immediate class. Refused:
  * control transfers, implicit stack users, forms invalid in 64-bit mode
  * (BCD, INC/DEC 40-4F, PUSHA/POPA, BOUND, ARPL, LES/LDS, INTO, 82), segment
- * register loads (stores, 8C, are planned apart), I/O, HLT, CLI/STI, INT, and
+ * register loads (stores, 8C, are planned apart; loads, 8E, are emulated by
+ * segment_load_form), I/O, HLT, CLI/STI, INT, and
  * LEA (whose operand is not a memory access and must not receive the FS
  * base). */
 static const uint8_t primary_class[256] = {
@@ -189,52 +190,6 @@ static int segment_store(const PwX86State *s, const uint8_t *src, size_t n, size
     plan->out[plan->out_bytes++] = (uint8_t)(selector >> 8);
     if (at + 1 + (size_t)addr_len > 15) return PW_ERR_UNSUPPORTED;
     plan->length = (uint8_t)(at + 1 + (size_t)addr_len);
-    return PW_OK;
-}
-
-/* MOV Sreg,r/m16 (8E /r). The translator models flat data segments and the
- * guest's fixed FS/TEB base, rather than arbitrary descriptor-table state.
- * Accept register loads that preserve the selector already assigned to that
- * segment; other loads need real descriptor semantics and remain refused. */
-static int segment_load_form(PwX86State *s, const uint8_t *src, size_t n, size_t at)
-{
-    uint8_t modrm;
-    unsigned reg, rm;
-    uint16_t selector;
-
-    if (at + 1 >= n) return PW_ERR_TRUNCATED;
-    modrm = src[at + 1];
-    reg = (modrm >> 3) & 7;
-    if (reg == 1 || reg > 5 || (modrm >> 6) != 3) return PW_ERR_UNSUPPORTED;
-    rm = modrm & 7;
-    selector = (uint16_t)s->gpr[rm];
-    if (selector != selector_of(s, reg)) return PW_ERR_UNSUPPORTED;
-    s->eip += (uint32_t)(at + 2);
-    return PW_OK;
-}
-
-/* The translator intentionally stops at operand-size-prefixed register
- * PUSH/POP forms: executing them natively would use the host's 64-bit stack.
- * Emulate the 16-bit forms on the guest stack. */
-static int word_register_stack_form(PwX86State *s, const uint8_t *src, size_t n)
-{
-    unsigned at = 0, reg;
-    uint16_t value;
-
-    if (!n || src[at++] != 0x66 || at >= n || src[at] < 0x50 || src[at] > 0x5f)
-        return PW_ERR_UNSUPPORTED;
-    reg = src[at] & 7;
-    if (src[at] < 0x58) {
-        value = (uint16_t)s->gpr[reg];
-        s->gpr[4] -= 2;
-        memcpy((void *)(uintptr_t)s->gpr[4], &value, sizeof(value));
-    } else {
-        if (reg == 4) return PW_ERR_UNSUPPORTED; /* POP SP changes stack semantics. */
-        memcpy(&value, (const void *)(uintptr_t)s->gpr[4], sizeof(value));
-        s->gpr[reg] = (s->gpr[reg] & 0xffff0000u) | value;
-        s->gpr[4] += 2;
-    }
-    s->eip += at + 1;
     return PW_OK;
 }
 
@@ -732,64 +687,22 @@ static int ecx_branch_form(PwX86State *s, const uint8_t *src, size_t n)
     return PW_OK;
 }
 
-/* ENTER's common level-zero form builds a stack frame without touching the
- * host stack. The translator declines C8, so handle the simple prologue here;
- * nested frame chains require the guest's prior frame links and are refused. */
-static int enter_form(PwX86State *s, const uint8_t *src, size_t n)
-{
-    unsigned at = 0, word = 0;
-    uint16_t allocation;
-    uint8_t level;
-
-    if (n && src[0] == 0x66) { word = 1; at = 1; }
-    if (at + 4 > n || src[at] != 0xc8) return PW_ERR_UNSUPPORTED;
-    memcpy(&allocation, src + at + 1, sizeof(allocation));
-    level = src[at + 3] & 0x1f;
-    if (level) return PW_ERR_UNSUPPORTED;
-    if (word) {
-        uint16_t bp = (uint16_t)s->gpr[5];
-        s->gpr[4] -= 2;
-        memcpy((void *)(uintptr_t)s->gpr[4], &bp, 2);
-        s->gpr[5] = (s->gpr[5] & 0xffff0000u) | (uint16_t)s->gpr[4];
-        s->gpr[4] -= allocation;
-    } else {
-        uint32_t old_bp = s->gpr[5];
-        s->gpr[4] -= 4;
-        memcpy((void *)(uintptr_t)s->gpr[4], &old_bp, sizeof(old_bp));
-        s->gpr[5] = s->gpr[4];
-        s->gpr[4] -= allocation;
-    }
-    s->eip += at + 4;
-    return PW_OK;
-}
-
-/* PUSH and POP of segment registers, which 64-bit mode does not have, so the
- * host cannot run them. A push stores the
+/* PUSH and POP of ES, CS, SS and DS (06 07 0E 16 17 1E 1F), which 64-bit
+ * mode does not have, so the host cannot run them. A push stores the
  * selector the guest sees (selector_of), zero-extended to 32 bits, or 16
  * bits with a 66 prefix. The data segments are flat, so a pop only moves ESP;
  * it takes a selector the guest could hold (null for ES and DS, or one of
  * its six) and refuses anything else, where the processor would raise #GP.
- * Miles Sound System (mss32.dll) saves and restores DS and ES this way; MDK
- * saves FS and GS with their 0F A0/A1/A8/A9 encodings. */
+ * Miles Sound System (mss32.dll) saves and restores DS and ES this way. */
 static int segment_stack_form(PwX86State *s, const uint8_t *src, size_t n)
 {
-    unsigned at = 0, size = 4, reg, pop, op_bytes = 1;
+    unsigned at = 0, size = 4, len = 1, reg, pop;
     uint32_t value = 0;
     uint16_t selector;
 
     if (n && src[0] == 0x66) { size = 2; at = 1; }
     if (at >= n) return PW_ERR_UNSUPPORTED;
-    if (src[at] == 0x0f) {
-        if (at + 1 >= n) return PW_ERR_TRUNCATED;
-        op_bytes = 2;
-        switch (src[at + 1]) {
-        case 0xa0: reg = 4; pop = 0; break;
-        case 0xa1: reg = 4; pop = 1; break;
-        case 0xa8: reg = 5; pop = 0; break;
-        case 0xa9: reg = 5; pop = 1; break;
-        default: return PW_ERR_UNSUPPORTED;
-        }
-    } else switch (src[at]) {
+    switch (src[at]) {
     case 0x06: reg = 0; pop = 0; break;
     case 0x07: reg = 0; pop = 1; break;
     case 0x0e: reg = 1; pop = 0; break;
@@ -797,6 +710,21 @@ static int segment_stack_form(PwX86State *s, const uint8_t *src, size_t n)
     case 0x17: reg = 2; pop = 1; break;
     case 0x1e: reg = 3; pop = 0; break;
     case 0x1f: reg = 3; pop = 1; break;
+    case 0x0f:
+        /* FS and GS (0F A0 0F A1 0F A8 0F A9), which 64-bit mode keeps but
+         * whose host selectors are not the guest's. A pop leaves fs_base
+         * alone: the selectors it takes all name the same TEB or a flat
+         * segment. Watcom's runtime saves both around its allocator. */
+        if (at + 1 >= n) return PW_ERR_UNSUPPORTED;
+        switch (src[at + 1]) {
+        case 0xa0: reg = 4; pop = 0; break;
+        case 0xa1: reg = 4; pop = 1; break;
+        case 0xa8: reg = 5; pop = 0; break;
+        case 0xa9: reg = 5; pop = 1; break;
+        default: return PW_ERR_UNSUPPORTED;
+        }
+        len = 2;
+        break;
     default: return PW_ERR_UNSUPPORTED;
     }
     if (!pop) {
@@ -813,7 +741,77 @@ static int segment_stack_form(PwX86State *s, const uint8_t *src, size_t n)
         }
         s->gpr[4] += size;
     }
-    s->eip += at + op_bytes;
+    s->eip += at + len;
+    return PW_OK;
+}
+
+/* MOV Sreg, r/m16 (8E /r). The data segments are flat and FS stays the TEB,
+ * so loading a selector the guest could hold changes nothing: take one of its
+ * six selectors, or null for anything but SS, and refuse the rest, where the
+ * processor would raise #GP; CS is #UD. Watcom's runtime reloads ES from DS
+ * this way ("mov eax, ds; mov es, eax"). */
+static int segment_load_form(PwX86State *s, const uint8_t *src, size_t n)
+{
+    unsigned at = 0, reg, known = 0;
+    uint32_t address;
+    uint16_t selector;
+    int len = 1;
+
+    if (n && src[0] == 0x66) at = 1;
+    if (at + 1 >= n || src[at] != 0x8e) return PW_ERR_UNSUPPORTED;
+    reg = (src[at + 1] >> 3) & 7;
+    if (reg == 1 || reg > 5) return PW_ERR_UNSUPPORTED;
+    if ((src[at + 1] >> 6) == 3) {
+        selector = (uint16_t)s->gpr[src[at + 1] & 7];
+    } else {
+        len = modrm_address(s, src + at + 1, n - at - 1, &address);
+        if (len < 0) return len;
+        memcpy(&selector, (const void *)(uintptr_t)address, 2);
+    }
+    for (unsigned i = 0; i < 6; i++) known |= selector == selector_of(s, i);
+    if (!known && !(selector == 0 && reg != 2)) return PW_ERR_UNSUPPORTED;
+    s->eip += at + 1 + (unsigned)len;
+    return PW_OK;
+}
+
+/* ENTER imm16, 0 (C8 iw 00): push ebp; mov ebp, esp; sub esp, imm16. Higher
+ * nesting levels, which copy outer frame pointers, stay refused. Watcom's
+ * runtime opens frames this way. */
+static int enter_form(PwX86State *s, const uint8_t *src, size_t n)
+{
+    uint16_t frame;
+
+    if (n < 4 || src[0] != 0xc8 || src[3] != 0) return PW_ERR_UNSUPPORTED;
+    memcpy(&frame, src + 1, 2);
+    s->gpr[4] -= 4;
+    memcpy((void *)(uintptr_t)s->gpr[4], &s->gpr[5], 4);
+    s->gpr[5] = s->gpr[4];
+    s->gpr[4] -= frame;
+    s->eip += 4;
+    return PW_OK;
+}
+
+/* PUSH and POP of a 16-bit register (66 50+r, 66 58+r): ESP moves by 2 and a
+ * pop keeps the register's upper half. SP itself is refused (a pop of SP
+ * replaces it). Watcom's FPU probe saves AX this way. */
+static int word_register_stack_form(PwX86State *s, const uint8_t *src, size_t n)
+{
+    unsigned reg;
+    uint16_t word;
+
+    if (n < 2 || src[0] != 0x66 || src[1] < 0x50 || src[1] > 0x5f) return PW_ERR_UNSUPPORTED;
+    reg = src[1] & 7;
+    if (reg == 4) return PW_ERR_UNSUPPORTED;
+    if (src[1] < 0x58) {
+        word = (uint16_t)s->gpr[reg];
+        s->gpr[4] -= 2;
+        memcpy((void *)(uintptr_t)s->gpr[4], &word, 2);
+    } else {
+        memcpy(&word, (const void *)(uintptr_t)s->gpr[4], 2);
+        s->gpr[4] += 2;
+        s->gpr[reg] = (s->gpr[reg] & 0xffff0000u) | word;
+    }
+    s->eip += 2;
     return PW_OK;
 }
 
@@ -888,23 +886,14 @@ int pw_x86_hostexec_step(PwX86HostExec *h, PwX86State *s, const uint8_t *src, si
         h->executed++;
         return PW_OK;
     }
-    {
-        unsigned at = n && src[0] == 0x66 ? 1 : 0;
-        if (at < n && src[at] == 0x8e && segment_load_form(s, src, n, at) == PW_OK) {
-            h->executed++;
-            return PW_OK;
-        }
-    }
-    if (word_register_stack_form(s, src, n) == PW_OK) {
-        h->executed++;
-        return PW_OK;
-    }
     status = pw_x86_hostexec_plan(s, src, n, &plan);
     if (status == PW_ERR_UNSUPPORTED &&
         (stack_memory_form(s, src, n) == PW_OK || esp_memory_form(s, src, n) == PW_OK ||
          flags_stack_form(s, src, n) == PW_OK ||
-         segment_stack_form(s, src, n) == PW_OK || all_registers_form(s, src, n) == PW_OK ||
-         ecx_branch_form(s, src, n) == PW_OK || enter_form(s, src, n) == PW_OK)) {
+         segment_stack_form(s, src, n) == PW_OK || segment_load_form(s, src, n) == PW_OK ||
+         enter_form(s, src, n) == PW_OK || word_register_stack_form(s, src, n) == PW_OK ||
+         all_registers_form(s, src, n) == PW_OK ||
+         ecx_branch_form(s, src, n) == PW_OK)) {
         h->executed++;
         return PW_OK;
     }

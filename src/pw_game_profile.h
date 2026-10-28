@@ -10,11 +10,20 @@
  *   scaling = fit          ; fit (keep aspect, fill the screen), integer, stretch
  *   view = window          ; window: show the game's windows; desktop: all of it
  *   show_fps = true        ; a frame-rate counter in the top left (default: true):
- *                          ; DXVK's HUD, or Mesa's for graphics = opengl
- *   refresh = 120          ; output refresh rate for graphics = opengl: 60 or 120
- *                          ; (default 60); a display without 120 Hz stays at 60
- *   opengl_thread = true   ; graphics = opengl: run OpenGL on its own CPU thread
- *                          ; (Mesa's glthread), beside the game (default: false)
+ *                          ; DXVK's HUD, or Mesa's for graphics = opengl; with
+ *                          ; framegen, frame generation's own instead, the
+ *                          ; game's frames and the screen's pictures a second
+ *                          ; ("30 -> 60", PW_FRAMEGEN_HUD), for any backend
+ *   menu = true            ; L3+R3 opens prospero-win's menu over the game
+ *                          ; (pw_game_menu; drawn by DXVK's HUD, so DXVK games
+ *                          ; only); default false
+ *   framegen = 2           ; frame generation: the screen gets 2, 3 or 4
+ *                          ; pictures for each frame the game draws, the ones
+ *                          ; between made by MihawkGen in the Vulkan driver
+ *                          ; (PW_FRAMEGEN); off by default. At the console's
+ *                          ; 60 Hz, 2 takes a 30 fps game to 60
+ *   refresh = 120          ; accepted and ignored: it set the PS5 OpenGL SDK's
+ *   opengl_thread = true   ; output rate and glthread, which Zink replaced
  *
  *   [input]
  *   preset = pinball       ; an input file shared between profiles
@@ -23,19 +32,24 @@
  *                          ; when nothing is bound, keyboard otherwise
  *   mouse = right_stick    ; a stick moves the pointer: left_stick, right_stick, none
  *   mouse_speed = 1200     ; pointer pixels per second at full tilt
- *   keyboard_stick = right_stick ; turn one stick into key presses: left_stick,
- *                                ; right_stick or none (default none)
- *   stick_deadzone = 25    ; activation threshold, percent (5..70)
- *   stick_up = w           ; keys for the four stick directions; defaults WASD
- *   stick_down = s
- *   stick_left = a
- *   stick_right = d
  *   cross = space          ; <button> = <key> | mouse_left | mouse_right |
  *   r2 = mouse_left        ;            mouse_middle | vk:0xNN | none
+ *   player2 = pinball-p2   ; a keyboard preset for a second DualSense, the pad
+ *                          ; of another signed-in user (local multiplayer)
  *
  *   [debug]
  *   winedebug = +seh,+virtual   ; Wine's debug channels for this game (default:
  *                               ; the title's, err+all,+loaddll,+process)
+ *   env = PW_NATIVE_PROFILE=1   ; one more variable for Wine's environment,
+ *                               ; up to 5 env lines: names start with PW_,
+ *                               ; DXVK_, VKD3D_, MESA_, GALLIUM_, ZINK_, RADV_
+ *                               ; or VK_,
+ *                               ; and may not be one the title sets itself
+ *                               ; (PW_VK_BATCH, PW_INPUT_SHARED_FAST,
+ *                               ; PW_QPC_TSC_*, GALLIUM_DRIVER, DXVK_HUD
+ *                               ; or GALLIUM_HUD while show_fps or menu is on,
+ *                               ; and PW_FRAMEGEN* while framegen is on);
+ *                               ; values: letters, digits and _ + - , . = : /
  *
  *   [runtime]
  *   thread_scheduling = true    ; Windows threads take turns and get their
@@ -44,11 +58,16 @@
  *   cpu = native                ; a 32-bit game's CPU backend: native (runs
  *                               ; its code directly, with Vulkan batching) or
  *                               ; translator (wowprospero); default native,
- *                               ; translator for OpenGL games
- *   native_profile = true       ; sample native CPU threads and PCs (debug;
- *                               ; may terminate the game on signal failure)
- *   dxvk_config = d3d9.maxAvailableMemory = 256
- *                               ; semicolon-separated DXVK_CONFIG options
+ *                               ; translator for builtin OpenGL games; native
+ *                               ; for explicit graphics=zink
+ *   shared_input = true         ; GetKeyState answered from Wine's shared
+ *                               ; input memory, without a crossing
+ *                               ; (PW_INPUT_SHARED_FAST=1); default false
+ *   fast_clock = true           ; QueryPerformanceCounter from the TSC
+ *                               ; (patch 0900): the title measures the TSC
+ *                               ; frequency at launch and sets
+ *                               ; PW_QPC_TSC_VALIDATED/PW_QPC_TSC_HZ only
+ *                               ; when it is consistent; default false
  *
  * Buttons: cross circle square triangle l1 r1 l2 r2 l3 r3 up down left
  * right options create touchpad. An input preset file holds only an [input]
@@ -65,7 +84,7 @@ enum {
     PW_GAME_DESKTOP_MAX_W = 3840, PW_GAME_DESKTOP_MAX_H = 2160,
     PW_GAME_MOUSE_SPEED_DEFAULT = 1200, PW_GAME_MOUSE_SPEED_MAX = 20000,
     PW_GAME_WINEDEBUG_CAPACITY = 128,
-    PW_GAME_DXVK_CONFIG_CAPACITY = 160,
+    PW_GAME_DEBUG_ENV_MAX = 5, PW_GAME_DEBUG_ENV_NAME = 48, PW_GAME_DEBUG_ENV_VALUE = 96,
 };
 
 typedef enum PwGameScaling { PW_GAME_SCALING_FIT = 0, PW_GAME_SCALING_INTEGER,
@@ -86,12 +105,9 @@ typedef struct PwGameInput {
     PwGameInputMode mode;
     PwGameStick mouse;
     uint32_t mouse_speed;
-    PwGameStick keyboard_stick;      /* digital key presses from this stick */
-    uint8_t stick_deadzone;          /* percent, 5..70 */
-    uint8_t stick_keys_set;          /* directions explicitly set by this profile/preset */
-    uint16_t stick_keys[4];          /* up, down, left, right; defaults to W, S, A, D */
     PwGameBinding bindings[PW_GAME_BUTTON_COUNT];   /* in PW_GAME_BUTTON order */
     char preset[PW_APP_ID_CAPACITY];
+    char player2[PW_APP_ID_CAPACITY];   /* the second pad's preset, profile only */
     uint32_t set;       /* which of mode/mouse/mouse_speed a file set (overlay) */
 } PwGameInput;
 
@@ -100,28 +116,37 @@ typedef struct PwGameDisplay {
     PwGameScaling scaling;
     PwGameView view;            /* window by default: a small game fills the TV */
     int show_fps;               /* the graphics backend's frame-rate counter */
-    uint32_t refresh;           /* Hz an OpenGL game asks the display for: 60 or 120 */
-    int opengl_thread;          /* OpenGL calls run on Mesa's glthread worker */
+    int menu;                   /* the in-game menu (pw_game_menu) */
+    uint32_t framegen;          /* pictures per game frame, 2..4; 0 off (PW_FRAMEGEN) */
+    uint32_t refresh;           /* parsed (60 or 120) but unused since Zink */
+    int opengl_thread;          /* parsed but unused since Zink */
 } PwGameDisplay;
 
 /* [runtime] cpu: the CPU backend a 32-bit game runs under. */
 typedef enum PwGameCpu {
-    PW_GAME_CPU_DEFAULT = 0,    /* native, except OpenGL games: the translator */
+    PW_GAME_CPU_DEFAULT = 0,    /* native */
     PW_GAME_CPU_NATIVE = 1,
     PW_GAME_CPU_TRANSLATOR = 2,
 } PwGameCpu;
 
 typedef struct PwGameRuntime {
     int thread_scheduling;      /* WINE_PS5_SCHED=1 */
-    int nglide_desktop_resolution; /* set nGlide's Resolution registry value */
     PwGameCpu cpu;
-    int native_profile;         /* native CPU counters, thread watch and PC samples */
-    char dxvk_config[PW_GAME_DXVK_CONFIG_CAPACITY]; /* DXVK_CONFIG, inline DXVK options */
+    int shared_input;           /* PW_INPUT_SHARED_FAST=1 */
+    int fast_clock;             /* the title calibrates the TSC, then sets
+                                   PW_QPC_TSC_VALIDATED and PW_QPC_TSC_HZ */
 } PwGameRuntime;
 
 /* A variable of Wine's environment; both strings are static. */
 typedef struct PwGameEnv { const char *name, *value; } PwGameEnv;
-enum { PW_GAME_RUNTIME_ENV_MAX = 2, PW_GAME_CPU_ENV_MAX = 5 };
+
+/* [debug] env = NAME=VALUE: one extra variable for Wine's environment. */
+typedef struct PwGameDebugEnv {
+    char name[PW_GAME_DEBUG_ENV_NAME];
+    char value[PW_GAME_DEBUG_ENV_VALUE];
+} PwGameDebugEnv;
+enum { PW_GAME_RUNTIME_ENV_MAX = 2, PW_GAME_CPU_ENV_MAX = 2, PW_GAME_GRAPHICS_ENV_MAX = 4,
+       PW_GAME_CLOCK_ENV_MAX = 2 };
 
 typedef struct PwGameProfile {
     PwAppProfile app;
@@ -129,6 +154,8 @@ typedef struct PwGameProfile {
     PwGameInput input;          /* this profile's own [input] lines */
     /* [debug] winedebug: WINEDEBUG for this game, empty for the title's. */
     char winedebug[PW_GAME_WINEDEBUG_CAPACITY];
+    PwGameDebugEnv debug_env[PW_GAME_DEBUG_ENV_MAX];    /* [debug] env lines */
+    size_t debug_env_count;
     PwGameRuntime runtime;      /* [runtime], everything off by default */
 } PwGameProfile;
 
@@ -137,16 +164,29 @@ typedef struct PwGameProfile {
  * PW_ERR_* status. */
 int pw_game_profile_parse(const uint8_t *bytes, size_t length, PwGameProfile *profile);
 /* The variables runtime sets in Wine's environment, into env, which has
- * room for PW_GAME_RUNTIME_ENV_MAX; how many. */
+ * room for PW_GAME_RUNTIME_ENV_MAX; how many. fast_clock is not among them:
+ * its frequency is measured at launch (src/pw_tsc_calibrate.h), and the
+ * title adds up to PW_GAME_CLOCK_ENV_MAX variables itself. */
 size_t pw_game_runtime_env(const PwGameRuntime *runtime, PwGameEnv *env);
 /* Whether a game runs on the native WoW64 CPU: only 32-bit games; [runtime]
- * cpu when set, else native unless the game draws with OpenGL, whose calls
- * the Vulkan batching does not cover. */
+ * cpu when set, else native. OpenGL games draw through Zink, whose Vulkan
+ * calls the batching covers like DXVK's. */
 int pw_game_cpu_native(const PwGameProfile *profile);
 /* The variables that select the native CPU, which always comes with Vulkan
  * batching (WINE_PS5_WOW64_CPU, PW_VK_BATCH), into env, which has room for
  * PW_GAME_CPU_ENV_MAX; how many (0 for the translator). */
 size_t pw_game_cpu_env(const PwGameProfile *profile, PwGameEnv *env);
+
+/* Graphics-specific environment, at most PW_GAME_GRAPHICS_ENV_MAX entries.
+ * graphics = opengl (or zink) selects GALLIUM_DRIVER=zink and
+ * PW_VK_DEFER_DESCRIPTORS=1 (unless [debug] env sets that variable, the
+ * opt-out), with Mesa's FPS HUD when show_fps is on; the launcher installs the architecture's Zink
+ * provider from win/mesa-zink/{i386-windows,x86_64-windows} and refuses the
+ * launch when it is missing. */
+size_t pw_game_graphics_env(const PwGameProfile *profile, PwGameEnv *env);
+/* The [debug] env variables, into env, which has room for
+ * PW_GAME_DEBUG_ENV_MAX; how many. The strings live in profile. */
+size_t pw_game_debug_env(const PwGameProfile *profile, PwGameEnv *env);
 /* An input with nothing bound, keyboard mode, no pointer. */
 void pw_game_input_init(PwGameInput *input);
 /* Parse an input preset file (one [input] section, no preset= line) into

@@ -9,6 +9,7 @@
 #include "vulkan_private.h"
 #include "pw_vk_wire.h"
 #include "pw_vk_batch.h"
+#include "pw_vk_codec.h"
 #include "pw_vk_command_stream.h"
 int pw_wine_vk_replay(uint32_t op,const void *wire,size_t bytes)
 {
@@ -38,14 +39,51 @@ int pw_wine_vk_replay(uint32_t op,const void *wire,size_t bytes)
 }
 
 extern NTSTATUS pw_vk_batch_dispatch(unsigned int,void *);
-static int preflight(void *unused,const struct pw_vk_stream_record *r){(void)unused;return !(r->payload_bytes<=4096&&pw_vk_wire_validate(r->opcode,r->payload,r->payload_bytes));}
-static int replay(void *unused,const struct pw_vk_stream_record *r){(void)unused;return !pw_wine_vk_replay(r->opcode,r->payload,r->payload_bytes);}
+extern NTSTATUS pw_vk_batch_dispatch_native(unsigned int,void *);
+/* Each entry owns its arena, including recursive and concurrent invocations.
+ * Common records need no heap allocation; unusually large schemas retain the
+ * existing bound and grow at most once across preflight and replay. */
+struct replay_context {
+ uint64_t local[512];
+ void *arena; size_t capacity; unsigned version; NTSTATUS failure;
+};
+static int generated_record(struct replay_context *ctx,const struct pw_vk_stream_record *r,void **params)
+{
+ unsigned code;
+ if(ctx->version!=PW_VK_BATCH_VERSION||r->payload_bytes<4||r->payload_bytes>PW_VK_CODEC_MAX_BYTES)return 0;
+ memcpy(&code,r->payload,4);
+ if(code>=unix_pw_vk_batch)return 0;
+ if(pw_vk_generated_decode(code,r->payload+4,r->payload_bytes-4,ctx->arena,ctx->capacity,params))return 1;
+ if(ctx->arena!=ctx->local)return 0;
+ /* A small-arena failure may be capacity or invalid input. Retry once at the
+  * full bound so no valid schema loses coverage; malformed input still has no
+  * effects because this happens during the complete semantic preflight. */
+ if(!(ctx->arena=malloc(PW_VK_CODEC_DECODE_BYTES))){ctx->failure=STATUS_NO_MEMORY;return 0;}
+ ctx->capacity=PW_VK_CODEC_DECODE_BYTES;
+ return pw_vk_generated_decode(code,r->payload+4,r->payload_bytes-4,ctx->arena,ctx->capacity,params);
+}
+static int preflight(void *context,const struct pw_vk_stream_record *r)
+{
+ struct replay_context *ctx=context;void *params;
+ if(r->opcode==PW_VK_BATCH_GENERATED_OPCODE)return !generated_record(ctx,r,&params);
+ return !(r->payload_bytes<=4096&&pw_vk_wire_validate(r->opcode,r->payload,r->payload_bytes));
+}
+static int replay(void *context,const struct pw_vk_stream_record *r)
+{
+ struct replay_context *ctx=context;void *params;unsigned code;
+ if(r->opcode!=PW_VK_BATCH_GENERATED_OPCODE)return !pw_wine_vk_replay(r->opcode,r->payload,r->payload_bytes);
+ if(!generated_record(ctx,r,&params))return 1;
+ memcpy(&code,r->payload,4);return pw_vk_batch_dispatch_native(code,params)!=STATUS_SUCCESS;
+}
 NTSTATUS pw_vk_batch_unix(void *args)
 {
- struct pw_vk_batch_params *p=args;size_t completed;
- if(p->version!=PW_VK_BATCH_VERSION||p->bytes>PW_VK_BATCH_SCRATCH||p->code>unix_count||p->code==unix_pw_vk_batch)return STATUS_INVALID_PARAMETER;
- if(pw_vk_stream_replay(UlongToPtr(p->batch),p->bytes,preflight,NULL,&completed)!=PW_VK_STREAM_OK)return STATUS_INVALID_PARAMETER;
- if(pw_vk_stream_replay(UlongToPtr(p->batch),p->bytes,replay,NULL,&completed)!=PW_VK_STREAM_OK)return STATUS_UNSUCCESSFUL;
+ struct pw_vk_batch_params *p=args;size_t completed;struct replay_context ctx;NTSTATUS status=STATUS_SUCCESS;
+ if((p->version!=PW_VK_BATCH_VERSION&&p->version!=PW_VK_BATCH_LEGACY_VERSION)||p->bytes>PW_VK_BATCH_SCRATCH||p->code>unix_count||p->code==unix_pw_vk_batch)return STATUS_INVALID_PARAMETER;
+ ctx.version=p->version;ctx.arena=ctx.local;ctx.capacity=sizeof(ctx.local);ctx.failure=STATUS_SUCCESS;
+ if(pw_vk_stream_replay(UlongToPtr(p->batch),p->bytes,preflight,&ctx,&completed)!=PW_VK_STREAM_OK)status=ctx.failure?ctx.failure:STATUS_INVALID_PARAMETER;
+ else if(pw_vk_stream_replay(UlongToPtr(p->batch),p->bytes,replay,&ctx,&completed)!=PW_VK_STREAM_OK)status=STATUS_UNSUCCESSFUL;
+ if(ctx.arena&&ctx.arena!=ctx.local)free(ctx.arena);
+ if(status)return status;
  p->status=STATUS_SUCCESS;
  /* unix_count is the private flush-only sentinel. This check occurs before
   * any dispatch; ordinary perf-critical thunks really return void. */
