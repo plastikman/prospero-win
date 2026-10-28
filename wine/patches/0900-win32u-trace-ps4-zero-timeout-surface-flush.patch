@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Subject: [PATCH] win32u: split PS4 zero-timeout input pump timing
+
+The DirectInput probe measures long zero-timeout MsgWaitForMultipleObjectsEx
+calls, but not which part is slow. Time the PS4 surface flush and Wine message
+handling separately, and emit sparse phase markers to identify a wait that
+does not return. Other wait_objects calls keep the original path.
+---
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 8c9a2aaef7..8f1b17370f 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -3454,11 +3454,57 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
+ static DWORD wait_objects( DWORD count, const HANDLE *handles, DWORD timeout,
+                            DWORD wake_mask, DWORD changed_mask, DWORD flags )
+ {
++    static DWORD last_slow_flush_log, last_slow_wait_log, last_probe_log;
++    static LONG first_wait_logged;
++    DWORD start, elapsed, result;
++    BOOL log_probe;
++
+     assert( count );  /* we must have at least the server queue */
+ 
+-    flush_window_surfaces( TRUE );
++    if (!InterlockedCompareExchange( &first_wait_logged, 1, 0 ))
++        WARN( "PS4-DI first wait count=%u handles=%p timeout=%u wake=%#x changed=%#x flags=%#x tid=%u\n",
++              count, handles, timeout, wake_mask, changed_mask, flags, GetCurrentThreadId() );
++
++    if (timeout || count != 1 || wake_mask || changed_mask != QS_ALLINPUT || flags)
++    {
++        flush_window_surfaces( TRUE );
++        return wait_message( count, handles, timeout, wake_mask, changed_mask, flags );
++    }
++
++    start = NtGetTickCount();
++    log_probe = !last_probe_log || start - last_probe_log >= 1000;
++    if (log_probe)
++    {
++        last_probe_log = start;
++        WARN( "PS4-DI wait phase=flush-begin tid=%u\n", GetCurrentThreadId() );
++    }
++    flush_window_surfaces( TRUE );
++    elapsed = NtGetTickCount() - start;
++    if (log_probe)
++        WARN( "PS4-DI wait phase=flush-end ms=%u tid=%u\n",
++              elapsed, GetCurrentThreadId() );
++    if (elapsed >= 5 && NtGetTickCount() - last_slow_flush_log >= 250)
++    {
++        last_slow_flush_log = NtGetTickCount();
++        WARN( "PS4-DI zero-timeout surface flush ms=%u tid=%u\n",
++              elapsed, GetCurrentThreadId() );
++    }
+ 
+-    return wait_message( count, handles, timeout, wake_mask, changed_mask, flags );
++    if (log_probe)
++        WARN( "PS4-DI wait phase=message-begin tid=%u\n", GetCurrentThreadId() );
++    start = NtGetTickCount();
++    result = wait_message( count, handles, timeout, wake_mask, changed_mask, flags );
++    elapsed = NtGetTickCount() - start;
++    if (log_probe)
++        WARN( "PS4-DI wait phase=message-end ms=%u result=%#x tid=%u\n",
++              elapsed, result, GetCurrentThreadId() );
++    if (elapsed >= 5 && NtGetTickCount() - last_slow_wait_log >= 250)
++    {
++        last_slow_wait_log = NtGetTickCount();
++        WARN( "PS4-DI zero-timeout message handling ms=%u tid=%u\n",
++              elapsed, GetCurrentThreadId() );
++    }
++    return result;
+ }
+ 
+ static HANDLE normalize_std_handle( HANDLE handle )
+-- 
+2.43.0

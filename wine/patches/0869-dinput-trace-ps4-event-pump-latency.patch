@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 15 Oct 2026 08:30:00 -0700
+Subject: [PATCH] dinput: trace slow PS4 event-pump calls
+
+GetDeviceData can call check_dinput_events through the keyboard poll hook.
+Measure the zero-timeout message pump and report only calls taking at least
+5 ms, rate-limited to keep the trace quiet during normal polling.
+---
+--- a/dlls/dinput/dinput_main.c
++++ b/dlls/dinput/dinput_main.c
+@@ -495,6 +495,8 @@
+ 
+ void check_dinput_events(void)
+ {
++    static DWORD last_slow_log;
++    DWORD start, result, elapsed;
+     /* Windows does not do that, but our current implementation of winex11
+      * requires periodic event polling to forward events to the wineserver.
+      *
+@@ -506,7 +508,15 @@
+      * - some games do not explicitly poll for keyboard events
+      *   (for example Morrowind in its key binding page)
+      */
+-    MsgWaitForMultipleObjectsEx(0, NULL, 0, QS_ALLINPUT, 0);
++    start = GetTickCount();
++    result = MsgWaitForMultipleObjectsEx(0, NULL, 0, QS_ALLINPUT, 0);
++    elapsed = GetTickCount() - start;
++    if (elapsed >= 5 && GetTickCount() - last_slow_log >= 250)
++    {
++        last_slow_log = GetTickCount();
++        WARN( "PS4-DI slow event pump result=%#lx ms=%lu tid=%lu\n",
++              result, elapsed, GetCurrentThreadId() );
++    }
+ }
+ 
+ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
+-- 
+2.43.0

@@ -1,0 +1,166 @@
+Subject: [PATCH] server/win32u: retain the shared input pipe instead of dup on PS4
+
+diff --git a/server/fd.c b/server/fd.c
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -154,6 +154,7 @@
+     WCHAR               *nt_name;     /* NT file name */
+     data_size_t          nt_namelen;  /* length of NT file name */
+     int                  unix_fd;     /* unix file descriptor */
++    struct object       *fd_owner;    /* retained owner for a borrowed descriptor */
+     unsigned int         no_fd_status;/* status to return when unix_fd is -1 */
+     unsigned int         cacheable :1;/* can the fd be cached on the client side? */
+     unsigned int         fs_locks :1; /* can we use filesystem locks for this fd? */
+@@ -1670,10 +1671,11 @@
+     }
+     else  /* no inode, close it right away */
+     {
+-        if (fd->unix_fd != -1) close( fd->unix_fd );
++        if (fd->unix_fd != -1 && !fd->fd_owner) close( fd->unix_fd );
+         free( fd->unix_name );
+     }
+     if (fd->sync) release_object( fd->sync );
++    if (fd->fd_owner) release_object( fd->fd_owner );
+ }
+ 
+ /* check if the desired access is possible without violating */
+@@ -1791,6 +1793,7 @@
+     fd->options    = 0;
+     fd->sharing    = 0;
+     fd->unix_fd    = -1;
++    fd->fd_owner   = NULL;
+     fd->unix_name  = NULL;
+     fd->nt_name    = NULL;
+     fd->nt_namelen = 0;
+@@ -2310,6 +2313,20 @@
+     return NULL;
+ }
+ 
++/* The in-process server shares the native descriptor table. Keep its owner
++ * alive instead of dup(), which PS4 titles cannot use. Allocation failure
++ * leaves the borrowed descriptor open. */
++struct fd *create_borrowed_fd( const struct fd_ops *ops, int unix_fd,
++                               struct object *user, struct object *owner )
++{
++    struct fd *fd = alloc_fd_object();
++    if (!fd) return NULL;
++    set_fd_user( fd, ops, user );
++    fd->unix_fd = unix_fd;
++    fd->fd_owner = grab_object( owner );
++    return fd;
++}
++
+ /* retrieve the object that is using an fd */
+ void *get_fd_user( struct fd *fd )
+ {
+diff --git a/server/file.h b/server/file.h
+--- a/server/file.h
++++ b/server/file.h
+@@ -306,2 +306,5 @@
+ 
++extern struct fd *create_borrowed_fd( const struct fd_ops *ops, int unix_fd,
++                                       struct object *user, struct object *owner );
++
+ #endif  /* __WINE_SERVER_FILE_H */
+diff --git a/server/queue.c b/server/queue.c
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -3104,13 +3104,19 @@
+ 
+     if ((unix_fd = get_file_unix_fd( file )) != -1)
+     {
++#ifdef __PROSPERO__
++        queue->fd = create_borrowed_fd( &msg_queue_fd_ops, unix_fd, &queue->obj,
++                                         (struct object *)file );
++        if (queue->fd) set_fd_events( queue->fd, POLLIN );
++#else
+         if ((unix_fd = dup( unix_fd )) != -1)
+         {
+             queue->fd = create_anonymous_fd( &msg_queue_fd_ops, unix_fd, &queue->obj, 0 );
+-            set_fd_events( queue->fd, POLLIN );
++            if (queue->fd) set_fd_events( queue->fd, POLLIN );
+         }
+         else
+             file_set_error();
++#endif
+     }
+     release_object( file );
+ }
+diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
+--- a/dlls/win32u/ps5drv.c
++++ b/dlls/win32u/ps5drv.c
+@@ -42,6 +42,7 @@
+ 
+ #include <dlfcn.h>
+ #include <pthread.h>
++#include <poll.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -340,7 +341,9 @@
+ static void register_input_fd(void)
+ {
+     DWORD tid = GetCurrentThreadId();
+-    HANDLE handle;
++    static HANDLE handle;
++    static pthread_mutex_t handle_lock = PTHREAD_MUTEX_INITIALIZER;
++    NTSTATUS status;
+     UINT i;
+     int fd;
+ 
+@@ -355,14 +358,19 @@
+     input_threads[input_thread_count++] = tid;
+     pthread_mutex_unlock( &screen_lock );
+ 
+-    if (wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, &handle )) return;
++    /* One persistent handle owns the title's shared wake pipe. Queue poll
++     * objects borrow it; creating separate file owners would double-close it. */
++    pthread_mutex_lock( &handle_lock );
++    status = handle ? 0 : wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, &handle );
++    pthread_mutex_unlock( &handle_lock );
++    if (status) { WARN( "input fd registration failed %#x\n", status ); return; }
+     SERVER_START_REQ( set_queue_fd )
+     {
+         req->handle = wine_server_obj_handle( handle );
+-        wine_server_call( req );
++        status = wine_server_call( req );
+     }
+     SERVER_END_REQ;
+-    NtClose( handle );
++    TRACE( "input queue tid=%04x fd=%d status=%#x\n", tid, fd, status );
+ }
+ 
+ static BOOL ps5_CreateWindow( HWND hwnd )
+@@ -556,7 +564,18 @@
+         /* drain the wake pipe first: input posted from now on wakes again */
+         char buffer[64];
+         int fd = input_fd();
+-        if (fd != -1) while (read( fd, buffer, sizeof(buffer) ) > 0) {}
++        if (fd != -1)
++        {
++#ifdef __PROSPERO__
++            /* PS4 refuses non-blocking mode. A second unconditional read
++             * would park the UI thread after draining the available bytes. */
++            struct pollfd wake = { fd, POLLIN, 0 };
++            while (poll( &wake, 1, 0 ) > 0 && (wake.revents & POLLIN))
++                if (read( fd, buffer, sizeof(buffer) ) <= 0) break;
++#else
++            while (read( fd, buffer, sizeof(buffer) ) > 0) {}
++#endif
++        }
+     }
+     while (processed < PS5_INPUT_BATCH && next_input( &event ))
+     {
+@@ -569,7 +588,11 @@
+             input.ki.wVk = event.code;
+             input.ki.wScan = NtUserMapVirtualKeyEx( event.code, MAPVK_VK_TO_VSC, NtUserGetKeyboardLayout( 0 ));
+             input.ki.dwFlags = event.down ? 0 : KEYEVENTF_KEYUP;
+-            NtUserSendHardwareInput( hwnd, 0, &input, 0 );
++            {
++                NTSTATUS status = NtUserSendHardwareInput( hwnd, 0, &input, 0 );
++                TRACE( "key hwnd=%p vk=%#x scan=%#x down=%u status=%#x\n",
++                       hwnd, input.ki.wVk, input.ki.wScan, event.down, status );
++            }
+             break;
+         case 2:
+             move_cursor( hwnd, event.x, event.y );

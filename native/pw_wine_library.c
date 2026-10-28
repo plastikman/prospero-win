@@ -8,7 +8,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <dirent.h>
-#ifndef __linux__
+/* The PS4 SDK declares getdents in <dirent.h> as
+ *   int getdents(int, struct dirent *, size_t);
+ * so redeclaring it here is a conflicting type rather than a missing one. */
+#if !defined(__linux__) && !defined(__PS4__)
 int getdents(int fd, char *buffer, int size);
 #endif
 
@@ -112,7 +115,11 @@ static int scan_getdents(PwWineLibrary *library, const char *directory)
     int fd = open(directory, O_RDONLY | O_DIRECTORY), got, error;
 
     if (fd < 0) return -1;
+    #if defined(__PS4__)
+    while ((got = (int)getdents(fd, (struct dirent *)buffer, sizeof(buffer))) > 0)
+#else
     while ((got = getdents(fd, (char *)buffer, sizeof(buffer))) > 0)
+#endif
         if (pw_wine_library_dirents(buffer, (size_t)got, add_name, library) < 0) {
             errno = EINVAL;
             got = -1;

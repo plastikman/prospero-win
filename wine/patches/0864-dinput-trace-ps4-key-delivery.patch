@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Wed, 14 Oct 2026 20:00:00 -0700
+Subject: [PATCH] dinput: trace PS4 keyboard delivery without per-frame spam
+
+Log changed keyboard states, buffered events returned to the game, and
+sampled non-empty state polls. This identifies whether controller-generated
+keys reach the PE32 game's DirectInput state and queue without enabling the
+high-volume +dinput trace.
+---
+--- a/dlls/dinput/keyboard.c
++++ b/dlls/dinput/keyboard.c
+@@ -107,6 +107,7 @@
+ 
+     impl->base.device_state[dik_code] = new_diks;
+     TRACE( "setting key %02x to %02x\n", dik_code, impl->base.device_state[dik_code] );
++    WARN( "PS4-DI event scan=%02x state=%02x vk=%02lx\n", dik_code, new_diks, vkey );
+ 
+     EnterCriticalSection( &impl->base.crit );
+ 
+--- a/dlls/dinput/device.c
++++ b/dlls/dinput/device.c
+@@ -1450,6 +1450,8 @@
+         .dwObj = 0,
+     };
+     HRESULT hr;
++    int first_pressed = -1;
++    static DWORD last_keyboard_poll_log;
+ 
+     TRACE( "iface %p, size %lu, data %p.\n", iface, size, data );
+ 
+@@ -1495,7 +1497,15 @@
+ 
+         hr = DI_OK;
+     }
++    if (hr == DI_OK && GET_DIDEVICE_TYPE( impl->instance.dwDevType ) == DI8DEVTYPE_KEYBOARD)
++        for (DWORD i = 0; i < size; ++i)
++            if (user_state[i] & 0x80) { first_pressed = i; break; }
+     LeaveCriticalSection( &impl->crit );
++    if (first_pressed >= 0 && GetTickCount() - last_keyboard_poll_log >= 250)
++    {
++        last_keyboard_poll_log = GetTickCount();
++        WARN( "PS4-DI poll key-state scan=%02x\n", first_pressed );
++    }
+ 
+     return hr;
+ }
+@@ -1505,6 +1515,8 @@
+ {
+     struct dinput_device *This = impl_from_IDirectInputDevice8W( iface );
+     HRESULT ret = DI_OK;
++    DIDEVICEOBJECTDATA first_event;
++    BOOL log_keyboard_event = FALSE;
+     int len;
+ 
+     TRACE( "iface %p, size %lu, data %p, count %p, flags %#lx.\n", iface, size, data, count, flags );
+@@ -1527,6 +1539,11 @@
+     if (len < 0) len += This->queue_len;
+ 
+     if ((*count != INFINITE) && (len > *count)) len = *count;
++    if (len && GET_DIDEVICE_TYPE( This->instance.dwDevType ) == DI8DEVTYPE_KEYBOARD)
++    {
++        first_event = This->data_queue[This->queue_tail];
++        log_keyboard_event = TRUE;
++    }
+ 
+     if (data)
+     {
+@@ -1550,6 +1567,9 @@
+     }
+ 
+     LeaveCriticalSection(&This->crit);
++    if (log_keyboard_event)
++        WARN( "PS4-DI queue count=%d first scan=%#lx data=%#lx\n", len,
++              first_event.dwOfs, first_event.dwData );
+ 
+     TRACE( "Returning %lu events queued\n", *count );
+     return ret;
+-- 
+2.43.0

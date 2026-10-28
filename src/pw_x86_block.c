@@ -4,6 +4,23 @@
 #include "pw_x87.h"
 #include <string.h>
 
+/* ⚠ DIAGNOSTIC. PW_ERR_VM is returned from twenty places in the translator --
+ * a refused host allocation, guest memory it cannot read, a span that leaves
+ * the 32-bit address space, a block that would not execute -- and they all
+ * arrive at the caller as the same number:
+ *     err:wow:BTCpuSimulate DBT error -9 at eip 0x7bf33290, fault address 0
+ * Name the one that fired. Bounded, and only on the console: this file also
+ * builds for the host, which has no klog. */
+#ifdef __PROSPERO__
+extern void pw_wow_log( const char *format, ... );
+#define PW_VM_NOTE(tag) do { \
+        static int pw_vm_left = 4; \
+        if (pw_vm_left > 0) { pw_vm_left--; pw_wow_log( "wowprospero: PW_ERR_VM at %s\n", tag ); } \
+    } while (0)
+#else
+#define PW_VM_NOTE(tag) ((void)0)
+#endif
+
 /* Context accesses below use signed disp8 encodings. Fail at build time if
  * future state-layout changes would silently address the wrong field. */
 _Static_assert(offsetof(PwX86State,eflags)<=127,"context exceeds disp8 layout");
@@ -1113,25 +1130,25 @@ static int string_dispatch(PwX86State *state,unsigned opcode,unsigned width,unsi
     uint32_t count=repeat?state->gpr[1]:1;
     if(!count)return PW_OK;
     uint64_t span=(uint64_t)count*width;
-    if(span>0x100000000ull)return PW_ERR_VM;
+    if(span>0x100000000ull){ PW_VM_NOTE("pw_x86_block.c:1139"); return PW_ERR_VM; }
     unsigned backwards=!!(state->eflags&0x400);uint32_t destination=state->gpr[7],source=state->gpr[6];
     uint32_t dst_low=destination;
     if(backwards) {
         uint64_t retreat=(uint64_t)(count-1)*width;
-        if(retreat>destination)return PW_ERR_VM;
+        if(retreat>destination){ PW_VM_NOTE("pw_x86_block.c:1144"); return PW_ERR_VM; }
         dst_low=destination-(uint32_t)retreat;
-    } else if((uint64_t)destination+span>0x100000000ull)return PW_ERR_VM;
+    } else if((uint64_t)destination+span>0x100000000ull){ PW_VM_NOTE("pw_x86_block.c:1146"); return PW_ERR_VM; }
     unsigned moving=opcode==0xa4 || opcode==0xa5;
     unsigned comparing=opcode==0xa6 || opcode==0xa7;
-    if(!memory_range_pointer(state,dst_low,comparing?0:1,span))return PW_ERR_VM;
+    if(!memory_range_pointer(state,dst_low,comparing?0:1,span)){ PW_VM_NOTE("pw_x86_block.c:1149"); return PW_ERR_VM; }
     uint32_t src_low=source;
     if(moving || comparing) {
         if(backwards) {
             uint64_t retreat=(uint64_t)(count-1)*width;
-            if(retreat>source)return PW_ERR_VM;
+            if(retreat>source){ PW_VM_NOTE("pw_x86_block.c:1154"); return PW_ERR_VM; }
             src_low=source-(uint32_t)retreat;
-        } else if((uint64_t)source+span>0x100000000ull)return PW_ERR_VM;
-        if(!memory_range_pointer(state,src_low,0,span))return PW_ERR_VM;
+        } else if((uint64_t)source+span>0x100000000ull){ PW_VM_NOTE("pw_x86_block.c:1156"); return PW_ERR_VM; }
+        if(!memory_range_pointer(state,src_low,0,span)){ PW_VM_NOTE("pw_x86_block.c:1157"); return PW_ERR_VM; }
     }
     for(uint32_t i=0;i<count;i++) {
         uint32_t offset=i*width;
@@ -1285,19 +1302,19 @@ static int muldiv_dispatch(PwX86State *state,unsigned action,uint32_t operand)
         result_eax=(uint32_t)product;result_edx=(uint32_t)((uint64_t)product>>32);
         overflow=product<(int64_t)INT32_MIN || product>(int64_t)INT32_MAX;
     } else if(action==6) {
-        if(!operand)return PW_ERR_VM;
+        if(!operand){ PW_VM_NOTE("pw_x86_block.c:1311"); return PW_ERR_VM; }
         uint64_t dividend=((uint64_t)edx<<32)|eax;
         uint64_t quotient=dividend/operand;
-        if(quotient>UINT32_MAX)return PW_ERR_VM;
+        if(quotient>UINT32_MAX){ PW_VM_NOTE("pw_x86_block.c:1314"); return PW_ERR_VM; }
         result_eax=(uint32_t)quotient;result_edx=(uint32_t)(dividend%operand);
     } else {
         int32_t divisor=(int32_t)operand;
-        if(!divisor)return PW_ERR_VM;
+        if(!divisor){ PW_VM_NOTE("pw_x86_block.c:1318"); return PW_ERR_VM; }
         uint64_t bits=((uint64_t)edx<<32)|eax;int64_t dividend;
         memcpy(&dividend,&bits,sizeof(dividend));
-        if(dividend==INT64_MIN && divisor==-1)return PW_ERR_VM;
+        if(dividend==INT64_MIN && divisor==-1){ PW_VM_NOTE("pw_x86_block.c:1321"); return PW_ERR_VM; }
         int64_t quotient=dividend/divisor;
-        if(quotient<INT32_MIN || quotient>INT32_MAX)return PW_ERR_VM;
+        if(quotient<INT32_MIN || quotient>INT32_MAX){ PW_VM_NOTE("pw_x86_block.c:1323"); return PW_ERR_VM; }
         result_eax=(uint32_t)(int32_t)quotient;
         result_edx=(uint32_t)(int32_t)(dividend%divisor);
     }

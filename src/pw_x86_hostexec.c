@@ -192,6 +192,52 @@ static int segment_store(const PwX86State *s, const uint8_t *src, size_t n, size
     return PW_OK;
 }
 
+/* MOV Sreg,r/m16 (8E /r). The translator models flat data segments and the
+ * guest's fixed FS/TEB base, rather than arbitrary descriptor-table state.
+ * Accept register loads that preserve the selector already assigned to that
+ * segment; other loads need real descriptor semantics and remain refused. */
+static int segment_load_form(PwX86State *s, const uint8_t *src, size_t n, size_t at)
+{
+    uint8_t modrm;
+    unsigned reg, rm;
+    uint16_t selector;
+
+    if (at + 1 >= n) return PW_ERR_TRUNCATED;
+    modrm = src[at + 1];
+    reg = (modrm >> 3) & 7;
+    if (reg == 1 || reg > 5 || (modrm >> 6) != 3) return PW_ERR_UNSUPPORTED;
+    rm = modrm & 7;
+    selector = (uint16_t)s->gpr[rm];
+    if (selector != selector_of(s, reg)) return PW_ERR_UNSUPPORTED;
+    s->eip += (uint32_t)(at + 2);
+    return PW_OK;
+}
+
+/* The translator intentionally stops at operand-size-prefixed register
+ * PUSH/POP forms: executing them natively would use the host's 64-bit stack.
+ * Emulate the 16-bit forms on the guest stack. */
+static int word_register_stack_form(PwX86State *s, const uint8_t *src, size_t n)
+{
+    unsigned at = 0, reg;
+    uint16_t value;
+
+    if (!n || src[at++] != 0x66 || at >= n || src[at] < 0x50 || src[at] > 0x5f)
+        return PW_ERR_UNSUPPORTED;
+    reg = src[at] & 7;
+    if (src[at] < 0x58) {
+        value = (uint16_t)s->gpr[reg];
+        s->gpr[4] -= 2;
+        memcpy((void *)(uintptr_t)s->gpr[4], &value, sizeof(value));
+    } else {
+        if (reg == 4) return PW_ERR_UNSUPPORTED; /* POP SP changes stack semantics. */
+        memcpy(&value, (const void *)(uintptr_t)s->gpr[4], sizeof(value));
+        s->gpr[reg] = (s->gpr[reg] & 0xffff0000u) | value;
+        s->gpr[4] += 2;
+    }
+    s->eip += at + 1;
+    return PW_OK;
+}
+
 int pw_x86_hostexec_plan(const PwX86State *s, const uint8_t *src, size_t n,
                          PwX86HostExecPlan *plan)
 {
@@ -686,22 +732,64 @@ static int ecx_branch_form(PwX86State *s, const uint8_t *src, size_t n)
     return PW_OK;
 }
 
-/* PUSH and POP of ES, CS, SS and DS (06 07 0E 16 17 1E 1F), which 64-bit
- * mode does not have, so the host cannot run them. A push stores the
+/* ENTER's common level-zero form builds a stack frame without touching the
+ * host stack. The translator declines C8, so handle the simple prologue here;
+ * nested frame chains require the guest's prior frame links and are refused. */
+static int enter_form(PwX86State *s, const uint8_t *src, size_t n)
+{
+    unsigned at = 0, word = 0;
+    uint16_t allocation;
+    uint8_t level;
+
+    if (n && src[0] == 0x66) { word = 1; at = 1; }
+    if (at + 4 > n || src[at] != 0xc8) return PW_ERR_UNSUPPORTED;
+    memcpy(&allocation, src + at + 1, sizeof(allocation));
+    level = src[at + 3] & 0x1f;
+    if (level) return PW_ERR_UNSUPPORTED;
+    if (word) {
+        uint16_t bp = (uint16_t)s->gpr[5];
+        s->gpr[4] -= 2;
+        memcpy((void *)(uintptr_t)s->gpr[4], &bp, 2);
+        s->gpr[5] = (s->gpr[5] & 0xffff0000u) | (uint16_t)s->gpr[4];
+        s->gpr[4] -= allocation;
+    } else {
+        uint32_t old_bp = s->gpr[5];
+        s->gpr[4] -= 4;
+        memcpy((void *)(uintptr_t)s->gpr[4], &old_bp, sizeof(old_bp));
+        s->gpr[5] = s->gpr[4];
+        s->gpr[4] -= allocation;
+    }
+    s->eip += at + 4;
+    return PW_OK;
+}
+
+/* PUSH and POP of segment registers, which 64-bit mode does not have, so the
+ * host cannot run them. A push stores the
  * selector the guest sees (selector_of), zero-extended to 32 bits, or 16
  * bits with a 66 prefix. The data segments are flat, so a pop only moves ESP;
  * it takes a selector the guest could hold (null for ES and DS, or one of
  * its six) and refuses anything else, where the processor would raise #GP.
- * Miles Sound System (mss32.dll) saves and restores DS and ES this way. */
+ * Miles Sound System (mss32.dll) saves and restores DS and ES this way; MDK
+ * saves FS and GS with their 0F A0/A1/A8/A9 encodings. */
 static int segment_stack_form(PwX86State *s, const uint8_t *src, size_t n)
 {
-    unsigned at = 0, size = 4, reg, pop;
+    unsigned at = 0, size = 4, reg, pop, op_bytes = 1;
     uint32_t value = 0;
     uint16_t selector;
 
     if (n && src[0] == 0x66) { size = 2; at = 1; }
     if (at >= n) return PW_ERR_UNSUPPORTED;
-    switch (src[at]) {
+    if (src[at] == 0x0f) {
+        if (at + 1 >= n) return PW_ERR_TRUNCATED;
+        op_bytes = 2;
+        switch (src[at + 1]) {
+        case 0xa0: reg = 4; pop = 0; break;
+        case 0xa1: reg = 4; pop = 1; break;
+        case 0xa8: reg = 5; pop = 0; break;
+        case 0xa9: reg = 5; pop = 1; break;
+        default: return PW_ERR_UNSUPPORTED;
+        }
+    } else switch (src[at]) {
     case 0x06: reg = 0; pop = 0; break;
     case 0x07: reg = 0; pop = 1; break;
     case 0x0e: reg = 1; pop = 0; break;
@@ -725,7 +813,7 @@ static int segment_stack_form(PwX86State *s, const uint8_t *src, size_t n)
         }
         s->gpr[4] += size;
     }
-    s->eip += at + 1;
+    s->eip += at + op_bytes;
     return PW_OK;
 }
 
@@ -800,12 +888,23 @@ int pw_x86_hostexec_step(PwX86HostExec *h, PwX86State *s, const uint8_t *src, si
         h->executed++;
         return PW_OK;
     }
+    {
+        unsigned at = n && src[0] == 0x66 ? 1 : 0;
+        if (at < n && src[at] == 0x8e && segment_load_form(s, src, n, at) == PW_OK) {
+            h->executed++;
+            return PW_OK;
+        }
+    }
+    if (word_register_stack_form(s, src, n) == PW_OK) {
+        h->executed++;
+        return PW_OK;
+    }
     status = pw_x86_hostexec_plan(s, src, n, &plan);
     if (status == PW_ERR_UNSUPPORTED &&
         (stack_memory_form(s, src, n) == PW_OK || esp_memory_form(s, src, n) == PW_OK ||
          flags_stack_form(s, src, n) == PW_OK ||
          segment_stack_form(s, src, n) == PW_OK || all_registers_form(s, src, n) == PW_OK ||
-         ecx_branch_form(s, src, n) == PW_OK)) {
+         ecx_branch_form(s, src, n) == PW_OK || enter_form(s, src, n) == PW_OK)) {
         h->executed++;
         return PW_OK;
     }

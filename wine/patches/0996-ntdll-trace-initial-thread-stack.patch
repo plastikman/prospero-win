@@ -1,0 +1,28 @@
+From: Codex <codex@localhost>
+Subject: ntdll: trace initial thread stack on PS4
+
+Record the first TEB-backed thread-data block, its TEB and pthread identity,
+and the host stack pointer at initialization. This lets later no-TEB fault
+records be matched against the initial thread setup without adding recurring
+runtime logging.
+
+---
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4685,6 +4685,16 @@
+     list_add_head( &teb_list, &thread_data->entry );
+     pthread_key_create( &thread_data_key, NULL );
+     pthread_setspecific( thread_data_key, thread_data );
++#ifdef __PROSPERO__
++    {
++        ULONG_PTR rsp;
++        __asm__ volatile( "movq %%rsp,%0" : "=r" (rsp) );
++        ERR( "PW_INITIAL_THREAD_STACK data=%p teb=%p pthread=%p rsp=%p stack=%p-%p\n",
++             thread_data, thread_data->teb, (void *)(ULONG_PTR)pthread_self(), (void *)rsp,
++             get_kernel_stack( thread_data ),
++             (char *)get_kernel_stack( thread_data ) + kernel_stack_size );
++    }
++#endif
+     return teb;
+ }
+ 

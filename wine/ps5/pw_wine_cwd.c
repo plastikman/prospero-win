@@ -75,6 +75,16 @@ static int join_locked(const char *base, const char *path, char *out, size_t siz
 {
     size_t base_length = strlen(base), path_length = strlen(path);
 
+    /* ⚠ "." IS THE DIRECTORY ITSELF, not a name inside it. Joining it gave
+     * "<base>/.", which this console's file systems do not resolve back to the
+     * same inode: wineserver creates its server directory, chdir()s there,
+     * open(".")s it and compares st_dev/st_ino against the directory it just
+     * made -- and that comparison failed, so it died with
+     *     wineserver: chdir did not end up in <server dir>
+     * Collapse it here, where every relative path already passes through. */
+    if (!strcmp(path, ".") || !strcmp(path, "./"))
+        return copy_out(base, base_length, out, size);
+
     if (base_length && base[base_length - 1] == '/') base_length--;
     if (base_length + 1 + path_length >= size) { errno = ENAMETOOLONG; return -1; }
     memcpy(out, base, base_length);

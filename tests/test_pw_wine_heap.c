@@ -7,6 +7,32 @@
 
 enum { THREADS=8,ROUNDS=20000 };
 
+typedef struct FakeBacking {
+    void *address;
+    unsigned maps, unmaps;
+    int refuse;
+} FakeBacking;
+
+static void *fake_map(void *context,size_t bytes)
+{
+    FakeBacking *backing=context;
+    backing->maps++;
+    if(backing->refuse)return NULL;
+    backing->address=malloc(bytes);
+    return backing->address;
+}
+
+static int fake_unmap(void *context,void *address,size_t bytes)
+{
+    FakeBacking *backing=context;
+    (void)bytes;
+    if(address!=backing->address)return 1;
+    free(address);
+    backing->address=NULL;
+    backing->unmaps++;
+    return 0;
+}
+
 static void *worker(void *seed_pointer)
 {
     unsigned seed=(unsigned)(uintptr_t)seed_pointer;void *live[64]={0};size_t sizes[64]={0};
@@ -105,5 +131,20 @@ int main(void)
     for(unsigned t=0;t<THREADS;t++)assert(!pthread_join(threads[t],NULL));
     pw_wine_heap_stats(&s);
     assert(s.live_bytes==0 && !s.large_live && s.allocations==s.frees && s.peak_live_bytes>1000000);
+    /* Backing allocations are paired with their own unmap callback; refusing
+     * a later allocation falls back to anonymous mmap and munmap. */
+    FakeBacking fake={0};
+    PwWineHeapBacking callbacks={&fake,fake_map,fake_unmap};
+    pw_wine_heap_set_backing(&callbacks);
+    void *backed=pw_wine_heap_malloc(200000);
+    assert(backed && fake.maps==1 && fake.address);
+    pw_wine_heap_free(backed);
+    assert(fake.unmaps==1 && !fake.address);
+    fake.refuse=1;
+    void *fallback=pw_wine_heap_malloc(200000);
+    assert(fallback && fake.maps==2);
+    pw_wine_heap_free(fallback);
+    assert(fake.unmaps==1 && !fake.address);
+    pw_wine_heap_set_backing(NULL);
     return 0;
 }

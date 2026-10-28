@@ -81,6 +81,11 @@ typedef struct PwX86Engine {
     int8_t fault_block_map[8];
     uint8_t fault_block_code[1024];
     uint32_t fault_block_code_bytes;
+    uint32_t fault_site_guest_pc;
+    uint32_t fault_site_host_offset;
+    uint8_t fault_site_code[16];
+    uint8_t fault_site_code_bytes;
+    uint32_t fault_site_valid;
     uint32_t quantum;
     unsigned chaining_enabled;
     unsigned residency_enabled;
@@ -222,7 +227,7 @@ const PwX86CacheEntry *pw_x86_engine_host_block(const PwX86Engine *, uintptr_t r
  * must block the sampling signal; sampling allocates nothing and calls no
  * platform functions. Overflow is explicit and never replaces older rows. */
 void pw_x86_engine_sample(const PwX86Engine *, uintptr_t rip, PwX86HotspotProfile *);
-uintptr_t pw_x86_engine_fault_redirect(const PwX86Engine *, uintptr_t rip);
+uintptr_t pw_x86_engine_fault_redirect(PwX86Engine *, uintptr_t rip);
 /* Leave the statistics counters out of blocks translated from now on (they
  * are on by default): a step then reports no retired instructions, and the
  * transition and register totals stay zero. The chain budget, the link

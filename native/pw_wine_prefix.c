@@ -45,6 +45,44 @@ int pw_wine_prefix_temp_create(const char *prefix, PwPrefixTemp *temp)
     return (int)temp->count;
 }
 
+int pw_wine_prefix_nglide_desktop_resolution(const char *prefix)
+{
+    static const char section[] = "[Software\\\\Zeus Software\\\\nGlide]";
+    static const char setting[] = "\"Resolution\"=dword:00000001";
+    char path[1024], line[1024];
+    FILE *file;
+    int in_section = 0;
+
+    if (!prefix || snprintf(path, sizeof(path), "%s/user.reg", prefix) >= (int)sizeof(path))
+        return -1;
+    if (!(file = fopen(path, "r"))) return -1;
+    while (fgets(line, sizeof(line), file)) {
+        size_t length = strcspn(line, "\r\n");
+        line[length] = 0;
+        if (line[0] == '[') in_section = !strcmp(line, section);
+        else if (in_section && !strcmp(line, setting)) {
+            fclose(file);
+            return 0;
+        }
+        if (length + 1 == sizeof(line) && !feof(file)) {
+            int c;
+            while ((c = fgetc(file)) != '\n' && c != EOF) {}
+        }
+    }
+    {
+        int failed = ferror(file);
+        if (fclose(file)) failed = 1;
+        if (failed) return -1;
+    }
+    if (!(file = fopen(path, "ab"))) return -1;
+    {
+        int failed = fputs("\n[Software\\\\Zeus Software\\\\nGlide]\n\"Resolution\"=dword:00000001\n", file) == EOF;
+        if (fclose(file)) failed = 1;
+        if (failed) return -1;
+    }
+    return 1;
+}
+
 /* Whole small files; NULL when unreadable or larger than limit. */
 static unsigned char *read_file(const char *path, size_t limit, size_t *size)
 {

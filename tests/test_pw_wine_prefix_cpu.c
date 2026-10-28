@@ -48,6 +48,22 @@ int main(void)
         assert(!mkdir(system32, 0777));
     }
 
+    /* nGlide's "By desktop" mode is registry DWORD 1 in this prefix. */
+    {
+        char reg[300], buffer[512] = {0};
+        FILE *file;
+        snprintf(reg, sizeof(reg), "%s/user.reg", prefix);
+        assert(pw_wine_prefix_nglide_desktop_resolution(prefix) == -1);
+        write_file(reg, "WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\WineDbg] 123\n\"Other\"=dword:00000001\n");
+        assert(pw_wine_prefix_nglide_desktop_resolution(prefix) == 1);
+        file = fopen(reg, "rb"); assert(file);
+        assert(fread(buffer, 1, sizeof(buffer) - 1, file) > 0);
+        assert(fclose(file) == 0);
+        assert(strstr(buffer, "[Software\\\\Zeus Software\\\\nGlide]\n\"Resolution\"=dword:00000001\n"));
+        assert(pw_wine_prefix_nglide_desktop_resolution(prefix) == 0);
+        remove(reg);
+    }
+
     /* first launch copies it, the next one finds the same file */
     assert(pw_wine_prefix_cpu_install(prefix, source, "wow64native.dll") == 1);
     assert(file_is(installed, "native v1") && access(temporary, F_OK) != 0);

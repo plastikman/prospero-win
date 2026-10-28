@@ -94,6 +94,12 @@ static void test_cpu(void)
     assert(pw_game_cpu_env(&p, env) == 2);
     assert(!strcmp(env[0].name, "WINE_PS5_WOW64_CPU") && !strcmp(env[0].value, "wow64native.dll"));
     assert(!strcmp(env[1].name, "PW_VK_BATCH") && !strcmp(env[1].value, "1"));
+    assert(parse(APP_ARCH("pe32", "dxvk") "[runtime]\nnative_profile = true\n", &p) == PW_OK);
+    assert(pw_game_cpu_env(&p, env) == 4);
+    assert(!strcmp(env[2].name, "PW_NATIVE_WATCH") && !strcmp(env[2].value, "1"));
+    assert(!strcmp(env[3].name, "PW_NATIVE_PC") && !strcmp(env[3].value, "1"));
+    assert(parse(APP_ARCH("pe32", "dxvk") "[runtime]\ncpu = translator\nnative_profile = true\n", &p) == PW_OK);
+    assert(pw_game_cpu_env(&p, env) == 0); /* no native sampler on translator */
 
     assert(parse(APP_ARCH("pe32", "dxvk"), &p) == PW_OK && pw_game_cpu_native(&p) == 1);
     assert(parse(APP_ARCH("pe32", "auto"), &p) == PW_OK && pw_game_cpu_native(&p) == 1);
@@ -130,13 +136,15 @@ static void test_runtime(void)
     assert(p.runtime.thread_scheduling == 1);
     assert(pw_game_runtime_env(&p.runtime, env) == 1);
     assert(!strcmp(env[0].name, "WINE_PS5_SCHED") && !strcmp(env[0].value, "1"));
+    assert(parse(APP "[runtime]\nnglide_resolution = desktop\nthread_scheduling = true\n", &p) == PW_OK);
+    assert(p.runtime.nglide_desktop_resolution && pw_game_runtime_env(&p.runtime, env) == 1);
     /* Among the other sections, in any case. */
     assert(parse(APP "[display]\nview = desktop\n[runtime]\nThread_Scheduling = 1\n"
                  "[debug]\nwinedebug = +seh\n", &p) == PW_OK);
     assert(p.runtime.thread_scheduling == 1);
     assert(p.display.view == PW_GAME_VIEW_DESKTOP && !strcmp(p.winedebug, "+seh"));
     /* Turned off explicitly: nothing reaches the environment. */
-    assert(parse(APP "[runtime]\nthread_scheduling = FALSE\n", &p) == PW_OK);
+    assert(parse(APP "[runtime]\nthread_scheduling = FALSE\nnglide_resolution = app\n", &p) == PW_OK);
     assert(!p.runtime.thread_scheduling && pw_game_runtime_env(&p.runtime, env) == 0);
     assert(pw_game_runtime_env(NULL, env) == 0 && pw_game_runtime_env(&p.runtime, NULL) == 0);
 }
@@ -170,7 +178,11 @@ static void test_refusals(void)
         APP "[runtime]\nthread_scheduling = 2\n",
         APP "[runtime]\nthread_scheduling =\n",
         APP "[runtime]\nthread_scheduling = on\n",
+        APP "[runtime]\nnative_profile = maybe\n",
+        APP "[runtime]\nnative_profile = true\nnative_profile = false\n",
         APP "[runtime]\nthread_scheduling = 0\nthread_scheduling = 1\n",
+        APP "[runtime]\nnglide_resolution = 640x480\n",
+        APP "[runtime]\nnglide_resolution = app\nnglide_resolution = desktop\n",
         APP "[runtime]\ntrust_code_pages = 1\n",                /* unknown key */
         APP "[runtime]\ncpu = dbt\n",                           /* native or translator only */
         APP "[runtime]\ncpu =\n",
@@ -201,6 +213,12 @@ static void test_refusals(void)
         APP "[input]\nmouse_speed = fast\n",
         APP "[input]\nmouse_speed = 10\nmouse_speed = 10\n",
         APP "[input]\nmouse_speed = 1234567890\n",
+        APP "[input]\nkeyboard_stick = both_sticks\n",
+        APP "[input]\nstick_deadzone = 0\n",
+        APP "[input]\nstick_deadzone = 71\n",
+        APP "[input]\nstick_deadzone = 25\nstick_deadzone = 30\n",
+        APP "[input]\nstick_up = mouse_left\n",
+        APP "[input]\nstick_up = w\nstick_up = i\n",
         APP "[input]\ncross = space\ncross = enter\n",
         APP "[input]\ncross = hyperspace\n",
         APP "[input]\ncross = f0\n",
@@ -324,6 +342,18 @@ static void test_published_forms(void)
 {
     PwGameProfile p;
     PwGameInput input;
+
+    assert(parse(APP "[input]\nkeyboard_stick = right_stick\nstick_deadzone = 30\n"
+                      "stick_up = i\nstick_down = k\nstick_left = j\nstick_right = l\n", &p) == PW_OK);
+    assert(p.input.keyboard_stick == PW_GAME_STICK_RIGHT && p.input.stick_deadzone == 30);
+    assert(p.input.stick_keys[0] == 'I' && p.input.stick_keys[1] == 'K' &&
+           p.input.stick_keys[2] == 'J' && p.input.stick_keys[3] == 'L');
+    pw_game_input_init(&input);
+    assert(preset("[input]\nstick_up = f\nkeyboard_stick = left_stick\n", &input) == PW_OK);
+    pw_game_input_overlay(&input, &p.input);
+    assert(input.keyboard_stick == PW_GAME_STICK_RIGHT && input.stick_deadzone == 30);
+    assert(input.stick_keys[0] == 'I' && input.stick_keys[1] == 'K' &&
+           input.stick_keys[2] == 'J' && input.stick_keys[3] == 'L');
 
     assert(parse(APP "\n[display]\ndesktop = 800x600\nscaling = fit\n\n[input]\npreset = pinball\n",
                  &p) == PW_OK);

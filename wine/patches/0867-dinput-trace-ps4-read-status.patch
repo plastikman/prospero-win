@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 15 Oct 2026 08:20:00 -0700
+Subject: [PATCH] dinput: trace PS4 acquisition and slow reads
+
+Record DirectInput acquisition/cooperative-level results, details for returned
+keyboard/mouse events, and calls taking at least 20 ms. This tests whether
+intermittent menu response comes from device state/queue transitions or a slow
+DirectInput call, without logging empty polls per frame.
+---
+--- a/dlls/dinput/device.c
++++ b/dlls/dinput/device.c
+@@ -494,10 +494,9 @@
+         if (FAILED(hr = impl->vtbl->acquire( iface ))) impl->status = STATUS_UNACQUIRED;
+     }
+     LeaveCriticalSection( &impl->crit );
+-    if (hr != DI_OK) return hr;
+-
+-    dinput_hooks_acquire_device( iface );
+-
++    if (hr == DI_OK) dinput_hooks_acquire_device( iface );
++    WARN( "PS4-DI acquire type=%#lx hr=%#lx status=%d coop=%#lx tid=%lu\n",
++          impl->instance.dwDevType, hr, impl->status, impl->dwCoopLevel, GetCurrentThreadId() );
+     return hr;
+ }
+ 
+@@ -513,10 +512,9 @@
+     else hr = impl->vtbl->unacquire( iface );
+     impl->status = STATUS_UNACQUIRED;
+     LeaveCriticalSection( &impl->crit );
+-    if (hr != DI_OK) return hr;
+-
+-    dinput_hooks_unacquire_device( iface );
+-
++    if (hr == DI_OK) dinput_hooks_unacquire_device( iface );
++    WARN( "PS4-DI unacquire type=%#lx hr=%#lx status=%d tid=%lu\n",
++          impl->instance.dwDevType, hr, impl->status, GetCurrentThreadId() );
+     return hr;
+ }
+ 
+@@ -584,7 +582,8 @@
+         hr = DI_OK;
+     }
+     LeaveCriticalSection(&This->crit);
+-
++    WARN( "PS4-DI coop type=%#lx hwnd=%p flags=%#lx hr=%#lx status=%d tid=%lu\n",
++          This->instance.dwDevType, hwnd, flags, hr, This->status, GetCurrentThreadId() );
+     return hr;
+ }
+ 
+@@ -1455,6 +1454,7 @@
+     BYTE first_mouse_state = 0;
+     static DWORD last_keyboard_poll_log;
+     static DWORD last_mouse_poll_log;
++    DWORD call_start = GetTickCount();
+ 
+     TRACE( "iface %p, size %lu, data %p.\n", iface, size, data );
+ 
+@@ -1525,6 +1525,9 @@
+         WARN( "PS4-DI poll mouse-button offset=%d state=%02x\n",
+               first_mouse_button, first_mouse_state );
+     }
++    if ((DWORD)(GetTickCount() - call_start) >= 20)
++        WARN( "PS4-DI slow GetDeviceState type=%#lx hr=%#lx ms=%lu tid=%lu\n",
++              impl->instance.dwDevType, hr, GetTickCount() - call_start, GetCurrentThreadId() );
+ 
+     return hr;
+ }
+@@ -1537,6 +1540,8 @@
+     DIDEVICEOBJECTDATA first_event;
+     BOOL log_keyboard_event = FALSE;
+     BOOL log_mouse_button = FALSE;
++    DWORD requested = count ? *count : 0;
++    DWORD call_start = GetTickCount();
+     int len;
+ 
+     TRACE( "iface %p, size %lu, data %p, count %p, flags %#lx.\n", iface, size, data, count, flags );
+@@ -1592,12 +1597,17 @@
+     }
+ 
+     LeaveCriticalSection(&This->crit);
+-    if (log_keyboard_event)
+-        WARN( "PS4-DI queue count=%d first scan=%#lx data=%#lx\n", len,
+-              first_event.dwOfs, first_event.dwData );
+-    else if (log_mouse_button)
+-        WARN( "PS4-DI mouse queue count=%d first offset=%#x data=%#x\n", len,
+-              (unsigned int)first_event.dwOfs, (unsigned int)first_event.dwData );
++    if (log_keyboard_event || log_mouse_button)
++        WARN( "PS4-DI read type=%#lx hr=%#lx request=%lu returned=%lu flags=%#lx "
++              "queued=%d first=%#lx/%#lx ts=%lu seq=%lu status=%d ms=%lu tid=%lu\n",
++              This->instance.dwDevType, ret, requested, *count, flags, len,
++              first_event.dwOfs, first_event.dwData, first_event.dwTimeStamp,
++              first_event.dwSequence, This->status, GetTickCount() - call_start, GetCurrentThreadId() );
++    else if ((DWORD)(GetTickCount() - call_start) >= 20)
++        WARN( "PS4-DI slow GetDeviceData type=%#lx hr=%#lx request=%lu returned=%lu flags=%#lx "
++              "queued=%d status=%d ms=%lu tid=%lu\n",
++              This->instance.dwDevType, ret, requested, *count, flags, len,
++              This->status, GetTickCount() - call_start, GetCurrentThreadId() );
+ 
+     TRACE( "Returning %lu events queued\n", *count );
+     return ret;
+-- 
+2.43.0

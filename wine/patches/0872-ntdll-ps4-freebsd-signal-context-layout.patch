@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Subject: [PATCH] ntdll: model Orbis signal frames with FreeBSD amd64 fields
+
+The SDK's mcontext_t is musl's gregs/fpregs structure, but the Orbis kernel
+passes the FreeBSD amd64 signal-frame layout Wine already expects. Declare
+that layout locally and keep the measured ucontext offset, so signal register
+access builds against the SDK without changing the kernel ABI assumptions.
+---
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -242,10 +242,27 @@
+ #elif defined(__FreeBSD__) || defined (__FreeBSD_kernel__)
+ 
+ #ifdef __PROSPERO__
+-/* Measured on PS5 FW 12.02: the kernel stores FreeBSD's amd64 mcontext_t
+- * unchanged, but at ucontext offset 64 rather than the 16 the SDK header
+- * declares for uc_mcontext. */
+-# define UCONTEXT_MC(context) (*(mcontext_t *)((char *)(context) + 64))
++/* Orbis exposes musl's mcontext_t, while the kernel signal frame uses the
++ * FreeBSD/amd64 layout. Keep the ABI layout explicit instead of relying on
++ * fields that are absent from the SDK type. The kernel places this structure
++ * at ucontext offset 64. */
++typedef struct
++{
++    uint64_t mc_onstack;
++    uint64_t mc_rdi, mc_rsi, mc_rdx, mc_rcx, mc_r8, mc_r9, mc_rax;
++    uint64_t mc_rbx, mc_rbp, mc_r10, mc_r11, mc_r12, mc_r13, mc_r14, mc_r15;
++    uint32_t mc_trapno;
++    uint16_t mc_fs, mc_gs;
++    uint64_t mc_addr;
++    uint32_t mc_flags;
++    uint16_t mc_es, mc_ds;
++    uint64_t mc_err, mc_rip, mc_cs, mc_rflags, mc_rsp, mc_ss;
++    int64_t mc_len, mc_fpformat, mc_ownedfp;
++    int64_t mc_fpstate[64] __attribute__((aligned(16)));
++    uint64_t mc_fsbase, mc_gsbase, mc_xfpustate, mc_xfpustate_len, mc_tlsbase;
++    uint64_t mc_spare[3];
++} pw_ps5_mcontext_t;
++# define UCONTEXT_MC(context) (*(pw_ps5_mcontext_t *)((char *)(context) + 64))
+ /* The SDK exports sysarch() but not the amd64_{get,set}_{fs,gs}base wrappers,
+  * and its machine/sysarch.h lacks the operation numbers (FreeBSD's values,
+  * verified on the console). */
+-- 
+2.43.0

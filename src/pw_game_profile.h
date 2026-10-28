@@ -23,6 +23,13 @@
  *                          ; when nothing is bound, keyboard otherwise
  *   mouse = right_stick    ; a stick moves the pointer: left_stick, right_stick, none
  *   mouse_speed = 1200     ; pointer pixels per second at full tilt
+ *   keyboard_stick = right_stick ; turn one stick into key presses: left_stick,
+ *                                ; right_stick or none (default none)
+ *   stick_deadzone = 25    ; activation threshold, percent (5..70)
+ *   stick_up = w           ; keys for the four stick directions; defaults WASD
+ *   stick_down = s
+ *   stick_left = a
+ *   stick_right = d
  *   cross = space          ; <button> = <key> | mouse_left | mouse_right |
  *   r2 = mouse_left        ;            mouse_middle | vk:0xNN | none
  *
@@ -38,6 +45,10 @@
  *                               ; its code directly, with Vulkan batching) or
  *                               ; translator (wowprospero); default native,
  *                               ; translator for OpenGL games
+ *   native_profile = true       ; sample native CPU threads and PCs (debug;
+ *                               ; may terminate the game on signal failure)
+ *   dxvk_config = d3d9.maxAvailableMemory = 256
+ *                               ; semicolon-separated DXVK_CONFIG options
  *
  * Buttons: cross circle square triangle l1 r1 l2 r2 l3 r3 up down left
  * right options create touchpad. An input preset file holds only an [input]
@@ -54,6 +65,7 @@ enum {
     PW_GAME_DESKTOP_MAX_W = 3840, PW_GAME_DESKTOP_MAX_H = 2160,
     PW_GAME_MOUSE_SPEED_DEFAULT = 1200, PW_GAME_MOUSE_SPEED_MAX = 20000,
     PW_GAME_WINEDEBUG_CAPACITY = 128,
+    PW_GAME_DXVK_CONFIG_CAPACITY = 160,
 };
 
 typedef enum PwGameScaling { PW_GAME_SCALING_FIT = 0, PW_GAME_SCALING_INTEGER,
@@ -74,6 +86,10 @@ typedef struct PwGameInput {
     PwGameInputMode mode;
     PwGameStick mouse;
     uint32_t mouse_speed;
+    PwGameStick keyboard_stick;      /* digital key presses from this stick */
+    uint8_t stick_deadzone;          /* percent, 5..70 */
+    uint8_t stick_keys_set;          /* directions explicitly set by this profile/preset */
+    uint16_t stick_keys[4];          /* up, down, left, right; defaults to W, S, A, D */
     PwGameBinding bindings[PW_GAME_BUTTON_COUNT];   /* in PW_GAME_BUTTON order */
     char preset[PW_APP_ID_CAPACITY];
     uint32_t set;       /* which of mode/mouse/mouse_speed a file set (overlay) */
@@ -97,12 +113,15 @@ typedef enum PwGameCpu {
 
 typedef struct PwGameRuntime {
     int thread_scheduling;      /* WINE_PS5_SCHED=1 */
+    int nglide_desktop_resolution; /* set nGlide's Resolution registry value */
     PwGameCpu cpu;
+    int native_profile;         /* native CPU counters, thread watch and PC samples */
+    char dxvk_config[PW_GAME_DXVK_CONFIG_CAPACITY]; /* DXVK_CONFIG, inline DXVK options */
 } PwGameRuntime;
 
 /* A variable of Wine's environment; both strings are static. */
 typedef struct PwGameEnv { const char *name, *value; } PwGameEnv;
-enum { PW_GAME_RUNTIME_ENV_MAX = 1, PW_GAME_CPU_ENV_MAX = 2 };
+enum { PW_GAME_RUNTIME_ENV_MAX = 2, PW_GAME_CPU_ENV_MAX = 5 };
 
 typedef struct PwGameProfile {
     PwAppProfile app;

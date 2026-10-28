@@ -2,7 +2,9 @@
 #include "pw_game_profile.h"
 #include <string.h>
 
-enum { SET_MODE = 1u << 0, SET_MOUSE = 1u << 1, SET_SPEED = 1u << 2, SET_PRESET = 1u << 3 };
+enum { SET_MODE = 1u << 0, SET_MOUSE = 1u << 1, SET_SPEED = 1u << 2, SET_PRESET = 1u << 3,
+       SET_KEYBOARD_STICK = 1u << 4, SET_STICK_DEADZONE = 1u << 5 };
+enum { STICK_UP = 1u << 0, STICK_DOWN = 1u << 1, STICK_LEFT = 1u << 2, STICK_RIGHT = 1u << 3 };
 
 /* DualSense buttons in PW_GAME_BUTTON order, with their scePadRead bits. */
 static const struct { const char *name; uint32_t mask; } buttons[PW_GAME_BUTTON_COUNT] = {
@@ -100,6 +102,10 @@ static int binding(const uint8_t *v, size_t n, PwGameBinding *out)
 static int input_field(PwGameInput *input, const uint8_t *key, size_t key_length,
                        const uint8_t *v, size_t n, int allow_preset)
 {
+    static const struct { const char *name; unsigned index, bit; } stick_keys[] = {
+        { "stick_up", 0, STICK_UP }, { "stick_down", 1, STICK_DOWN },
+        { "stick_left", 2, STICK_LEFT }, { "stick_right", 3, STICK_RIGHT },
+    };
     if (is(key, key_length, "preset")) {
         if (!allow_preset || (input->set & SET_PRESET)) return PW_ERR_MALFORMED;
         if (!n || n >= sizeof(input->preset)) return PW_ERR_MALFORMED;
@@ -137,6 +143,35 @@ static int input_field(PwGameInput *input, const uint8_t *key, size_t key_length
             return PW_ERR_MALFORMED;
         input->mouse_speed = speed;
         input->set |= SET_SPEED;
+        return PW_OK;
+    }
+    if (is(key, key_length, "keyboard_stick")) {
+        if (input->set & SET_KEYBOARD_STICK) return PW_ERR_MALFORMED;
+        if (is(v, n, "none")) input->keyboard_stick = PW_GAME_STICK_NONE;
+        else if (is(v, n, "left_stick")) input->keyboard_stick = PW_GAME_STICK_LEFT;
+        else if (is(v, n, "right_stick")) input->keyboard_stick = PW_GAME_STICK_RIGHT;
+        else return PW_ERR_UNSUPPORTED;
+        input->set |= SET_KEYBOARD_STICK;
+        return PW_OK;
+    }
+    if (is(key, key_length, "stick_deadzone")) {
+        uint32_t deadzone;
+        if ((input->set & SET_STICK_DEADZONE) || number(v, n, &deadzone) != PW_OK ||
+            deadzone < 5 || deadzone > 70)
+            return PW_ERR_MALFORMED;
+        input->stick_deadzone = (uint8_t)deadzone;
+        input->set |= SET_STICK_DEADZONE;
+        return PW_OK;
+    }
+    for (size_t i = 0; i < sizeof(stick_keys) / sizeof(stick_keys[0]); i++) {
+        if (!is(key, key_length, stick_keys[i].name)) continue;
+        PwGameBinding parsed = { 0, 0, 0 };
+        int status;
+        if (input->stick_keys_set & stick_keys[i].bit) return PW_ERR_MALFORMED;
+        if ((status = binding(v, n, &parsed)) != PW_OK) return status;
+        if (parsed.kind != PW_GAME_BIND_KEY) return PW_ERR_UNSUPPORTED;
+        input->stick_keys[stick_keys[i].index] = parsed.code;
+        input->stick_keys_set |= stick_keys[i].bit;
         return PW_OK;
     }
     for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++) {
@@ -257,8 +292,10 @@ static int debug_field(PwGameProfile *profile, const uint8_t *key, size_t key_le
     return PW_OK;
 }
 
-/* [runtime] thread_scheduling: true/false or 1/0; cpu: native or
- * translator; each once. */
+/* [runtime] boolean switches: true/false or 1/0; nglide_resolution: app or
+ * desktop; cpu: native or translator; dxvk_config is DXVK's semicolon-
+ * separated inline config. Restrict its alphabet to config syntax, not shell
+ * metacharacters, before passing it to the Wine environment. */
 static int runtime_field(PwGameRuntime *runtime, uint32_t *seen, const uint8_t *key, size_t key_length,
                          const uint8_t *v, size_t n)
 {
@@ -273,7 +310,38 @@ static int runtime_field(PwGameRuntime *runtime, uint32_t *seen, const uint8_t *
         *seen |= 2u;
         return PW_OK;
     }
+    if (is(key, key_length, "native_profile")) {
+        if (*seen & 8u) return PW_ERR_MALFORMED;
+        if (is(v, n, "true") || is(v, n, "1")) runtime->native_profile = 1;
+        else if (is(v, n, "false") || is(v, n, "0")) runtime->native_profile = 0;
+        else return PW_ERR_UNSUPPORTED;
+        *seen |= 8u;
+        return PW_OK;
+    }
+    if (is(key, key_length, "dxvk_config")) {
+        if ((*seen & 16u) || !n || n >= sizeof(runtime->dxvk_config))
+            return PW_ERR_MALFORMED;
+        for (size_t i = 0; i < n; i++) {
+            uint8_t c = v[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_' || c == ' ' || c == '=' ||
+                  c == '.' || c == ';' || c == ',' || c == '-'))
+                return PW_ERR_MALFORMED;
+        }
+        memcpy(runtime->dxvk_config, v, n);
+        runtime->dxvk_config[n] = 0;
+        *seen |= 16u;
+        return PW_OK;
+    }
     if (is(key, key_length, "thread_scheduling")) bit = 1u, field = &runtime->thread_scheduling;
+    else if (is(key, key_length, "nglide_resolution")) {
+        if (*seen & 4u) return PW_ERR_MALFORMED;
+        if (is(v, n, "desktop")) runtime->nglide_desktop_resolution = 1;
+        else if (is(v, n, "app")) runtime->nglide_desktop_resolution = 0;
+        else return PW_ERR_UNSUPPORTED;
+        *seen |= 4u;
+        return PW_OK;
+    }
     else return PW_ERR_UNSUPPORTED;
     if (*seen & bit) return PW_ERR_MALFORMED;
     if (is(v, n, "true") || is(v, n, "1")) on = 1;
@@ -343,6 +411,7 @@ size_t pw_game_runtime_env(const PwGameRuntime *runtime, PwGameEnv *env)
 
     if (!runtime || !env) return 0;
     if (runtime->thread_scheduling) env[count++] = (PwGameEnv){ "WINE_PS5_SCHED", "1" };
+    if (runtime->dxvk_config[0]) env[count++] = (PwGameEnv){ "DXVK_CONFIG", runtime->dxvk_config };
     return count;
 }
 
@@ -356,11 +425,17 @@ int pw_game_cpu_native(const PwGameProfile *profile)
 
 size_t pw_game_cpu_env(const PwGameProfile *profile, PwGameEnv *env)
 {
+    size_t count = 0;
     if (!env || !pw_game_cpu_native(profile)) return 0;
     /* patch 0611; the native CPU never runs without the batching */
-    env[0] = (PwGameEnv){ "WINE_PS5_WOW64_CPU", "wow64native.dll" };
-    env[1] = (PwGameEnv){ "PW_VK_BATCH", "1" };
-    return 2;
+    env[count++] = (PwGameEnv){ "WINE_PS5_WOW64_CPU", "wow64native.dll" };
+    env[count++] = (PwGameEnv){ "PW_VK_BATCH", "1" };
+    if (profile->runtime.native_profile) {
+        env[count++] = (PwGameEnv){ "PW_NATIVE_WATCH", "1" };
+        env[count++] = (PwGameEnv){ "PW_NATIVE_PC", "1" };
+        env[count++] = (PwGameEnv){ "PW_NATIVE_PROFILE", "1" };
+    }
+    return count;
 }
 
 void pw_game_input_init(PwGameInput *input)
@@ -368,6 +443,11 @@ void pw_game_input_init(PwGameInput *input)
     if (!input) return;
     memset(input, 0, sizeof(*input));
     input->mouse_speed = PW_GAME_MOUSE_SPEED_DEFAULT;
+    input->stick_deadzone = 25;
+    input->stick_keys[0] = 'W';
+    input->stick_keys[1] = 'S';
+    input->stick_keys[2] = 'A';
+    input->stick_keys[3] = 'D';
     for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++) input->bindings[i].mask = buttons[i].mask;
 }
 
@@ -414,7 +494,12 @@ void pw_game_input_overlay(PwGameInput *base, const PwGameInput *overrides)
     if (overrides->set & SET_MODE) base->mode = overrides->mode;
     if (overrides->set & SET_MOUSE) base->mouse = overrides->mouse;
     if (overrides->set & SET_SPEED) base->mouse_speed = overrides->mouse_speed;
-    base->set |= overrides->set & (SET_MODE | SET_MOUSE | SET_SPEED);
+    if (overrides->set & SET_KEYBOARD_STICK) base->keyboard_stick = overrides->keyboard_stick;
+    if (overrides->set & SET_STICK_DEADZONE) base->stick_deadzone = overrides->stick_deadzone;
+    for (size_t i = 0; i < 4; i++)
+        if (overrides->stick_keys_set & (1u << i)) base->stick_keys[i] = overrides->stick_keys[i];
+    base->stick_keys_set |= overrides->stick_keys_set;
+    base->set |= overrides->set & (SET_MODE | SET_MOUSE | SET_SPEED | SET_KEYBOARD_STICK | SET_STICK_DEADZONE);
     for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++)
         if (overrides->bindings[i].kind != PW_GAME_BIND_UNSET) base->bindings[i] = overrides->bindings[i];
 }

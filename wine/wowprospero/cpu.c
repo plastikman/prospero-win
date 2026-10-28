@@ -112,6 +112,16 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
 
 void WINAPI BTCpuThreadInit(void)
 {
+    /* ⚠ DIAGNOSTIC, at ERR so it arrives without a channel.
+     *
+     * GTA IV hangs because winmm's devices thread never runs one guest
+     * instruction: WINMM_StartDevicesThread creates it and waits on
+     * {event, thread handle} forever, the wait never returns, and the unix
+     * side's "translator starting" -- logged once per thread that enters
+     * pw_wow_run -- fires only for the main thread. The thread exists and has
+     * not died. The question is how far up it gets, and this is the first
+     * place the CPU backend sees a new 32-bit thread at all. */
+    ERR( "new 32-bit thread\n" );
 }
 
 void WINAPI BTCpuThreadTerm( HANDLE thread, LONG status )
@@ -318,6 +328,24 @@ void WINAPI BTCpuNotifyUnmapViewOfSection( void *addr, BOOL is_after, NTSTATUS s
     else flush( addr, 0 );
 }
 
+/* Read only bytes wholly contained in one committed guest region. Exception
+ * diagnostics must not raise a second fault while inspecting the first one. */
+static BOOL read_guest_bytes( UINT address, void *buffer, SIZE_T size )
+{
+    MEMORY_BASIC_INFORMATION info;
+    ULONG_PTR base, end, at = address;
+
+    if (!size || NtQueryVirtualMemory( GetCurrentProcess(), ULongToPtr( address ),
+                                       MemoryBasicInformation, &info, sizeof(info), NULL ) ||
+        info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return FALSE;
+    base = (ULONG_PTR)info.BaseAddress;
+    if (info.RegionSize > ~(ULONG_PTR)0 - base) return FALSE;
+    end = base + info.RegionSize;
+    if (at < base || at > end || size > end - at) return FALSE;
+    memcpy( buffer, ULongToPtr( address ), size );
+    return TRUE;
+}
+
 static void raise_guest_exception( I386_CONTEXT *ctx, DWORD code, UINT address, UINT write )
 {
     static LONG logged;
@@ -329,9 +357,141 @@ static void raise_guest_exception( I386_CONTEXT *ctx, DWORD code, UINT address, 
     {
         MEMORY_BASIC_INFORMATION info;
         const UINT *stack = ULongToPtr( ctx->Esp );
+        BYTE instruction[8];
+        UINT ebp_minus_4;
 
-        ERR( "guest exception %#lx at eip %#lx esp %#lx address %#x write %u\n",
-             code, ctx->Eip, ctx->Esp, address, write );
+        ERR( "guest exception %#lx at eip %#lx esp %#lx ebp %#lx eax %#lx ebx %#lx ecx %#lx edx %#lx esi %#lx edi %#lx address %#x write %u\n",
+             code, ctx->Eip, ctx->Esp, ctx->Ebp, ctx->Eax, ctx->Ebx, ctx->Ecx,
+             ctx->Edx, ctx->Esi, ctx->Edi, address, write );
+        {
+            NTSTATUS status = NtQueryVirtualMemory( GetCurrentProcess(), ULongToPtr( ctx->Eip ),
+                                                     MemoryBasicInformation, &info, sizeof(info), NULL );
+            if (!status)
+            {
+                ULONG_PTR allocation = (ULONG_PTR)info.AllocationBase;
+                ERR( "guest eip mapping eip=%08lx allocation=%p base=%p size=%#llx state=%#lx protect=%#lx allocation_protect=%#lx type=%#lx offset=%#llx\n",
+                     ctx->Eip, info.AllocationBase, info.BaseAddress,
+                     (unsigned long long)info.RegionSize,
+                     info.State, info.Protect, info.AllocationProtect, info.Type,
+                     (unsigned long long)((ULONG_PTR)ctx->Eip - allocation) );
+            }
+            else ERR( "guest eip mapping eip=%08lx query_status=%#lx\n", ctx->Eip, status );
+        }
+        if (read_guest_bytes( ctx->Eip, instruction, sizeof(instruction) ))
+            ERR( "guest instruction %08lx: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                 ctx->Eip, instruction[0], instruction[1], instruction[2], instruction[3],
+                 instruction[4], instruction[5], instruction[6], instruction[7] );
+        else ERR( "guest instruction %08lx: bytes unavailable\n", ctx->Eip );
+        if (ctx->Ebp >= sizeof(ebp_minus_4) &&
+            read_guest_bytes( ctx->Ebp - sizeof(ebp_minus_4), &ebp_minus_4, sizeof(ebp_minus_4) ))
+            ERR( "guest [ebp-4] %08lx: %08x\n", (ULONG)(ctx->Ebp - sizeof(ebp_minus_4)), ebp_minus_4 );
+        else ERR( "guest [ebp-4] unavailable (ebp %08lx)\n", ctx->Ebp );
+        /* Walk the conventional EBP chain while it remains monotonic and
+         * readable. Include bytes ending at each saved return address so a
+         * corrupt frame can be distinguished from a valid caller site. */
+        {
+            UINT frame = ctx->Ebp;
+            unsigned int i;
+
+            for (i = 0; i < 8; ++i)
+            {
+                UINT pair[2];
+                BYTE callsite[8];
+
+                if (!read_guest_bytes( frame, pair, sizeof(pair) )) break;
+                ERR( "guest frame %u ebp %08x saved %08x return %08x\n",
+                     i, frame, pair[0], pair[1] );
+                if (pair[1] >= sizeof(callsite) &&
+                    read_guest_bytes( pair[1] - sizeof(callsite), callsite, sizeof(callsite) ))
+                    ERR( "guest return-bytes %08x: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                         pair[1] - (UINT)sizeof(callsite), callsite[0], callsite[1],
+                         callsite[2], callsite[3], callsite[4], callsite[5],
+                         callsite[6], callsite[7] );
+                /* For the first three frames, resolve direct CALL targets
+                 * and record their live entry bytes. FalloutNV's frames pass
+                 * through runtime-modified image pages, so static EXE
+                 * disassembly does not describe the code that ran. */
+                if (i < 3 && pair[1] >= 5)
+                {
+                    BYTE call[5], target_code[32] = {0};
+                    INT displacement;
+                    UINT target = 0;
+                    BOOL call_ok = read_guest_bytes( pair[1] - 5, call, sizeof(call) ) && call[0] == 0xe8;
+
+                    if (call_ok)
+                    {
+                        memcpy( &displacement, call + 1, sizeof(displacement) );
+                        target = pair[1] + displacement;
+                    }
+                    if (call_ok && read_guest_bytes( target, target_code, sizeof(target_code) ))
+                    {
+                        ERR( "guest frame0 call target %08x bytes %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                             target, target_code[0], target_code[1], target_code[2], target_code[3],
+                             target_code[4], target_code[5], target_code[6], target_code[7] );
+                        ERR( "guest frame0 target+8 %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                             target_code[8], target_code[9], target_code[10], target_code[11],
+                             target_code[12], target_code[13], target_code[14], target_code[15] );
+                        ERR( "guest frame0 target+16 %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                             target_code[16], target_code[17], target_code[18], target_code[19],
+                             target_code[20], target_code[21], target_code[22], target_code[23] );
+                        ERR( "guest frame0 target+24 %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                             target_code[24], target_code[25], target_code[26], target_code[27],
+                             target_code[28], target_code[29], target_code[30], target_code[31] );
+                    }
+                    else ERR( "guest frame0 call target unavailable call=%u target=%08x\n",
+                             call_ok, target );
+                }
+                /* In the observed FalloutNV chain, frame 1 returns to
+                 * 0x7da98f. Its local -0x20 holds the result of the preceding
+                 * lookup(0), which is then used as the RTTI source object. */
+                if (i == 1 && frame >= 0x20)
+                {
+                    UINT object, words[8];
+
+                    if (read_guest_bytes( frame - 0x20, &object, sizeof(object) ))
+                    {
+                        ERR( "guest frame1 lookup(0) local -20 %08x: %08x\n", frame - 0x20, object );
+                        if (object && read_guest_bytes( object, words, sizeof(words) ))
+                            ERR( "guest frame1 lookup(0) object %08x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                 object, words[0], words[1], words[2], words[3], words[4],
+                                 words[5], words[6], words[7] );
+                        else ERR( "guest frame1 lookup(0) object %08x: bytes unavailable\n", object );
+                    }
+                    /* FalloutNV 1.4.0.525's lookup at 0x58db10 reads this
+                     * relocated singleton, tests manager+8 bit 3, then
+                     * indexes the table at manager+0x18. */
+                    {
+                        UINT manager, flags = 0, slots[34] = {0};
+                        if (read_guest_bytes( 0x132a80c, &manager, sizeof(manager) ))
+                        {
+                            BOOL slots_ok = FALSE;
+                            if (manager)
+                            {
+                                read_guest_bytes( manager + 8, &flags, sizeof(flags) );
+                                slots_ok = read_guest_bytes( manager + 0x18, slots, sizeof(slots) );
+                            }
+                            ERR( "guest frame2 lookup manager %08x flags %08x slots %s\n",
+                                 manager, flags, slots_ok ? "readable" : "unavailable" );
+                            if (slots_ok)
+                            {
+                                ERR( "guest lookup slots 00-07: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                     slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7] );
+                                ERR( "guest lookup slots 08-0f: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                     slots[8], slots[9], slots[10], slots[11], slots[12], slots[13], slots[14], slots[15] );
+                                ERR( "guest lookup slots 10-17: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                     slots[16], slots[17], slots[18], slots[19], slots[20], slots[21], slots[22], slots[23] );
+                                ERR( "guest lookup slots 18-1f: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                     slots[24], slots[25], slots[26], slots[27], slots[28], slots[29], slots[30], slots[31] );
+                                ERR( "guest lookup slots 20-21: %08x %08x\n", slots[32], slots[33] );
+                            }
+                        }
+                        else ERR( "guest frame2 lookup singleton unavailable\n" );
+                    }
+                }
+                if (pair[0] <= frame || pair[0] - frame > 0x100000) break;
+                frame = pair[0];
+            }
+        }
         /* The top of the i386 stack, for the callers' return addresses. */
         if (!NtQueryVirtualMemory( GetCurrentProcess(), stack, MemoryBasicInformation, &info, sizeof(info), NULL ) &&
             info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
@@ -425,6 +585,12 @@ void WINAPI BTCpuSimulate(void)
     UINT *stack;
 
     C_ASSERT( sizeof(ctx->ExtendedRegisters) == sizeof(fp) );
+
+    /* ⚠ DIAGNOSTIC, with BTCpuThreadInit's. Entered once per thread and then
+     * looped in, so this is one line per thread, and it says whether a thread
+     * that reached the backend also reached the translator -- "translator
+     * starting" comes from the unix side of the very first pw_wow_run below. */
+    ERR( "simulate entry, eip %#lx\n", (unsigned long)ctx->Eip );
 
     for (;;)
     {
@@ -527,7 +693,13 @@ void WINAPI BTCpuSimulate(void)
             raise_guest_exception( ctx, EXCEPTION_FLT_INVALID_OPERATION, 0, 0 );
             break;
         default:
-            ERR( "DBT error %d at eip %#lx\n", params.status, ctx->Eip );
+            /* ⚠ The address matters as much as the status: PW_ERR_VM is how
+             * the translator reports both a refused host allocation and guest
+             * memory it cannot read, and only the fault address tells them
+             * apart. */
+            ERR( "DBT error %d at eip %#lx, fault address %#lx%s\n", params.status,
+                 ctx->Eip, (unsigned long)params.fault_address,
+                 params.fault_write ? " (write)" : "" );
             /* End the process the way ExitProcess does: the other threads
              * first, which marks the process as exiting, so the call for
              * itself leaves through exit() and the host's exit handlers run

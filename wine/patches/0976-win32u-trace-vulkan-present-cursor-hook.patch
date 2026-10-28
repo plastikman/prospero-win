@@ -1,0 +1,26 @@
+From: Codex <codex@localhost>
+Subject: win32u: Trace Vulkan present cursor hook entry
+
+Report once when the PS5 cursor handoff is called from the Vulkan present
+path. This separates an unvisited present hook from a hidden cursor image or
+a failed VideoOut cursor operation.
+
+---
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -2237,6 +2237,12 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *present_info )
+ #ifdef WINE_PS5_USER_DRIVER
+     {
++        static BOOL cursor_hook_logged;
+         extern void ps5drv_vulkan_cursor( void *vulkan_handle );
++        if (!cursor_hook_logged)
++        {
++            ERR( "PW_VK_PRESENT cursor hook reached\n" );
++            cursor_hook_logged = TRUE;
++        }
+         ps5drv_vulkan_cursor( vulkan_handle );
+     }
+ #endif
+-- 
+2.43.0

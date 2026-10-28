@@ -1,0 +1,68 @@
+From: Codex <codex@localhost>
+Subject: ntdll: trace PS4 page-fault resolution boundary
+
+Write the raw page-fault state to the PS4 kernel log immediately before and
+after virtual_handle_fault(). This catches faults that recurse before Wine's
+normal exception logger or server dispatch can run. Keep the trace bounded.
+
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 0000000..0000000 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -3270,13 +3270,49 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
+     case TRAP_x86_PAGEFLT:  /* Page fault */
+         rec.NumberParameters = 2;
+         rec.ExceptionInformation[0] = (ERROR_sig(sigcontext) >> 1) & 0x09;
+         rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
++        {
++            static unsigned int trace_count;
++            unsigned int n = __atomic_add_fetch( &trace_count, 1, __ATOMIC_RELAXED );
++            BOOL handled, invalid_gs;
++
++            if (n <= 12)
++            {
++                extern int sceKernelDebugOutText( int channel, const char *text );
++                char line[256];
++
++                snprintf( line, sizeof(line),
++                          "ntdll ps4-pageflt-before n=%u tid=%04x data=%p teb=%p sig=%d code=%d addr=%p rip=%p rsp=%p trap=%ld err=%lx access=%lu fault=%p\n",
++                          n, data ? data->tid : 0, data, data ? data->teb : NULL,
++                          signal, siginfo ? siginfo->si_code : 0,
++                          siginfo ? siginfo->si_addr : NULL,
++                          (void *)RIP_sig(sigcontext), (void *)RSP_sig(sigcontext),
++                          (long)TRAP_sig(sigcontext), (unsigned long)ERROR_sig(sigcontext),
++                          (unsigned long)rec.ExceptionInformation[0],
++                          (void *)rec.ExceptionInformation[1] );
++                sceKernelDebugOutText( 0, line );
++            }
++
++            handled = virtual_handle_fault( data, &rec, (void *)RSP_sig(sigcontext) );
++            invalid_gs = handled ? check_invalid_gsbase( data, sigcontext ) : FALSE;
++            if (n <= 12)
++            {
++                extern int sceKernelDebugOutText( int channel, const char *text );
++                char line[192];
++
++                snprintf( line, sizeof(line),
++                          "ntdll ps4-pageflt-after n=%u handled=%d invalid_gs=%d exception=%08x addr=%p info0=%p info1=%p\n",
++                          n, handled, invalid_gs, rec.ExceptionCode, rec.ExceptionAddress,
++                          (void *)rec.ExceptionInformation[0],
++                          (void *)rec.ExceptionInformation[1] );
++                sceKernelDebugOutText( 0, line );
++            }
++            if (!handled || invalid_gs)
++            {
++                leave_handler( data, sigcontext );
++                return;
++            }
++        }
+-        if (!virtual_handle_fault( data, &rec, (void *)RSP_sig(sigcontext) ) ||
+-            check_invalid_gsbase( data, sigcontext ))
+-        {
+-            leave_handler( data, sigcontext );
+-            return;
+-        }
+         if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+             rec.ExceptionInformation[0] == EXCEPTION_EXECUTE_FAULT)
+         {

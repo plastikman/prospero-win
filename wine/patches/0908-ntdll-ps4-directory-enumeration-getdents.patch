@@ -1,0 +1,87 @@
+From 8d730e47a5a4f5db690a8232f4f8b313e21cc401 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 15 Oct 2026 13:00:00 -0700
+Subject: [PATCH] ntdll: enumerate PS4 directories with getdents
+
+Keep the server-side directory name when realpath cannot canonicalize an
+openable PS4 path. NtQueryDirectoryFile needs that name when the PS4 working
+directory wrapper cannot fchdir() a wineserver descriptor.
+
+Use the shared PS4 directory scanner for NtQueryDirectoryFile. The PS4 libc
+readdir path fails on its 64 KiB directory blocks; the scanner uses getdents
+with the block size the filesystem expects.
+
+---
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -2055,7 +2055,15 @@
+ {
+     char resolved[PATH_MAX];
+ 
+-    return realpath( path, resolved ) ? strdup( resolved ) : NULL;
++    if (realpath( path, resolved )) return strdup( resolved );
++#ifdef __PROSPERO__
++    /* A directory fd still needs a name when the console's libc cannot
++     * canonicalize an otherwise openable path. ntdll uses this name to enter
++     * the directory when it cannot fchdir() a descriptor from wineserver. */
++    return strdup( path );
++#else
++    return NULL;
++#endif
+ }
+ 
+ char *dup_fd_name( struct fd *root, const char *name )
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -2697,8 +2697,41 @@
+  *
+  * Read a directory using the POSIX readdir interface; helper for NtQueryDirectoryFile.
+  */
++#ifdef __PROSPERO__
++struct append_directory_context
++{
++    struct dir_data *data;
++    const UNICODE_STRING *mask;
++};
++
++static int append_directory_entry( const char *name, void *context_ptr )
++{
++    struct append_directory_context *context = context_ptr;
++
++    if (!append_entry( context->data, name, NULL, context->mask ))
++    {
++        errno = ENOMEM;
++        return -1;
++    }
++    return 0;
++}
++#endif
++
+ static NTSTATUS read_directory_data_readdir( struct dir_data *data, const UNICODE_STRING *mask )
+ {
++#ifdef __PROSPERO__
++    struct append_directory_context context = { data, mask };
++    unsigned int flags;
++    extern int pw_cwd_scan_directory( int dirfd, const char *path,
++                                      int (*visit)( const char *name, void *context ),
++                                      void *context, unsigned int *flags );
++    /* libc readdir() can fail with EINVAL for the console's 64 KiB directory
++     * blocks. The shared PS4 directory scanner uses getdents() with the
++     * required block-sized buffer and caches stable listings. */
++    if (pw_cwd_scan_directory( AT_FDCWD, ".", append_directory_entry, &context, &flags ))
++        return errno_to_status( errno );
++    return STATUS_SUCCESS;
++#else
+     struct dirent *de;
+     NTSTATUS status = STATUS_NO_MEMORY;
+     DIR *dir = opendir( "." );
+@@ -2717,6 +2750,7 @@
+ done:
+     closedir( dir );
+     return status;
++#endif
+ }
+ 
+ 
+-- 
+2.39.5

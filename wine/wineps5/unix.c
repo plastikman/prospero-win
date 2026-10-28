@@ -53,6 +53,7 @@ struct ps5_stream
     BOOL playing;
 
     UINT64 written_frames, last_pos_frames;
+    UINT64 diagnostic_padding_calls;
     UINT32 period_frames, bufsize_frames, tmp_buffer_frames;
     UINT32 period_output_frames, since_event;   /* at the console's rate */
     REFERENCE_TIME period;
@@ -662,12 +663,26 @@ static NTSTATUS ps5_get_current_padding(void *args)
 {
     struct get_current_padding_params *params = args;
     struct ps5_stream *stream = handle_get_stream(params->stream);
+    UINT64 calls;
+    UINT32 held, period_frames;
+    HANDLE event;
+    BOOL playing;
+    NTSTATUS status;
 
     pthread_mutex_lock(&lock);
 
     *params->padding = stream->mix.held;
+    calls = ++stream->diagnostic_padding_calls;
+    held = stream->mix.held;
+    period_frames = stream->period_frames;
+    event = stream->event;
+    playing = stream->playing;
 
-    return unlock_result(&params->result, S_OK);
+    status = unlock_result(&params->result, S_OK);
+    if (calls == 1 || !(calls & 0x3ffff))
+        WINE_MESSAGE("PW_AUDIO_PADDING calls=%lu stream=%p event=%p held=%u period_frames=%u playing=%u\n",
+                     calls, stream, event, held, period_frames, playing);
+    return status;
 }
 
 static NTSTATUS ps5_get_next_packet_size(void *args)
@@ -763,6 +778,10 @@ static NTSTATUS ps5_set_event_handle(void *args)
     }
 
     stream->event = params->event;
+
+    WINE_MESSAGE("PW_AUDIO_EVENT stream=%p event=%p flags=%x period_frames=%u period=%lld\n",
+                 stream, stream->event, stream->flags, stream->period_frames,
+                 (long long)stream->period);
 
     return unlock_result(&params->result, S_OK);
 }

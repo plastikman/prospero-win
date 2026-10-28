@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 15 Oct 2026 08:25:00 -0700
+Subject: [PATCH] dinput: rate limit PS4 acquire trace
+
+Oblivion retries Acquire every frame after its devices are acquired. Keep
+logging the first acquisition and failures, but report repeated DI_NOEFFECT
+results at most once per second so diagnostics do not flood the console log.
+---
+diff --git a/dlls/dinput/device.c b/dlls/dinput/device.c
+--- a/dlls/dinput/device.c
++++ b/dlls/dinput/device.c
+@@ -477,4 +477,5 @@ static HRESULT WINAPI dinput_device_Acquire( IDirectInputDevice8W *iface )
+     HRESULT hr = DI_OK;
+     DWORD pid;
++    static DWORD last_acquire_log;
+ 
+     TRACE( "iface %p.\n", iface );
+@@ -496,5 +497,9 @@ static HRESULT WINAPI dinput_device_Acquire( IDirectInputDevice8W *iface )
+     LeaveCriticalSection( &impl->crit );
+     if (hr == DI_OK) dinput_hooks_acquire_device( iface );
+-    WARN( "PS4-DI acquire type=%#lx hr=%#lx status=%d coop=%#lx tid=%lu\n",
+-          impl->instance.dwDevType, hr, impl->status, impl->dwCoopLevel, GetCurrentThreadId() );
++    if (hr != DI_NOEFFECT || GetTickCount() - last_acquire_log >= 1000)
++    {
++        last_acquire_log = GetTickCount();
++        WARN( "PS4-DI acquire type=%#lx hr=%#lx status=%d coop=%#lx tid=%lu\n",
++              impl->instance.dwDevType, hr, impl->status, impl->dwCoopLevel, GetCurrentThreadId() );
++    }
+     return hr;
+ }
+-- 
+2.43.0

@@ -1,0 +1,34 @@
+From: Codex <codex@localhost>
+Subject: ntdll: stop reading faulting PS4 signal stack
+
+The raw signal trace may run while the interrupted RSP is invalid. Keep the
+register record, but do not dereference that untrusted stack from the handler.
+
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 0000000..0000000 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -3110,10 +3110,8 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
+         unsigned int n = __atomic_add_fetch( &trace_count, 1, __ATOMIC_RELAXED );
+         if (n <= 4)
+         {
+             extern int sceKernelDebugOutText( int channel, const char *text );
+-            uint64_t *frame = (uint64_t *)(uintptr_t)RSP_sig(sigcontext);
+             char line[192];
+-            unsigned int i;
+ 
+             snprintf( line, sizeof(line),
+                       "ntdll ps4-sig-fault-frame n=%u sig=%d code=%d addr=%p rip=%llx rsp=%llx cs=%x ss=%x flags=%llx trap=%lld err=%llx\n",
+@@ -3131,11 +3129,5 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
+                       (long long)TRAP_sig(sigcontext),
+                       (unsigned long long)ERROR_sig(sigcontext) );
+             sceKernelDebugOutText( 0, line );
+-            for (i = 0; i < 5; i++)
+-            {
+-                snprintf( line, sizeof(line), "ntdll ps4-sig-fault-stack n=%u [%u]=%016llx\n",
+-                          n, i, (unsigned long long)frame[i] );
+-                sceKernelDebugOutText( 0, line );
+-            }
+         }
+     }

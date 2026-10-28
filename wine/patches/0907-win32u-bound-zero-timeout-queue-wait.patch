@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 15 Oct 2026 11:50:00 -0700
+Subject: [PATCH] win32u: bound zero-timeout queue wait retries
+
+A zero-timeout message poll can repeatedly observe a signaled server queue
+while process_driver_events() reports no matching input. The absolute timeout
+does not stop NtWaitForMultipleObjects from returning the signaled queue again,
+so the poll spins until the queue changes. Return WAIT_TIMEOUT after processing
+that stale wake once; real driver events still return through the existing path.
+---
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -3464,4 +3464,10 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
+         if (probe) repeat_driver_ms += NtGetTickCount() - start;
+         if (more) break;
++        /* A zero-timeout poll must not spin while the server queue stays signaled. */
++        if (!timeout)
++        {
++            ret = WAIT_TIMEOUT;
++            break;
++        }
+     }
+     while (ret == count - 1);
+-- 
+2.43.0

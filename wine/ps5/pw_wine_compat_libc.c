@@ -46,7 +46,7 @@ int posix_fadvise(int fd,off_t offset,off_t length,int advice)
 unsigned int if_nametoindex(const char *name){return pw_compat_if_nametoindex(name);}
 int fstatfs(int fd,struct statfs *buf){(void)fd;(void)buf;return pw_compat_no_fstatfs();}
 int link(const char *from,const char *to){(void)from;(void)to;return pw_compat_no_link();}
-int ptrace(int request,pid_t pid,caddr_t address,int data)
+int ptrace(int request,pid_t pid,void *address,int data)
 {(void)request;(void)pid;(void)address;(void)data;return (int)pw_compat_no_ptrace();}
 mode_t umask(mode_t mask){return pw_compat_umask(mask);}
 char *nl_langinfo(nl_item item){return (char *)(item==CODESET?pw_compat_codeset():"");}

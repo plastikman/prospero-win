@@ -76,7 +76,7 @@ index ee77208..3c17143 100644
 + * assuming GS has already been installed during thread bootstrap. */
 +C_ASSERT( offsetof( struct thread_data, teb ) == 0 );
 +C_ASSERT( signal_stack_mask == 0xffff );
-+C_ASSERT( offsetof( mcontext_t, mc_cs ) + 64 == 232 );
++C_ASSERT( offsetof( pw_ps5_mcontext_t, mc_cs ) + 64 == 232 );
 +#define PW_NATIVE_SIGNAL_ENTRY(name) \
 +    extern void pw_native_##name##_handler( int, siginfo_t *, void * ); \
 +    __ASM_GLOBAL_FUNC( pw_native_##name##_handler, \

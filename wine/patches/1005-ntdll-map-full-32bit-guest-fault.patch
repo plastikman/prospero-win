@@ -1,0 +1,74 @@
+From: Codex <codex@openai.com>
+Subject: [PATCH] ntdll: query full 32-bit guest fault range
+
+Fallout 3 faulted at 0x1e070068, above the previous 0x08000000 upper bound. Trace faults across the 32-bit address space and query the code page as well as the fault address and candidate guest pointers.
+
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -3023,41 +3023,44 @@
+             int32_t protection, memory_type;
+             uint8_t flags;
+             char name[32];
+-        } before_fault, before_rbx, before_object, after_fault;
++        } before_fault, before_rbx, before_object, before_code, after_fault;
+         extern int sceKernelVirtualQuery( const void *, int, void *, size_t );
+         extern int sceKernelDebugOutText( int, const char * );
+         static unsigned int guest_fault_trace_count;
+         unsigned int guest_fault_n = 0;
+-        int q_fault = -1, q_rbx = -1, q_object = -1, q_after = -1;
++        int q_fault = -1, q_rbx = -1, q_object = -1, q_code = -1, q_after = -1;
+         int hook_result;
+ 
+-        /* Log low guest-memory faults, including null/near-null accesses. The
+-         * Fallout 3 load fault at 0x8100 was below the previous 0x00400000
+-         * lower bound. Query the fault address and candidate guest pointers
+-         * (RBX and RDI) before raising the Windows exception. This distinguishes
+-         * a missing/protection-limited page from a bad pointer without reading
+-         * faulting memory or changing mappings. */
++        /* Log guest faults throughout the 32-bit address range, including
++         * addresses above 0x08000000. Query the fault address, candidate guest
++         * pointers (RBX and RDI), and the code address before raising the
++         * Windows exception. This identifies mapping/protection state without
++         * reading faulting memory or changing mappings. */
+         if ((signal == SIGBUS || signal == SIGSEGV) && siginfo &&
+-            (uintptr_t)siginfo->si_addr < 0x08000000 && !(ERROR_sig(sigcontext) & 0x10))
++            (uintptr_t)siginfo->si_addr < 0x80000000 && !(ERROR_sig(sigcontext) & 0x10))
+         {
+             guest_fault_n = __atomic_add_fetch( &guest_fault_trace_count, 1, __ATOMIC_RELAXED );
+             if (guest_fault_n <= 12)
+             {
+-                char line[512];
++                char line[768];
+                 memset( &before_fault, 0, sizeof(before_fault) );
+                 memset( &before_rbx, 0, sizeof(before_rbx) );
+                 memset( &before_object, 0, sizeof(before_object) );
++                memset( &before_code, 0, sizeof(before_code) );
+                 q_fault = sceKernelVirtualQuery( siginfo->si_addr, 1, &before_fault,
+                                                  sizeof(before_fault) );
+                 q_rbx = sceKernelVirtualQuery( (void *)(uintptr_t)RBX_sig(sigcontext), 1,
+                                                &before_rbx, sizeof(before_rbx) );
+                 q_object = sceKernelVirtualQuery( (void *)(uintptr_t)RDI_sig(sigcontext), 1,
+                                                   &before_object, sizeof(before_object) );
++                q_code = sceKernelVirtualQuery( (void *)(uintptr_t)RIP_sig(sigcontext), 1,
++                                                &before_code, sizeof(before_code) );
+                 before_fault.name[sizeof(before_fault.name) - 1] = 0;
+                 before_rbx.name[sizeof(before_rbx.name) - 1] = 0;
+                 before_object.name[sizeof(before_object.name) - 1] = 0;
++                before_code.name[sizeof(before_code.name) - 1] = 0;
+                 snprintf( line, sizeof(line),
+-                          "ntdll ps4-guest-fault-map n=%u sig=%d code=%d addr=%p rip=%llx rsp=%llx rax=%llx rbx=%llx rsi=%llx rdi=%llx err=%llx qaddr=%d range=%p-%p prot=%x type=%x flags=%x name=%s qrbx=%d rbx_range=%p-%p rbx_prot=%x rbx_name=%s qobj=%d obj_range=%p-%p obj_prot=%x obj_name=%s\n",
++                          "ntdll ps4-guest-fault-map n=%u sig=%d code=%d addr=%p rip=%llx rsp=%llx rax=%llx rbx=%llx rsi=%llx rdi=%llx err=%llx qaddr=%d range=%p-%p prot=%x type=%x flags=%x name=%s qrbx=%d rbx_range=%p-%p rbx_prot=%x rbx_name=%s qobj=%d obj_range=%p-%p obj_prot=%x obj_name=%s qcode=%d code_range=%p-%p code_prot=%x code_name=%s\n",
+                           guest_fault_n, signal, siginfo->si_code, siginfo->si_addr,
+                           (unsigned long long)RIP_sig(sigcontext),
+                           (unsigned long long)RSP_sig(sigcontext),
+@@ -3071,7 +3074,9 @@
+                           q_rbx, before_rbx.start, before_rbx.end,
+                           before_rbx.protection, before_rbx.name,
+                           q_object, before_object.start, before_object.end,
+-                          before_object.protection, before_object.name );
++                          before_object.protection, before_object.name,
++                          q_code, before_code.start, before_code.end,
++                          before_code.protection, before_code.name );
+                 sceKernelDebugOutText( 0, line );
+             }
+         }

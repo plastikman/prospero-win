@@ -5,6 +5,23 @@
 #include <stdint.h>
 #include <string.h>
 
+/* ⚠ DIAGNOSTIC. PW_ERR_VM is returned from twenty places in the translator --
+ * a refused host allocation, guest memory it cannot read, a span that leaves
+ * the 32-bit address space, a block that would not execute -- and they all
+ * arrive at the caller as the same number:
+ *     err:wow:BTCpuSimulate DBT error -9 at eip 0x7bf33290, fault address 0
+ * Name the one that fired. Bounded, and only on the console: this file also
+ * builds for the host, which has no klog. */
+#ifdef __PROSPERO__
+extern void pw_wow_log( const char *format, ... );
+#define PW_VM_NOTE(tag) do { \
+        static int pw_vm_left = 4; \
+        if (pw_vm_left > 0) { pw_vm_left--; pw_wow_log( "wowprospero: PW_ERR_VM at %s\n", tag ); } \
+    } while (0)
+#else
+#define PW_VM_NOTE(tag) ((void)0)
+#endif
+
 /* A zero tag would match guest PC zero and jump through an empty pointer.
  * PC one hashes to slot one, so it cannot match any lookup in empty slot
  * zero in either bank. A published PC zero replaces this sentinel normally.
@@ -276,9 +293,9 @@ static int emit_return_stub(PwX86Engine *engine)
     options.native_fp = engine->native_fp;
     if(!(bytes = pw_x86_reencode_return_stub(stub, sizeof(stub), &options))) return PW_ERR_UNSUPPORTED;
     const size_t page = engine->backend->page_bytes, end = ((bytes + page - 1) / page) * page;
-    if(protection(engine, 0, end, PW_PROT_READ|PW_PROT_WRITE) != PW_OK) return PW_ERR_VM;
+    if(protection(engine, 0, end, PW_PROT_READ|PW_PROT_WRITE) != PW_OK) { PW_VM_NOTE("pw_x86_engine.c:302"); return PW_ERR_VM; }
     memcpy(engine->code.write_base, stub, bytes);
-    if(protection(engine, 0, end, PW_PROT_READ|PW_PROT_EXEC) != PW_OK) return PW_ERR_VM;
+    if(protection(engine, 0, end, PW_PROT_READ|PW_PROT_EXEC) != PW_OK) { PW_VM_NOTE("pw_x86_engine.c:304"); return PW_ERR_VM; }
     engine->return_stub_bytes = (bytes + 63) & ~(size_t)63;
     engine->cache.cursor = engine->return_stub_bytes;
     return PW_OK;
@@ -461,7 +478,7 @@ void pw_x86_engine_sample(const PwX86Engine *engine, uintptr_t rip, PwX86Hotspot
     profile->overflow++;
 }
 
-uintptr_t pw_x86_engine_fault_redirect(const PwX86Engine *engine, uintptr_t rip)
+uintptr_t pw_x86_engine_fault_redirect(PwX86Engine *engine, uintptr_t rip)
 {
     const PwX86CacheEntry *e = pw_x86_engine_host_block(engine, rip);
     uintptr_t start;
@@ -470,6 +487,19 @@ uintptr_t pw_x86_engine_fault_redirect(const PwX86Engine *engine, uintptr_t rip)
     if(!e || !e->fault_table_offset) return 0;
     start = (uintptr_t)engine->code.exec_base + e->code_offset;
     path = pw_x86_fault_table_path((const uint8_t *)start, e->fault_table_offset, rip - start);
+    if(path) {
+        size_t offset = rip - start;
+        size_t bytes = e->code_bytes - offset;
+        for(size_t i = 0; i < sizeof(engine->fault_site_code); i++)
+            engine->fault_site_code[i] = 0;
+        if(bytes > sizeof(engine->fault_site_code)) bytes = sizeof(engine->fault_site_code);
+        engine->fault_site_guest_pc = e->guest_pc;
+        engine->fault_site_host_offset = (uint32_t)offset;
+        engine->fault_site_code_bytes = (uint8_t)bytes;
+        for(size_t i = 0; i < bytes; i++)
+            engine->fault_site_code[i] = ((const uint8_t *)start)[offset + i];
+        __atomic_store_n(&engine->fault_site_valid, 1, __ATOMIC_RELEASE);
+    }
     return path ? start + path : 0;
 }
 
@@ -621,7 +651,7 @@ static int compile_block(PwX86Engine *engine,uint32_t pc,const PwX86CacheEntry *
     size_t end=((tail+page-1)/page)*page;
     if(end>engine->code.bytes)end=engine->code.bytes;
     if(protection(engine,first,end-first,PW_PROT_READ|PW_PROT_WRITE)!=PW_OK)
-        return PW_ERR_VM;
+        { PW_VM_NOTE("pw_x86_engine.c:647"); return PW_ERR_VM; }
     memcpy((uint8_t *)engine->code.write_base+engine->cache.cursor,scratch,best.code_bytes);
     status=pw_x86_cache_publish(&engine->cache,pc,&best,engine->cache.cursor,entry);
     if(status!=PW_OK) {
@@ -630,7 +660,7 @@ static int compile_block(PwX86Engine *engine,uint32_t pc,const PwX86CacheEntry *
         return status;
     }
     if(protection(engine,first,end-first,PW_PROT_READ|PW_PROT_EXEC)!=PW_OK) {
-        engine->failed=1;return PW_ERR_VM;
+        engine->failed=1;{ PW_VM_NOTE("pw_x86_engine.c:656"); return PW_ERR_VM; }
     }
 
     /* Initialize link slot stubs */
@@ -858,6 +888,7 @@ dispatch:;
     state->call_stack_top = engine->call_stack_top;
     state->verify_hops = PW_X86_REENCODE_VERIFY_HOPS;
     state->stale_slot = 0;
+    __atomic_store_n(&engine->fault_site_valid, 0, __ATOMIC_RELAXED);
     void *code_entry=(uint8_t *)engine->code.exec_base+entry->code_offset+entry->canonical_entry_offset;
     int invoked;
     uint64_t execution_begin=0;
@@ -953,7 +984,21 @@ dispatch:;
     }
     engine->retired_instructions+=report->retired;
     if(invoked==PW_X86_REENCODE_HOST_STEP)return PW_ERR_UNSUPPORTED;
-    return invoked==PW_ERR_X87_TRAP?PW_ERR_X87_TRAP:invoked?PW_ERR_VM:PW_OK;
+    if(invoked && invoked!=PW_ERR_X87_TRAP) {
+        /* ⚠ DIAGNOSTIC. Running a translated block answers with its own
+         * status, and every value but these two collapses into PW_ERR_VM on the
+         * way out -- the same code the translator uses for a refused host
+         * allocation and for guest memory it cannot read. Keep the value. */
+#ifdef __PROSPERO__
+        {
+            static int left = 8;
+            if (left > 0) { left--; pw_wow_log( "wowprospero: invoke returned %d at guest eip %08x\n",
+                                                invoked, (unsigned)state->eip ); }
+        }
+#endif
+        { PW_VM_NOTE("pw_x86_engine.c:997"); return PW_ERR_VM; }
+    }
+    return invoked==PW_ERR_X87_TRAP?PW_ERR_X87_TRAP:PW_OK;
 }
 
 int pw_x86_execution_clock_batch(PwX86ExecutionClock clock, void *opaque, uint64_t *mean_ns)
@@ -963,10 +1008,10 @@ int pw_x86_execution_clock_batch(PwX86ExecutionClock clock, void *opaque, uint64
     uint64_t means[8];
     for(unsigned i=0;i<8;i++) {
         uint64_t begin=clock(opaque),last=begin;
-        if(!begin)return PW_ERR_VM;
+        if(!begin){ PW_VM_NOTE("pw_x86_engine.c:1009"); return PW_ERR_VM; }
         for(unsigned read=0;read<1024;read++) {
             uint64_t now=clock(opaque);
-            if(!now || now<last)return PW_ERR_VM;
+            if(!now || now<last){ PW_VM_NOTE("pw_x86_engine.c:1012"); return PW_ERR_VM; }
             last=now;
         }
         uint64_t elapsed=last-begin;
@@ -1007,7 +1052,7 @@ int pw_x86_engine_reset(PwX86Engine *engine,uint32_t generation)
      * about to be poisoned need RW; unused reservations must stay uncommitted. */
     if(writable_bytes && (engine->sealed || engine->failed) &&
        protection(engine,0,writable_bytes,PW_PROT_READ|PW_PROT_WRITE)!=PW_OK)
-        return PW_ERR_VM;
+        { PW_VM_NOTE("pw_x86_engine.c:1053"); return PW_ERR_VM; }
 
     /* Count unlinks before cache entries are zeroed */
     for(uint32_t i=0; i<engine->cache.capacity; i++) {

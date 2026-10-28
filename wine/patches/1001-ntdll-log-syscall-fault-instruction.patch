@@ -1,0 +1,30 @@
+From: Codex <codex@localhost>
+Subject: ntdll: log PS4 syscall-fault instruction bytes
+
+The native Fallout 3 transition faults in winevulkan.so, but the logged
+faulting address does not match the effective address implied by the saved
+instruction pointer and registers. Log the saved x86-64 error bits, exception
+parameters, and instruction bytes at syscall-fault time so the next dump can
+be symbolized against the actual loaded PRX. This changes diagnostics only.
+
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index dbc34da07b..dbc34da07b 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2645,6 +2645,19 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigconte
+     ERR_(seh)( "fault regs r9=%016lx r10=%016lx r11=%016lx r12=%016lx r13=%016lx\n",
+                context->R9, context->R10, context->R11, context->R12, context->R13 );
+     ERR_(seh)( "fault regs r14=%016lx r15=%016lx\n", context->R14, context->R15 );
++    if (context->Rip)
++    {
++        const BYTE *ip = (const BYTE *)(ULONG_PTR)context->Rip;
++
++        /* Capture actual instruction bytes alongside RIP. */
++        ERR_(seh)( "fault instruction err=%llx params=%u p0=%016lx p1=%016lx bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++                   (unsigned long long)ERROR_sig(sigcontext), rec->NumberParameters,
++                   rec->ExceptionInformation[0], rec->ExceptionInformation[1],
++                   ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7] );
++    }
+ 
+     /* Context.Rsp can be an unmapped WoW64 stack address. */

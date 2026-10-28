@@ -29,6 +29,7 @@ enum { PAGE = 0x4000, PHYS_PAGES = 256 };
 static int phys_fd, refuse_map, cpu_only_refused;
 static unsigned char allocated[PHYS_PAGES];
 
+
 int sceKernelReserveVirtualRange(void **address, size_t bytes, int flags, size_t alignment)
 {
     void *at;

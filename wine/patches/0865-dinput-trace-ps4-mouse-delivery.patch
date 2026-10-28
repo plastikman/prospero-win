@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 15 Oct 2026 06:05:00 -0700
+Subject: [PATCH] dinput: trace PS4 mouse delivery to exclusive devices
+
+Trace mouse button delivery through DirectInput's raw-input and legacy hooks,
+returned buffered events, and non-empty GetDeviceState polls. This distinguishes
+cursor movement from click delivery without enabling high-volume mouse traces.
+---
+diff --git a/dlls/dinput/device.c b/dlls/dinput/device.c
+index 8a32fb7806..01daa04016 100644
+--- a/dlls/dinput/device.c
++++ b/dlls/dinput/device.c
+@@ -1451,7 +1451,10 @@ static HRESULT WINAPI dinput_device_GetDeviceState( IDirectInputDevice8W *iface,
+     };
+     HRESULT hr;
+     int first_pressed = -1;
++    int first_mouse_button = -1;
++    BYTE first_mouse_state = 0;
+     static DWORD last_keyboard_poll_log;
++    static DWORD last_mouse_poll_log;
+ 
+     TRACE( "iface %p, size %lu, data %p.\n", iface, size, data );
+ 
+@@ -1500,12 +1503,28 @@ static HRESULT WINAPI dinput_device_GetDeviceState( IDirectInputDevice8W *iface,
+     if (hr == DI_OK && GET_DIDEVICE_TYPE( impl->instance.dwDevType ) == DI8DEVTYPE_KEYBOARD)
+         for (DWORD i = 0; i < size; ++i)
+             if (user_state[i] & 0x80) { first_pressed = i; break; }
++    if (hr == DI_OK && GET_DIDEVICE_TYPE( impl->instance.dwDevType ) == DI8DEVTYPE_MOUSE)
++        for (DWORD i = 0; i < user_format->dwNumObjs; ++i)
++            if ((user_format->rgodf[i].dwType & DIDFT_BUTTON) &&
++                user_format->rgodf[i].dwOfs < size &&
++                (user_state[user_format->rgodf[i].dwOfs] & 0x80))
++            {
++                first_mouse_button = user_format->rgodf[i].dwOfs;
++                first_mouse_state = user_state[first_mouse_button];
++                break;
++            }
+     LeaveCriticalSection( &impl->crit );
+     if (first_pressed >= 0 && GetTickCount() - last_keyboard_poll_log >= 250)
+     {
+         last_keyboard_poll_log = GetTickCount();
+         WARN( "PS4-DI poll key-state scan=%02x\n", first_pressed );
+     }
++    if (first_mouse_button >= 0 && GetTickCount() - last_mouse_poll_log >= 250)
++    {
++        last_mouse_poll_log = GetTickCount();
++        WARN( "PS4-DI poll mouse-button offset=%d state=%02x\n",
++              first_mouse_button, first_mouse_state );
++    }
+ 
+     return hr;
+ }
+@@ -1517,6 +1536,7 @@ static HRESULT WINAPI dinput_device_GetDeviceData( IDirectInputDevice8W *iface,
+     HRESULT ret = DI_OK;
+     DIDEVICEOBJECTDATA first_event;
+     BOOL log_keyboard_event = FALSE;
++    BOOL log_mouse_button = FALSE;
+     int len;
+ 
+     TRACE( "iface %p, size %lu, data %p, count %p, flags %#lx.\n", iface, size, data, count, flags );
+@@ -1544,6 +1564,11 @@ static HRESULT WINAPI dinput_device_GetDeviceData( IDirectInputDevice8W *iface,
+         first_event = This->data_queue[This->queue_tail];
+         log_keyboard_event = TRUE;
+     }
++    else if (len && GET_DIDEVICE_TYPE( This->instance.dwDevType ) == DI8DEVTYPE_MOUSE)
++    {
++        first_event = This->data_queue[This->queue_tail];
++        log_mouse_button = first_event.dwOfs >= DIMOFS_BUTTON0;
++    }
+ 
+     if (data)
+     {
+@@ -1570,6 +1595,9 @@ static HRESULT WINAPI dinput_device_GetDeviceData( IDirectInputDevice8W *iface,
+     if (log_keyboard_event)
+         WARN( "PS4-DI queue count=%d first scan=%#lx data=%#lx\n", len,
+               first_event.dwOfs, first_event.dwData );
++    else if (log_mouse_button)
++        WARN( "PS4-DI mouse queue count=%d first offset=%#x data=%#x\n", len,
++              (unsigned int)first_event.dwOfs, (unsigned int)first_event.dwData );
+ 
+     TRACE( "Returning %lu events queued\n", *count );
+     return ret;
+diff --git a/dlls/dinput/mouse.c b/dlls/dinput/mouse.c
+index 5c0bdbcf76..869972b7e6 100644
+--- a/dlls/dinput/mouse.c
++++ b/dlls/dinput/mouse.c
+@@ -184,6 +184,11 @@ void dinput_mouse_rawinput_hook( IDirectInputDevice8W *iface, WPARAM wparam, LPA
+         }
+     }
+ 
++    if (ri->data.mouse.usButtonFlags)
++        WARN( "PS4-DI mouse rawinput flags=%#x buttons=%#x state=%02x/%02x/%02x\n",
++              ri->data.mouse.usFlags, ri->data.mouse.usButtonFlags,
++              state->rgbButtons[0], state->rgbButtons[1], state->rgbButtons[2] );
++
+     TRACE( "buttons %02x %02x %02x %02x %02x, x %+ld, y %+ld, w %+ld\n", state->rgbButtons[0],
+            state->rgbButtons[1], state->rgbButtons[2], state->rgbButtons[3], state->rgbButtons[4],
+            state->lX, state->lY, state->lZ );
+@@ -290,6 +295,10 @@ int dinput_mouse_hook( IDirectInputDevice8W *iface, WPARAM wparam, LPARAM lparam
+             break;
+     }
+ 
++    if (wparam >= WM_LBUTTONDOWN && wparam <= WM_MBUTTONUP)
++        WARN( "PS4-DI mouse legacy msg=%#x state=%02x/%02x/%02x\n", (unsigned int)wparam,
++              state->rgbButtons[0], state->rgbButtons[1], state->rgbButtons[2] );
++
+     TRACE( "buttons %02x %02x %02x %02x %02x, x %+ld, y %+ld, w %+ld\n", state->rgbButtons[0],
+            state->rgbButtons[1], state->rgbButtons[2], state->rgbButtons[3], state->rgbButtons[4],
+            state->lX, state->lY, state->lZ );
+-- 
+2.43.0

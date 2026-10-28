@@ -6,6 +6,8 @@
 #define PW_NATIVE_CS32 0x33
 #define PW_NATIVE_SS32 0x3b
 #define PW_NATIVE_CS64 0x43
+#define PW_NATIVE_PROFILE_SAMPLE_COUNT 64
+#define PW_NATIVE_PROFILE_SAMPLE_SHIFT 10
 
 /* ntdll owns the signal protocol. Its optional Unix export accepts this
  * version and returns zero for an unsupported protocol. Each bit describes
@@ -41,6 +43,14 @@ struct pw_native_profile
     unsigned long long host_sysarch_ticks, guest_sysarch_ticks;
     unsigned long long unix_calls, syscall_calls, last_tsc;
     unsigned long long reserved, report_proc;
+    /* A 64-entry rolling sample of every 1024th dispatched call. */
+    unsigned int syscall_samples[PW_NATIVE_PROFILE_SAMPLE_COUNT];
+    unsigned int unix_samples[PW_NATIVE_PROFILE_SAMPLE_COUNT];
+    /* One-frame-up guest return addresses for sampled syscalls, parallel to
+     * syscall_samples; zero when EBP is not a nearby guest stack frame. */
+    unsigned int syscall_caller_samples[PW_NATIVE_PROFILE_SAMPLE_COUNT];
+    /* Native syscall numbers parallel to sampled guest syscall PCs. */
+    unsigned int syscall_id_samples[PW_NATIVE_PROFILE_SAMPLE_COUNT];
 };
 /* Unix-owned thread state; accessing Unix TLS requires host FS. */
 struct pw_native_thread_state

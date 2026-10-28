@@ -43,6 +43,33 @@
 #include "call_top.h"
 #include "host_memory.h"
 
+/* ⚠ On the console this module's stderr goes nowhere: the sink ntdll installs
+ * is ntdll's own, and a PRX carries its own libc. Diagnostics go to klog
+ * instead. Off the console there is no klog and stderr is fine. */
+#ifdef __PROSPERO__
+extern void pw_wow_log( const char *format, ... );
+#define PW_WOW_NOTE( ... ) pw_wow_log( __VA_ARGS__ )
+#else
+#define PW_WOW_NOTE( ... ) fprintf( stderr, __VA_ARGS__ )
+#endif
+
+/* Compare the actual allocations with the flexible-memory regions. */
+static void thread_memory_note( const char *stage, const void *address, size_t bytes )
+{
+#ifdef PW_WOW_PS4_BUDGET
+    extern int sceKernelAvailableFlexibleMemorySize( size_t *bytes );
+    size_t available = 0;
+    int status = sceKernelAvailableFlexibleMemorySize( &available );
+    PW_WOW_NOTE( "wowprospero memory: tid=%04x stage=%s at=%p bytes=%zu flexible=%zuK status=%d\n",
+                 (unsigned)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
+                 stage, address, bytes, available >> 10, status );
+#else
+    (void)stage;
+    (void)address;
+    (void)bytes;
+#endif
+}
+
 /* The guest range every translated access is checked against (load_state). */
 enum { GUEST_LOW = 0x10000u, GUEST_HIGH = 0xfffff000u };
 /* The guest GPRs held in host registers across linked blocks: seven fit, and
@@ -57,6 +84,11 @@ enum { CALL_STACK = 0x40000 };
 
 struct pw_thread
 {
+    /* ⚠ Which allocator served this block. It comes from the console libc's
+     * calloc, or -- when that refuses, which it does for this size here --
+     * from ntdll's heap, and the two keep incompatible metadata. Freeing it
+     * with the wrong one is what killed GTA IV; see free_thread_state. */
+    int state_from_wine_heap;
     PwVmBackend vm;
     PwX86Engine engine;
     PwX86State state;
@@ -115,7 +147,10 @@ static uint64_t next_cache_report_id;
  * code ranges from this table rather than thread-local storage. */
 enum { MAX_ARENAS = 1024 };
 static struct { uintptr_t low, high; PwX86Engine *engine; PwX86State *state; PwX86HotspotProfile *profile;
-                volatile int *retry; } arenas[MAX_ARENAS];
+                volatile int *retry;
+                /* The last time this arena's thread reported a sample line; see
+                 * profile_sample_line. Only the arena's own thread touches it. */
+                uint64_t report_tsc; } arenas[MAX_ARENAS];
 #ifndef __PROSPERO__
 static struct sigaction wine_segv;
 #endif
@@ -348,6 +383,65 @@ static int source_view( void *opaque, uint32_t pc, const uint8_t **source, size_
     return source_view_writable( opaque, pc, source, bytes, &writable_from );
 }
 
+/* At a guest memory fault, log the DBT state before Wine turns it into an
+ * exception context. This lets the reported access be checked against the
+ * live instruction, register residency and the block that actually failed. */
+static void log_guest_fault_state( struct pw_thread *thread, int status )
+{
+    static int reports;
+    PwX86State *state = &thread->state;
+    const uint8_t *source = NULL;
+    uint8_t instruction[8] = {0};
+    uint8_t translated[32] = {0};
+    size_t bytes = 0, available = 0;
+    size_t translated_bytes = thread->engine.fault_block_code_bytes;
+    int report = __atomic_add_fetch( &reports, 1, __ATOMIC_RELAXED );
+
+    if (translated_bytes > sizeof(translated)) translated_bytes = sizeof(translated);
+    memcpy( translated, thread->engine.fault_block_code, translated_bytes );
+    if (report > 8) return;
+    if (source_view( NULL, state->eip, &source, &available ) == PW_OK)
+    {
+        bytes = available < sizeof(instruction) ? available : sizeof(instruction);
+        memcpy( instruction, source, bytes );
+    }
+    PW_WOW_NOTE( "wowprospero fault[%d]: status=%d pc=%08x access=%08x/%u write=%u "
+                 "eax=%08x ecx=%08x edx=%08x ebx=%08x\n",
+                 report, status, state->eip, state->fault_address, state->fault_width,
+                 state->fault_write, state->gpr[0], state->gpr[1], state->gpr[2], state->gpr[3] );
+    PW_WOW_NOTE( "wowprospero fault[%d]: esp=%08x ebp=%08x esi=%08x edi=%08x flags=%08x "
+                 "block=%08x insns=%u retired=%u resident=%02x\n",
+                 report, state->gpr[4], state->gpr[5], state->gpr[6], state->gpr[7],
+                 state->eflags, thread->engine.fault_block_pc,
+                 thread->engine.fault_block_instructions, state->step_retired,
+                 thread->engine.fault_block_resident_mask );
+    PW_WOW_NOTE( "wowprospero fault[%d]: map=%d,%d,%d,%d,%d,%d,%d,%d\n",
+                 report, thread->engine.fault_block_map[0], thread->engine.fault_block_map[1],
+                 thread->engine.fault_block_map[2], thread->engine.fault_block_map[3],
+                 thread->engine.fault_block_map[4], thread->engine.fault_block_map[5],
+                 thread->engine.fault_block_map[6], thread->engine.fault_block_map[7] );
+    PW_WOW_NOTE( "wowprospero fault[%d]: bytes=%zu %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                 report, bytes, instruction[0], instruction[1], instruction[2], instruction[3],
+                 instruction[4], instruction[5], instruction[6], instruction[7] );
+    PW_WOW_NOTE( "wowprospero fault[%d]: translated=%zu %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                 report, translated_bytes, translated[0], translated[1], translated[2], translated[3],
+                 translated[4], translated[5], translated[6], translated[7] );
+    PW_WOW_NOTE( "wowprospero fault[%d]: translated+8 %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                 report, translated[8], translated[9], translated[10], translated[11],
+                 translated[12], translated[13], translated[14], translated[15] );
+    if (__atomic_load_n( &thread->engine.fault_site_valid, __ATOMIC_ACQUIRE ))
+    {
+        const uint8_t *site = thread->engine.fault_site_code;
+        PW_WOW_NOTE( "wowprospero fault[%d]: site guest=%08x hostoff=%08x bytes=%u\n",
+                     report, thread->engine.fault_site_guest_pc,
+                     thread->engine.fault_site_host_offset, thread->engine.fault_site_code_bytes );
+        PW_WOW_NOTE( "wowprospero fault[%d]: site-code %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                     report, site[0], site[1], site[2], site[3], site[4], site[5], site[6], site[7] );
+        PW_WOW_NOTE( "wowprospero fault[%d]: site-code+8 %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                     report, site[8], site[9], site[10], site[11], site[12], site[13], site[14], site[15] );
+    }
+}
+
 /* Zeroed memory above the guest's 4 GiB, from Wine's own virtual memory
  * (host_memory.h), committed, or only reserved (type MEM_RESERVE); NULL
  * when there is none. */
@@ -357,11 +451,22 @@ static void *place_above_guest( size_t bytes, ULONG type, ULONG protect )
     MEM_EXTENDED_PARAMETER parameter = { 0 };
     SIZE_T size = bytes;
     void *base = NULL;
+    NTSTATUS status;
 
     parameter.Type = MemExtendedParameterAddressRequirements;
     parameter.Pointer = &requirements;
-    if (NtAllocateVirtualMemoryEx( NtCurrentProcess(), &base, &size, type, protect, &parameter, 1 ))
+    if ((status = NtAllocateVirtualMemoryEx( NtCurrentProcess(), &base, &size, type,
+                                             protect, &parameter, 1 )))
+    {
+        /* ⚠ DIAGNOSTIC. The translator's code arena is the one allocation on
+         * this console that has to end up executable, and every refusal here
+         * reached the caller as a bare PW_ERR_VM -- "the memory backend refused
+         * a request" -- with no status, no size and no protection:
+         *     err:wow:BTCpuSimulate DBT error -9 at eip 0x7bf33290 */
+        PW_WOW_NOTE( "wowprospero: %zu bytes type %x protect %x refused: %08x\n",
+                     bytes, (unsigned int)type, (unsigned int)protect, (unsigned int)status );
         return NULL;
+    }
     return base;
 }
 
@@ -385,9 +490,18 @@ static void *reserve_code( size_t bytes )
 static int commit_code( void *base, size_t bytes )
 {
     SIZE_T size = bytes;
+    void *at = base;
+    NTSTATUS status;
 
-    return NtAllocateVirtualMemory( NtCurrentProcess(), &base, 0, &size, MEM_COMMIT,
-                                    PAGE_EXECUTE_READWRITE ) ? -1 : 0;
+    if (!(status = NtAllocateVirtualMemory( NtCurrentProcess(), &base, 0, &size, MEM_COMMIT,
+                                            PAGE_EXECUTE_READWRITE )))
+        return 0;
+    /* ⚠ DIAGNOSTIC -- see place_above_guest. Executable memory is the whole
+     * question here: this console refuses a plain executable mapping and wants
+     * direct memory mapped read-write and then protected (orbis_jit.c). */
+    PW_WOW_NOTE( "wowprospero: commit %p %zu bytes executable refused: %08x\n",
+                 at, bytes, (unsigned int)status );
+    return -1;
 }
 
 static void release( void *base, size_t bytes )
@@ -446,6 +560,43 @@ static void execution_report( struct pw_thread *thread )
              (unsigned long long)thread->engine.execution_clock_errors );
 }
 
+/* ⚠ Release the thread state through the allocator that produced it.
+ *
+ * It comes from the console libc's calloc, and from ntdll's heap when that
+ * refuses -- which it does, for this size, on this console: "thread state from
+ * ntdll's heap (libc refused 148792 bytes, errno 22)". Both paths then freed it
+ * with libc's free(), so libc read ntdll's metadata as one of its own chunks.
+ *
+ * GTA IV died on that, reproducibly, sixty-six seconds after reaching a loaded
+ * scene, on the one exiting thread of six that had been through this path:
+ *
+ *     fault regs rip=00000008000e1ef7 ... rax=000245380000000d
+ *                rcx=0000453800000008 r15=0000000201a38020
+ *     syscall fault 0xc0000005 at libSceLibcInternal.sprx+0x51ef7,
+ *                address 453a01a44017
+ *
+ * 0x24538 is 148792, this structure's size, sitting in the high half of a
+ * register where a chunk size belongs; and the faulting address is exactly
+ * 0x453800000000 + 0x201a44017 -- a real heap pointer plus a size read at the
+ * wrong width. libc was walking a chunk header that was never libc's.
+ *
+ * ⚠ Provenance is recorded rather than assumed: either allocator may serve,
+ * and libc refusing this size is measured on this console, not guaranteed. */
+static void free_thread_state( struct pw_thread *thread )
+{
+    if (!thread) return;
+#ifdef __PROSPERO__
+    if (thread->state_from_wine_heap)
+    {
+        extern void pw_wine_heap_free( void *ptr );
+
+        pw_wine_heap_free( thread );
+        return;
+    }
+#endif
+    free( thread );
+}
+
 static struct pw_thread *get_thread(void)
 {
     struct pw_thread *thread = self;
@@ -453,16 +604,59 @@ static struct pw_thread *get_thread(void)
     int first, attempt;
 
     if (thread) return thread;
-    if (!(thread = calloc( 1, sizeof(*thread) ))) return NULL;
+    {
+        /* ⚠ One line per process, to prove this channel carries at all: a PRX
+         * other than ntdll has no stderr and no klog of its own, and every
+         * diagnostic added here was invisible until the log became a file. */
+        static int announced;
+        if (!announced++)
+            PW_WOW_NOTE( "wowprospero: translator starting, thread state %zu bytes\n",
+                         sizeof(*thread) );
+    }
+    thread_memory_note( "before-state", NULL, sizeof(*thread) );
+    if (!(thread = calloc( 1, sizeof(*thread) )))
+    {
+#ifdef __PROSPERO__
+        /* ⚠ ntdll keeps the one allocator known to work in this process: it
+         * links prospero-win's heap and exports it (scripts/prx-ps4.sh), while
+         * this module's malloc is the console libc's and answered NULL for
+         * 145 KiB. Fall back to ntdll's before giving up. */
+        extern void *pw_wine_heap_malloc( size_t bytes );
+        if ((thread = pw_wine_heap_malloc( sizeof(*thread) )))
+        {
+            memset( thread, 0, sizeof(*thread) );
+            thread->state_from_wine_heap = 1;
+            PW_WOW_NOTE( "wowprospero: thread state from ntdll's heap (libc refused %zu bytes, errno %d)\n",
+                         sizeof(*thread), errno );
+        }
+    }
+    if (!thread)
+    {
+#endif
+        /* ⚠ This returned NULL in silence, and the caller turns that into
+         * PW_ERR_VM with no fault address -- which reaches the log as
+         *     err:wow:BTCpuSimulate DBT error -9 ... fault address 0
+         * and looks exactly like the translator refusing guest memory. */
+        PW_WOW_NOTE( "wowprospero: no memory for %zu bytes of thread state\n",
+                     sizeof(*thread) );
+        return NULL;
+    }
+    thread_memory_note( "after-state", thread, sizeof(*thread) );
     first = !__atomic_load_n( &first_thread_ready, __ATOMIC_ACQUIRE );
     if (pw_wow_host_backend( &thread->vm, &host_memory ) != PW_OK ||
         (attempt = pw_wow_thread_fit( first, setup_thread, thread, &budget )) < 0)
     {
         fprintf( stderr, "wowprospero: no memory for a %s thread's translator\n",
                  first ? "first" : "further" );
-        free( thread );
+        free_thread_state( thread );
         return NULL;
     }
+    thread_memory_note( "after-setup", thread->entries, budget.entries * sizeof(*thread->entries) );
+    thread_memory_note( "code-arena", thread->engine.code.write_base, thread->engine.code.bytes );
+    thread_memory_note( "hostexec", thread->hostexec.code.write_base, thread->hostexec.code.bytes );
+    PW_WOW_NOTE( "wowprospero budget: tid=%04x first=%d attempt=%d entries=%u arena=%zuK hostexec=%zuK\n",
+                 (unsigned)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
+                 first, attempt, budget.entries, budget.arena_bytes >> 10, budget.hostexec_bytes >> 10 );
     if (attempt)
         fprintf( stderr, "wowprospero: %s thread's translator reduced to %u entries, %zu KiB of code\n",
                  first ? "first" : "further", budget.entries, budget.arena_bytes >> 10 );
@@ -853,7 +1047,10 @@ static uint64_t profile_tsc_rate, profile_period_ticks;
  * without a lock, TLS, or access to another thread's cache. */
 enum { PROFILE_NATIVE_SLOTS = 4096 };
 static struct profile_native { uintptr_t pc; uint64_t samples; } profile_native[PROFILE_NATIVE_SLOTS];
+static struct profile_native profile_syscall_callers[PROFILE_NATIVE_SLOTS];
 static uint64_t profile_native_overflow, profile_native_last_dump;
+static uint64_t profile_syscall_caller_overflow;
+static uintptr_t profile_libkernel_low, profile_libkernel_high;
 static void profile_native_sample(uintptr_t pc)
 {
     unsigned bucket = (unsigned)((pc >> 4) * 2654435761u) & (PROFILE_NATIVE_SLOTS - 1);
@@ -874,6 +1071,174 @@ static void profile_native_sample(uintptr_t pc)
     }
     __atomic_fetch_add(&profile_native_overflow, 1, __ATOMIC_RELAXED);
 }
+
+/* If SIGPROF lands in a libkernel syscall wrapper, RSP points at that
+ * wrapper's caller return address. Keep caller PCs separate from syscall-stub
+ * PCs: the former identify the Wine module doing the polling. */
+static void profile_syscall_caller_sample(uintptr_t pc)
+{
+    unsigned bucket = (unsigned)((pc >> 4) * 2654435761u) & (PROFILE_NATIVE_SLOTS - 1);
+    if(!pc) return;
+    for(unsigned i = 0; i < PROFILE_NATIVE_SLOTS; i++) {
+        uintptr_t key = __atomic_load_n(&profile_syscall_callers[bucket].pc, __ATOMIC_ACQUIRE);
+        if(!key) {
+            uintptr_t empty = 0;
+            if(__atomic_compare_exchange_n(&profile_syscall_callers[bucket].pc, &empty, pc, 0,
+                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) key = pc;
+            else key = empty;
+        }
+        if(key == pc) {
+            __atomic_fetch_add(&profile_syscall_callers[bucket].samples, 1, __ATOMIC_RELAXED);
+            return;
+        }
+        bucket = (bucket + 1) & (PROFILE_NATIVE_SLOTS - 1);
+    }
+    __atomic_fetch_add(&profile_syscall_caller_overflow, 1, __ATOMIC_RELAXED);
+}
+/* ⚠ A thread that never leaves translated code never reports.
+ *
+ * profile_maybe_dump() runs where run() returns -- at a system call, a Unix
+ * call, a fault. A guest thread spinning on memory makes none of those, so the
+ * one thread a profile is wanted for is the one thread that never prints. GTA
+ * IV has exactly that: its main thread parked in NtWaitForMultipleObjects on
+ * two events forever while another burns a full core and issues not one call.
+ *
+ * So sample from the handler as well, throttled to the report period and to
+ * one line: the hottest guest address this thread has seen. It costs a scan of
+ * the slot table every five seconds on a thread that is already only running
+ * because nothing else will make it stop. */
+static uint64_t profile_sample_period;
+static void profile_sample_line(PwX86HotspotProfile *profile, uint64_t *report_tsc, uint64_t tsc)
+{
+    uint32_t pc = 0;
+    uint64_t best = 0, total = 0;
+
+    if(!profile || !profile_sample_period) return;
+    if(*report_tsc && tsc - *report_tsc < profile_sample_period) return;
+    *report_tsc = tsc;
+    for(unsigned i = 0; i < PW_X86_HOTSPOT_SLOTS; i++) {
+        uint64_t samples = profile->slots[i].samples;
+        total += samples;
+        if(samples > best) { best = samples; pc = profile->slots[i].guest_pc; }
+    }
+    if(!total) return;
+    PW_WOW_NOTE("wowprospero sample: tid=%04x pc=%08x samples=%llu of %llu\n",
+               (unsigned)HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
+               pc, (unsigned long long)best, (unsigned long long)total);
+}
+
+#ifdef __PROSPERO__
+/* ⚠ The console's own module table, declared here rather than included: this
+ * is a Wine unix library and orbis/libkernel.h does not belong in it. Shapes
+ * from sdk/orbis-sdk-v1/sdk/include/orbis/_types/kernel.h. */
+typedef struct { void *address; uint32_t size; int32_t prot; } pw_module_segment;
+typedef struct { size_t size; char name[256]; pw_module_segment segment[4];
+                 uint32_t segments; uint8_t fingerprint[20]; } pw_module_info;
+int32_t sceKernelGetModuleList(int32_t *array, size_t size, size_t *available);
+int32_t sceKernelGetModuleInfo(int32_t handle, pw_module_info *info);
+
+/* Log where every module sits, once, so the raw host addresses below can be
+ * attributed offline. dladdr answers nothing here, and resolving a name inside
+ * the signal handler is not worth the risk for a diagnostic. */
+static void profile_modules(void)
+{
+    int32_t handles[256];
+    size_t available = 0;
+
+    if(sceKernelGetModuleList(handles, sizeof(handles) / sizeof(handles[0]), &available)) return;
+    if(available > sizeof(handles) / sizeof(handles[0])) available = sizeof(handles) / sizeof(handles[0]);
+    for(size_t i = 0; i < available; i++) {
+        pw_module_info info;
+
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        if(sceKernelGetModuleInfo(handles[i], &info)) continue;
+        info.name[sizeof(info.name) - 1] = 0;
+        if(strstr(info.name, "libkernel") && info.segments && info.segment[0].address) {
+            uintptr_t low = (uintptr_t)info.segment[0].address;
+            __atomic_store_n(&profile_libkernel_high, low + info.segment[0].size, __ATOMIC_RELAXED);
+            __atomic_store_n(&profile_libkernel_low, low, __ATOMIC_RELEASE);
+        }
+        PW_WOW_NOTE("wowprospero module: %s text=%p+%x\n", info.name,
+                   info.segments ? info.segment[0].address : (void *)0,
+                   info.segments ? info.segment[0].size : 0u);
+    }
+}
+#endif
+
+/* ⚠ The samples that matter may never be attributed to a guest address.
+ *
+ * A sample lands in a thread's hotspot table only while that thread is inside
+ * its translator's arena. A thread running host code -- Wine, a PRX, RADV --
+ * is counted in profile_unattributed and keyed by host PC in profile_native,
+ * and profile_native_dump only runs where run() returns, which a spinning
+ * thread never reaches. So report from the handler here too, throttled to the
+ * report period, with no malloc and no qsort: pick the top few by repeated
+ * scan, which is four passes over the table every five seconds. */
+static uint64_t profile_native_report_tsc;
+static void profile_native_line(uint64_t tsc)
+{
+    uint64_t ceiling = ~0ull;
+
+    if(!profile_sample_period) return;
+    if(profile_native_report_tsc && tsc - profile_native_report_tsc < profile_sample_period) return;
+    profile_native_report_tsc = tsc;
+    /* ⚠ No tid here, and the file says why at the top of the handler: this
+     * path runs on every thread the timer interrupts, the title's own among
+     * them, and those have no TEB. Reading ClientId.UniqueThread through it
+     * faulted at address 0x48 on thread 0000 and took the app down on launch.
+     * profile_sample_line may do it because it only runs on a thread that is
+     * inside a translator arena, which is a Wine thread by construction. */
+    PW_WOW_NOTE("wowprospero profile_process: ticks=%llu unattributed=%llu overflow=%llu\n",
+               (unsigned long long)__atomic_load_n(&profile_ticks, __ATOMIC_RELAXED),
+               (unsigned long long)__atomic_load_n(&profile_unattributed, __ATOMIC_RELAXED),
+               (unsigned long long)__atomic_load_n(&profile_native_overflow, __ATOMIC_RELAXED));
+    for(unsigned rank = 0; rank < 4; rank++) {
+        uintptr_t pc = 0;
+        uint64_t best = 0;
+
+        for(unsigned i = 0; i < PROFILE_NATIVE_SLOTS; i++) {
+            uint64_t samples = __atomic_load_n(&profile_native[i].samples, __ATOMIC_RELAXED);
+            if(samples > best && samples < ceiling) {
+                best = samples;
+                pc = __atomic_load_n(&profile_native[i].pc, __ATOMIC_ACQUIRE);
+            }
+        }
+        if(!best) return;
+        PW_WOW_NOTE("wowprospero native: rank=%u pc=%#lx samples=%llu\n",
+                   rank, (unsigned long)pc, (unsigned long long)best);
+        ceiling = best;
+    }
+}
+
+static uint64_t profile_syscall_caller_report_tsc;
+static void profile_syscall_caller_line(uint64_t tsc)
+{
+    uint64_t ceiling = ~0ull;
+
+    if(!profile_sample_period) return;
+    if(profile_syscall_caller_report_tsc &&
+       tsc - profile_syscall_caller_report_tsc < profile_sample_period) return;
+    profile_syscall_caller_report_tsc = tsc;
+    for(unsigned rank = 0; rank < 4; rank++) {
+        uintptr_t pc = 0;
+        uint64_t best = 0;
+
+        for(unsigned i = 0; i < PROFILE_NATIVE_SLOTS; i++) {
+            uint64_t samples = __atomic_load_n(&profile_syscall_callers[i].samples, __ATOMIC_RELAXED);
+            if(samples > best && samples < ceiling) {
+                best = samples;
+                pc = __atomic_load_n(&profile_syscall_callers[i].pc, __ATOMIC_ACQUIRE);
+            }
+        }
+        if(!best) return;
+        PW_WOW_NOTE("wowprospero syscall_caller: rank=%u pc=%#lx samples=%llu overflow=%llu\n",
+                    rank, (unsigned long)pc, (unsigned long long)best,
+                    (unsigned long long)__atomic_load_n(&profile_syscall_caller_overflow, __ATOMIC_RELAXED));
+        ceiling = best;
+    }
+}
+
 static void profile_handler(int signal, siginfo_t *info, void *context)
 {
     const uintptr_t rip = *context_rip(context);
@@ -888,6 +1253,7 @@ static void profile_handler(int signal, siginfo_t *info, void *context)
             PwX86HotspotProfile *profile = __atomic_load_n(&arenas[i].profile, __ATOMIC_ACQUIRE);
             if(profile) {
                 pw_x86_engine_sample(arenas[i].engine, rip, profile);
+                profile_sample_line(profile, &arenas[i].report_tsc, __rdtsc());
                 return;
             }
             break;
@@ -895,6 +1261,15 @@ static void profile_handler(int signal, siginfo_t *info, void *context)
     }
     __atomic_fetch_add(&profile_unattributed, 1, __ATOMIC_RELAXED);
     profile_native_sample(rip);
+    uintptr_t low = __atomic_load_n(&profile_libkernel_low, __ATOMIC_ACQUIRE);
+    uintptr_t high = __atomic_load_n(&profile_libkernel_high, __ATOMIC_RELAXED);
+    if(low && rip >= low && rip < high) {
+        uintptr_t *rsp = context_rsp(context);
+        if(rsp) profile_syscall_caller_sample(*rsp);
+    }
+    uint64_t tsc = __rdtsc();
+    profile_native_line(tsc);
+    profile_syscall_caller_line(tsc);
 }
 
 static uint64_t profile_monotonic_ns(void)
@@ -926,22 +1301,36 @@ static void profile_start(void)
 {
     profile_path = getenv("PW_WOW_PROFILE");
 #ifdef __PROSPERO__
-    if(!profile_path) {
+    /* ⚠ An empty value is not a path. This console's environ is its own
+     * problem (docs/FINDINGS.md: setenv succeeds but never publishes), so a
+     * getenv that answers "" rather than NULL would have skipped the trigger
+     * file and then bailed out below without a word -- which is exactly how
+     * this looked from the outside: the file in place and no output at all. */
+    if(!profile_path || !*profile_path) {
         struct stat st;
-        if(!stat("/data/prospero-win/pw_wow_profile", &st)) profile_path = "1";
+        int found = !stat("/data/prospero-win/pw_wow_profile", &st);
+
+        PW_WOW_NOTE("wowprospero profile: env=%s trigger=%s\n",
+                   profile_path ? (*profile_path ? profile_path : "(empty)") : "(unset)",
+                   found ? "present" : "absent");
+        profile_path = found ? "1" : NULL;
     }
 #endif
     if(!profile_path || !*profile_path) { profile_path = NULL; return; }
     /* Before the timer starts, so no SIGPROF cuts the calibration short. */
     profile_tsc_rate = profile_calibrate();
     if(!profile_tsc_rate) {
-        fprintf(stderr, "wowprospero profile: TSC calibration failed\n");
+        PW_WOW_NOTE("wowprospero profile: TSC calibration failed\n");
         profile_path = NULL;
         return;
     }
     profile_period_ticks = pw_tsc_ticks(PROFILE_PERIOD_MS, profile_tsc_rate);
-    fprintf(stderr, "wowprospero profile_clock: tsc_hz=%llu calibration_ms=%u period_ms=%u\n",
-            (unsigned long long)profile_tsc_rate, PROFILE_CALIBRATION_NS / 1000000, PROFILE_PERIOD_MS);
+    profile_sample_period = profile_period_ticks;
+#ifdef __PROSPERO__
+    profile_modules();
+#endif
+    PW_WOW_NOTE("wowprospero profile_clock: tsc_hz=%llu calibration_ms=%u period_ms=%u\n",
+               (unsigned long long)profile_tsc_rate, PROFILE_CALIBRATION_NS / 1000000, PROFILE_PERIOD_MS);
     struct sigaction action;
     struct itimerval timer = { { 0, 1000 }, { 0, 1000 } };
     memset(&action, 0, sizeof(action));
@@ -949,7 +1338,7 @@ static void profile_start(void)
     action.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
     sigemptyset(&action.sa_mask);
     if(sigaction(SIGPROF, &action, NULL) || setitimer(ITIMER_PROF, &timer, NULL)) {
-        fprintf(stderr, "wowprospero profile: sampling timer unavailable\n");
+        PW_WOW_NOTE("wowprospero profile: sampling timer unavailable\n");
         profile_path = NULL;
     }
 }
@@ -957,16 +1346,24 @@ static void profile_start(void)
 static void profile_add_thread(struct pw_thread *thread)
 {
     if(profile_path && !thread->engine.fault_markers) {
-        fprintf(stderr, "wowprospero profile: requires fault-marker block map\n");
+        PW_WOW_NOTE("wowprospero profile: requires fault-marker block map\n");
         return;
     }
     if(profile_path) {
+        unsigned i;
+
         thread->profile = calloc(1, sizeof(*thread->profile));
-        for(unsigned i = 0; i < MAX_ARENAS; i++)
+        for(i = 0; i < MAX_ARENAS; i++)
             if(__atomic_load_n(&arenas[i].high, __ATOMIC_ACQUIRE) && arenas[i].engine == &thread->engine) {
                 __atomic_store_n(&arenas[i].profile, thread->profile, __ATOMIC_RELEASE);
                 break;
             }
+        /* ⚠ A thread whose arena is not mapped yet is never published, and
+         * then every guest sample it takes is counted as unattributed for the
+         * life of the process. Say so rather than let it look like host code. */
+        if(i == MAX_ARENAS)
+            PW_WOW_NOTE("wowprospero profile: tid=%04x has no arena to publish into\n",
+                       (unsigned)HandleToULong(NtCurrentTeb()->ClientId.UniqueThread));
     }
 }
 
@@ -1571,6 +1968,8 @@ static NTSTATUS run( void *args )
             reset_thread_engine( thread );
             continue;
         }
+        if (status == PW_ERR_VM || status == PW_ERR_NOT_FOUND)
+            log_guest_fault_state( thread, status );
         pw_wow_report_error(params, status, state->eip, state->fault_address, state->fault_write);
         break;
     }
@@ -1795,7 +2194,7 @@ static NTSTATUS thread_term( void *args )
     pw_x86_engine_destroy( &thread->engine );
     release( thread->entries, 0 );
     if (thread->call_stack) release( thread->call_stack, 0 );
-    free( thread );
+    free_thread_state( thread );
     return STATUS_SUCCESS;
 }
 

@@ -1,0 +1,51 @@
+From: Codex <codex@localhost>
+Subject: win32u: Trace PS5 Vulkan hardware cursor handoff
+
+Report the first cursor state passed from Wine to VideoOut, changes in
+visibility, and changes in the return status. This distinguishes a game that
+keeps its Windows cursor hidden from a failed VideoOut hardware-cursor call
+without logging once per presented frame.
+
+---
+diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
+--- a/dlls/win32u/ps5drv.c
++++ b/dlls/win32u/ps5drv.c
+@@ -741,5 +741,7 @@ void ps5drv_vulkan_cursor( void *vulkan_handle )
+     static int (*show)( const UINT32 *, UINT, UINT, INT, INT, UINT, UINT );
+     static BOOL looked;
++    static BOOL reported, last_visible;
++    static int last_result;
+     const UINT32 *image;
+     UINT width, height;
+     POINT top_left;
+@@ -751,9 +753,26 @@ void ps5drv_vulkan_cursor( void *vulkan_handle )
+         looked = TRUE;
+         show = dlsym( vulkan_handle, "pw_videoout_cursor" );
+     }
+-    if (!show) return;
++    if (!show)
++    {
++        if (!reported) ERR( "PW_VK_CURSOR missing pw_videoout_cursor export\n" );
++        reported = TRUE;
++        return;
++    }
+     image = ps5drv_lock_cursor( &width, &height, &top_left );
+-    show( width && height ? image : NULL, width, height, top_left.x, top_left.y, screen_width, screen_height );
++    {
++        BOOL visible = image && width && height;
++        int result = show( visible ? image : NULL, width, height, top_left.x, top_left.y,
++                           screen_width, screen_height );
++
++        if (!reported || visible != last_visible || result != last_result)
++            ERR( "PW_VK_CURSOR visible=%u image=%p size=%ux%u pos=%d,%d desktop=%ux%u result=%d\n",
++                 visible, image, width, height, top_left.x, top_left.y, screen_width,
++                 screen_height, result );
++        reported = TRUE;
++        last_visible = visible;
++        last_result = result;
++    }
+     ps5drv_unlock_cursor();
+ }
+ #endif
+-- 
+2.43.0

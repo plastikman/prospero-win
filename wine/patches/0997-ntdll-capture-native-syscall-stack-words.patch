@@ -1,0 +1,64 @@
+From: Codex <codex@local>
+Subject: ntdll: capture native syscall stack words outside TEB bounds
+
+The native RSP samples sit below the TEB StackLimit, so the existing
+bounded stack snapshot is empty. For sampled libkernel syscall 0x1c6,
+snapshot four words at the interrupted RSP; rsp0 already reads the
+first word, and this adds the next three for offline caller tracing.
+
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index d20f2adabc..163c74393d 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -107,6 +107,7 @@ static volatile unsigned long long pw_native_pc_frames64[8];
+ static volatile unsigned long long pw_native_pc_stack_limit, pw_native_pc_stack_base;
+ static volatile unsigned long long pw_native_pc_stack_words[8];
+ static volatile unsigned long long pw_native_pc_stack_deep_words[4];
++static volatile unsigned long long pw_native_pc_rsp_words[4];
+ 
+ __attribute__((visibility("default")))
+ unsigned int __wine_prospero_native_wow64_caps( unsigned int version )
+@@ -131,7 +132,8 @@ unsigned int __wine_prospero_native_profile_sample( unsigned long long *sequence
+                                                      unsigned long long *stack_limit,
+                                                      unsigned long long *stack_base,
+                                                      unsigned long long *stack_words,
+-                                                     unsigned long long *stack_deep_words )
++                                                     unsigned long long *stack_deep_words,
++                                                     unsigned long long *rsp_words )
+ {
+     unsigned long long seq = __atomic_load_n( &pw_native_pc_sequence, __ATOMIC_ACQUIRE );
+     if (sequence) *sequence = seq;
+@@ -154,6 +156,8 @@ unsigned int __wine_prospero_native_profile_sample( unsigned long long *sequence
+         stack_words[i] = __atomic_load_n( &pw_native_pc_stack_words[i], __ATOMIC_RELAXED );
+     if (stack_deep_words) for (unsigned int i = 0; i < 4; ++i)
+         stack_deep_words[i] = __atomic_load_n( &pw_native_pc_stack_deep_words[i], __ATOMIC_RELAXED );
++    if (rsp_words) for (unsigned int i = 0; i < 4; ++i)
++        rsp_words[i] = __atomic_load_n( &pw_native_pc_rsp_words[i], __ATOMIC_RELAXED );
+     return 1;
+ }
+ 
+@@ -1134,7 +1138,23 @@ static void __attribute__((used)) profile_handler( int signal, siginfo_t *siginf
+         __atomic_store_n( &pw_native_pc_stack_words[i], 0, __ATOMIC_RELAXED );
+     }
+     for (unsigned int i = 0; i < 4; ++i)
++    {
+         __atomic_store_n( &pw_native_pc_stack_deep_words[i], 0, __ATOMIC_RELAXED );
++        __atomic_store_n( &pw_native_pc_rsp_words[i], 0, __ATOMIC_RELAXED );
++    }
++    /* TEB StackLimit does not cover the native stack used by some PS4 thread
++     * paths. For the known libkernel _umtx_op syscall sample, RSP is valid
++     * (the first word is already captured below as rsp0); record three more
++     * words above it while the interrupted thread is suspended. */
++    {
++        ULONG_PTR rsp = RSP_sig(context);
++        if ((CS_sig(context) & 0xffff) == 0x43 && RAX_sig(context) == 0x1c6 &&
++            rsp && !(rsp & 7) && rsp <= ~0ull - 4 * sizeof(ULONG_PTR))
++            for (unsigned int i = 0; i < 4; ++i)
++                __atomic_store_n( &pw_native_pc_rsp_words[i],
++                                  *(const volatile ULONG_PTR *)(rsp + i * sizeof(ULONG_PTR)),
++                                  __ATOMIC_RELAXED );
++    }
+     {
+         ULONG_PTR stack_limit = data->teb ? (ULONG_PTR)data->teb->Tib.StackLimit : 0;
+         ULONG_PTR stack_base = data->teb ? (ULONG_PTR)data->teb->Tib.StackBase : 0;

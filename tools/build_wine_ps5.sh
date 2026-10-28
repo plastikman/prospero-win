@@ -87,7 +87,10 @@ TARGETS="dlls/ntdll/ntdll.so dlls/win32u/win32u.so server/wineserver dlls/winevu
 # side (patch 0720), so its PE and Unix halves must come from the same build.
 # winevulkan: emit its PE thunks alongside the Unix side so command-stream
 # hooks and dispatch table capability checks come from the same source.
-PE_MODULES="xinput1_1 xinput1_2 xinput1_3 xinput1_4 xinputuap quartz opengl32 winevulkan"
+# ntdll: log the PE32 guest page protections on the PS4 native-WoW64 fault path.
+# iphlpapi: provide the PS4 NSI-unavailable loopback adapter fallback.
+# ws2_32: trace the empty-hostname branch in the PE32 Winsock wrapper.
+PE_MODULES="ntdll iphlpapi ws2_32 xinput1_1 xinput1_2 xinput1_3 xinput1_4 xinputuap quartz opengl32 winevulkan"
 # Everything optional but FreeType (built below) is off: the console has none
 # of these libraries, and a configure-time probe against the payload SDK must
 # not pick up host headers.
@@ -152,7 +155,7 @@ fi
     (cd "$ps5opengl_sdk" && sha256sum --status --check manifest.sha256) ||
     fail "PS5 OpenGL SDK does not match its SHA-256 manifest"
 
-# The series: NNNN-lower-case-name.patch, unique numbers below 0900, each a
+# The series: NNNN-lower-case-name.patch, unique numbers through 1006, each a
 # mail-formatted patch with a subject. Printed in the order it is applied.
 series() {
     [ -d "$patches" ] || fail "no patch directory $patches"
@@ -166,8 +169,8 @@ series() {
             fail "patch name must be NNNN-lower-case-words.patch: $patch"
         number=$(printf '%s' "$patch" | cut -c1-4 | sed 's/^0*//')
         number=${number:-0}
-        [ "$number" -ge 100 ] && [ "$number" -le 899 ] ||
-            fail "patch number outside 0100-0899: $patch"
+        [ "$number" -ge 100 ] && [ "$number" -le 1006 ] ||
+            fail "patch number outside 0100-1006: $patch"
         [ "$number" -ne "$last" ] || fail "duplicate patch number: $patch"
         last=$number
         grep -q '^Subject: ' "$patches/$patch" || fail "patch has no Subject: $patch"

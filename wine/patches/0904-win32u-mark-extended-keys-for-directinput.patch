@@ -1,0 +1,35 @@
+From: plastikman <plastikman@users.noreply.github.com>
+Subject: [PATCH] win32u: mark extended keys in PS5 driver input
+
+diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
+index 336057aa9b..0b5f333793 100644
+--- a/dlls/win32u/ps5drv.c
++++ b/dlls/win32u/ps5drv.c
+@@ -588,6 +592,27 @@ static BOOL ps5_ProcessEvents( DWORD mask )
+             input.ki.wVk = event.code;
+             input.ki.wScan = NtUserMapVirtualKeyEx( event.code, MAPVK_VK_TO_VSC, NtUserGetKeyboardLayout( 0 ));
+             input.ki.dwFlags = event.down ? 0 : KEYEVENTF_KEYUP;
++            switch (event.code)
++            {
++            case VK_UP:
++            case VK_DOWN:
++            case VK_LEFT:
++            case VK_RIGHT:
++            case VK_INSERT:
++            case VK_DELETE:
++            case VK_HOME:
++            case VK_END:
++            case VK_PRIOR:
++            case VK_NEXT:
++            case VK_RCONTROL:
++            case VK_RMENU:
++            case VK_LWIN:
++            case VK_RWIN:
++            case VK_APPS:
++            case VK_DIVIDE:
++                input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
++                break;
++            }
+             {
+                 NTSTATUS status = NtUserSendHardwareInput( hwnd, 0, &input, 0 );
+                 TRACE( "key hwnd=%p vk=%#x scan=%#x down=%u status=%#x\n",

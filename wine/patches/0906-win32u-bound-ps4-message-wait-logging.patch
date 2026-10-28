@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Subject: [PATCH] win32u: bound PS4 message-wait phase logging
+
+The 0905 trace emitted one log per inner wait-loop iteration and overwhelmed
+runtime logging when the queue stayed signaled. Aggregate phase times and emit
+one throttled summary only for slow calls or repeated queue wakeups.
+---
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index df748e935d..84a2671956 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -3412,55 +3412,47 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
+     ULONG ret_len;
+     HANDLE event;
+     static DWORD last_probe_log;
+-    DWORD ret, start, elapsed;
+-    BOOL log_probe = !timeout && count == 1 && !wake_mask && changed_mask == QS_ALLINPUT && !flags &&
+-                     (!last_probe_log || NtGetTickCount() - last_probe_log >= 1000);
++    DWORD ret, start, total_start, elapsed, callback_before_ms = 0, driver_ms = 0;
++    DWORD idle_ms = 0, kernel_wait_ms = 0, repeat_driver_ms = 0, callback_after_ms = 0;
++    DWORD repeat_count = 0, total_ms;
++    BOOL more;
++    BOOL probe = !timeout && count == 1 && !wake_mask && changed_mask == QS_ALLINPUT && !flags;
+ 
+-    if (log_probe) last_probe_log = NtGetTickCount();
++    total_start = probe ? NtGetTickCount() : 0;
+     if ((abs = get_nt_timeout( &time, timeout )))
+     {
+         NtQuerySystemTime( &now );
+         abs->QuadPart = now.QuadPart - abs->QuadPart;
+     }
+ 
+-    if (log_probe) WARN( "PS4-DI message phase=callback-before-begin tid=%u\n", GetCurrentThreadId() );
+-    start = NtGetTickCount();
++    if (probe) start = NtGetTickCount();
+     if (!KeUserDispatchCallback( &params.dispatch, sizeof(params), &ret_ptr, &ret_len ) &&
+         ret_len == sizeof(params.locks))
+     {
+         params.locks = *(DWORD *)ret_ptr;
+         params.restore = TRUE;
+     }
+-    elapsed = NtGetTickCount() - start;
+-    if (log_probe) WARN( "PS4-DI message phase=callback-before-end ms=%u tid=%u\n", elapsed, GetCurrentThreadId() );
++    if (probe) callback_before_ms = NtGetTickCount() - start;
+ 
+-    if (log_probe) WARN( "PS4-DI message phase=driver-events-begin tid=%u\n", GetCurrentThreadId() );
+-    start = NtGetTickCount();
++    if (probe) start = NtGetTickCount();
+     process_driver_events( QS_ALLINPUT, wake_mask, changed_mask );
+-    elapsed = NtGetTickCount() - start;
+-    if (log_probe) WARN( "PS4-DI message phase=driver-events-end ms=%u tid=%u\n", elapsed, GetCurrentThreadId() );
++    if (probe) driver_ms = NtGetTickCount() - start;
+ 
+-    if (log_probe) WARN( "PS4-DI message phase=idle-event-begin tid=%u\n", GetCurrentThreadId() );
+-    start = NtGetTickCount();
++    if (probe) start = NtGetTickCount();
+     if (!(changed_mask & QS_SMRESULT) && (event = get_user_thread_info()->idle_event)) NtSetEvent( event, NULL );
+-    elapsed = NtGetTickCount() - start;
+-    if (log_probe) WARN( "PS4-DI message phase=idle-event-end ms=%u tid=%u\n", elapsed, GetCurrentThreadId() );
++    if (probe) idle_ms = NtGetTickCount() - start;
+ 
+-    if (log_probe) WARN( "PS4-DI message phase=kernel-wait-begin tid=%u\n", GetCurrentThreadId() );
+     do
+     {
+-        start = NtGetTickCount();
++        if (probe) start = NtGetTickCount();
+         ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );
+-        elapsed = NtGetTickCount() - start;
+-        if (log_probe) WARN( "PS4-DI message phase=kernel-wait-end ms=%u result=%#x tid=%u\n",
+-                             elapsed, ret, GetCurrentThreadId() );
++        if (probe) kernel_wait_ms += NtGetTickCount() - start;
+         if (ret != count - 1) break;
+-        if (log_probe) WARN( "PS4-DI message phase=driver-events-repeat-begin tid=%u\n", GetCurrentThreadId() );
+-        start = NtGetTickCount();
+-        if (process_driver_events( QS_ALLINPUT, wake_mask, changed_mask )) break;
+-        elapsed = NtGetTickCount() - start;
+-        if (log_probe) WARN( "PS4-DI message phase=driver-events-repeat-end ms=%u tid=%u\n",
+-                             elapsed, GetCurrentThreadId() );
++        repeat_count++;
++        if (probe) start = NtGetTickCount();
++        more = process_driver_events( QS_ALLINPUT, wake_mask, changed_mask );
++        if (probe) repeat_driver_ms += NtGetTickCount() - start;
++        if (more) break;
+     }
+     while (ret == count - 1);
+ 
+@@ -3473,11 +3465,25 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
+     if (ret == WAIT_TIMEOUT && !count && !timeout) NtYieldExecution();
+     if (ret == count - 1) get_user_thread_info()->last_driver_time = get_driver_check_time();
+ 
+-    if (log_probe) WARN( "PS4-DI message phase=callback-after-begin tid=%u\n", GetCurrentThreadId() );
+-    start = NtGetTickCount();
++    if (probe) start = NtGetTickCount();
+     KeUserDispatchCallback( &params.dispatch, sizeof(params), &ret_ptr, &ret_len );
+-    elapsed = NtGetTickCount() - start;
+-    if (log_probe) WARN( "PS4-DI message phase=callback-after-end ms=%u tid=%u\n", elapsed, GetCurrentThreadId() );
++    if (probe) callback_after_ms = NtGetTickCount() - start;
++
++    if (probe)
++    {
++        total_ms = NtGetTickCount() - total_start;
++        if ((total_ms >= 20 || repeat_count > 1) &&
++            (!last_probe_log || NtGetTickCount() - last_probe_log >= 250))
++        {
++            last_probe_log = NtGetTickCount();
++            elapsed = driver_ms + repeat_driver_ms;
++            WARN( "PS4-DI message summary total_ms=%u callback_before_ms=%u driver_ms=%u idle_ms=%u "
++                  "kernel_wait_ms=%u repeat_driver_ms=%u repeat_count=%u callback_after_ms=%u "
++                  "driver_total_ms=%u result=%#x tid=%u\n",
++                  total_ms, callback_before_ms, driver_ms, idle_ms, kernel_wait_ms,
++                  repeat_driver_ms, repeat_count, callback_after_ms, elapsed, ret, GetCurrentThreadId() );
++        }
++    }
+ 
+     return ret;
+ }
+--
+2.43.0

@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] ntdll: trace first PS4 exception before server dispatch
+
+Record the first exception context before send_debug_event() can recursively
+fault while reporting it. Include guest and signal PCs plus TEB stack bounds.
+Limit the trace to 24 entries so recursive failures cannot flood the log.
+
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 0000000..0000000 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -1968,6 +1968,26 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
+     XSAVE_AREA_HEADER *src_xs;
+     void *callback;
+ 
++#ifdef __PROSPERO__
++    {
++        /* Capture before send_debug_event(): its server path may fault again
++         * while trying to report this exception. */
++        static unsigned int trace_count;
++        unsigned int n = __atomic_add_fetch( &trace_count, 1, __ATOMIC_RELAXED );
++
++        if (n <= 24)
++            ERR( "PW_EXCEPTION_SETUP n=%u tid=%#lx code=%08x flags=%08x addr=%p params=%u p0=%p p1=%p ctxrip=%p ctxrsp=%p sigrip=%p sigrsp=%p stack_base=%p stack_limit=%p dealloc=%p\n",
++                 n, (ULONG_PTR)data->teb->ClientId.UniqueThread, rec->ExceptionCode,
++                 rec->ExceptionFlags, rec->ExceptionAddress, rec->NumberParameters,
++                 rec->NumberParameters > 0 ? (void *)rec->ExceptionInformation[0] : NULL,
++                 rec->NumberParameters > 1 ? (void *)rec->ExceptionInformation[1] : NULL,
++                 (void *)context->Rip, (void *)context->Rsp,
++                 (void *)RIP_sig( sigcontext ), (void *)RSP_sig( sigcontext ),
++                 data->teb->Tib.StackBase, data->teb->Tib.StackLimit,
++                 data->teb->DeallocationStack );
++    }
++#endif
++
+     status = send_debug_event( data, rec, context, TRUE, TRUE );
+     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
+     {

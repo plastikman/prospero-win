@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,8 +41,137 @@
 
 int __real_open(const char *path, int flags, ...);
 int __real_close(int fd);
+int __real_dup(int fd);
+extern int sceKernelRdup(int fd);
+
+/* ⚠ dup() RETURNS EPERM ON THIS KERNEL. Measured 2026-10-07: wineserver's
+ * dup_fd_object (server/fd.c) failed with errno 1, which file_set_error turned
+ * into STATUS_ACCESS_DENIED, which create_user_data_mapping returned as NULL,
+ * which init_directories handed to release_object -- a null dereference four
+ * steps from the cause. orbis-compat records the same refusal for dup2 onto fd
+ * 1 or 2 ("the descriptor table is not ours to rearrange"); this is the plain
+ * dup of an arbitrary descriptor.
+ *
+ * fcntl(F_DUPFD) is the POSIX equivalent and is not refused, so fall back to
+ * it. Wine's server duplicates descriptors routinely, so this is not a
+ * one-site fix. */
+int __wrap_dup(int fd)
+{
+    int result, candidate;
+
+    if ((result = __real_dup(fd)) != -1) return result;        /* EPERM here */
+    if ((result = fcntl(fd, F_DUPFD, 0)) != -1) return result; /* EINVAL here */
+
+    /* The POSIX calls are all refused on this kernel -- dup is EPERM,
+     * fcntl(F_DUPFD) is EINVAL, and dup2 onto a free high number fails too, so
+     * the descriptor table really is not ours to rearrange (orbis-compat says
+     * the same of dup2 onto fd 1 or 2). libkernel has its own primitive for
+     * it, which is what a title is evidently meant to use. */
+    (void)candidate;
+    result = sceKernelRdup(fd);
+    /* ⚠ AN SCE CALL BEHIND A POSIX NAME. orbis-compat records the same of
+     * sceKernelStat: failure is 0x8002_0000 | errno, not -1 with errno set.
+     * Returned as-is it is a large POSITIVE integer, so the caller takes it for
+     * a descriptor and the first fstat of it fails EBADF -- four frames from
+     * here, in mapping_init. The low 16 bits are the FreeBSD errno. */
+    if ((unsigned)result >= 0x80000000u)
+    {
+        errno = ((unsigned)result >> 16) == 0x8002 ? (result & 0xFFFF) : EBADF;
+        return -1;
+    }
+    return result;
+}
+
 int __real_stat(const char *path, struct stat *st);
 int __real_lstat(const char *path, struct stat *st);
+
+/* ⚠ stat() DOES NOT REPORT st_dev OR st_ino ON THIS CONSOLE. Measured
+ * 2026-10-07 (src/stat-probe): orbis-compat's stat() goes through
+ * sceKernelStat, which leaves st_dev, st_ino, st_nlink and st_uid zero, while
+ * its fstat() goes through _fstat and fills them. Same translate(), different
+ * kernel call. st_mode and st_size agree.
+ *
+ * Wine identifies files by (st_dev, st_ino), so zeros are not a cosmetic gap:
+ * wineserver creates its server directory, chdir()s in, open(".")s it and
+ * compares a stat() against an fstat() -- which can never match, and it died
+ * with "chdir did not end up in <dir>" every time.
+ *
+ * Fill them the only way that works here: open the path and fstat it. Only
+ * when they came back zero, so a file system that does report them pays
+ * nothing. A failure to open leaves the stat as-is rather than failing the
+ * call -- the mode and size are still good. */
+static void fill_identity(const char *path, struct stat *st)
+{
+    struct stat from_fd;
+    int fd;
+
+    if (st->st_dev || st->st_ino) return;
+    if ((fd = __real_open(path, O_RDONLY)) < 0) return;
+    if (!fstat(fd, &from_fd)) {
+        st->st_dev = from_fd.st_dev;
+        st->st_ino = from_fd.st_ino;
+        if (!st->st_nlink) st->st_nlink = from_fd.st_nlink;
+        if (!st->st_uid) st->st_uid = from_fd.st_uid;
+    }
+    __real_close(fd);
+}
+
+/* ⚠ A path this layer hands to libc must end within PW_CWD_PATH_MAX. Sony's
+ * libc reads it with no bound, so an unterminated buffer walks off the end of
+ * the mapping and faults inside libSceLibcInternal, where it reads as a crash
+ * in a syscall rather than as a bad argument here:
+ *
+ *     syscall fault 0xc0000005 at libSceLibcInternal.sprx+0x51eca,
+ *                   address 2202daf860
+ *     syscall fault in syscall 0x147a (win32u #1146)
+ *     syscall fault called from win32u.prx+0x242393  (NtUserCreateWindowStation)
+ *     syscall fault called from ntdll.prx+0xb58b2    (stat_resolved)
+ *
+ * Every buffer here is a char[PW_CWD_PATH_MAX] inside struct resolved, so
+ * reading that many bytes is always in bounds; what is not guaranteed is that
+ * something wrote a terminator. Say so and refuse, rather than letting libc
+ * find out. If this never fires, the stack walk above pointed at a stale slot
+ * and the fault is somewhere else -- which is worth knowing too. */
+static int pw_path_is_terminated(const char *path, const char *who)
+{
+    extern int sceKernelDebugOutText(int channel, const char *text);
+    static int reported;
+    char line[160];
+
+    if (path && strnlen(path, PW_CWD_PATH_MAX) < PW_CWD_PATH_MAX) return 1;
+    if (reported < 8) {
+        reported++;
+        snprintf(line, sizeof(line),
+                 "pw_cwd: %s given a path with no terminator in %d bytes (%p)\n",
+                 who, (int)PW_CWD_PATH_MAX, (const void *)path);
+        sceKernelDebugOutText(0, line);
+    }
+    errno = EINVAL;
+    return 0;
+}
+
+/* Every raw stat in this file goes through these, so any identity comparison
+ * anywhere sees real st_dev/st_ino rather than zeros. */
+static int real_stat_full(const char *path, struct stat *st)
+{
+    int result;
+
+    if (!pw_path_is_terminated(path, "stat")) return -1;
+    result = __real_stat(path, st);
+    if (!result) fill_identity(path, st);
+    return result;
+}
+
+static int real_lstat_full(const char *path, struct stat *st)
+{
+    int result;
+
+    if (!pw_path_is_terminated(path, "lstat")) return -1;
+    result = __real_lstat(path, st);
+    if (!result) fill_identity(path, st);
+    return result;
+}
+
 int __real_access(const char *path, int mode);
 int __real_mkdir(const char *path, mode_t mode);
 int __real_rmdir(const char *path);
@@ -191,7 +321,7 @@ static int link_stat(const char *full, ssize_t target_length, struct stat *st)
     size_t hash = 5381;
 
     parent_of(full, directory);
-    if (__real_stat(directory, &parent)) return -1;
+    if (real_stat_full(directory, &parent)) return -1;
     while (*full) hash = hash * 33 + (unsigned char)*full++;
     *st = parent;
     st->st_mode = S_IFLNK | 0777;
@@ -218,7 +348,7 @@ static int lstat_resolved(struct resolved *r, struct stat *st)
 
     do {
         if (is_link(r->full, &length)) return link_stat(r->full, length, st);
-    } while ((result = __real_lstat(r->full, st)) && reload(r));
+    } while ((result = real_lstat_full(r->full, st)) && reload(r));
     return result;
 }
 
@@ -226,7 +356,8 @@ static int stat_resolved(struct resolved *r, struct stat *st)
 {
     int result;
 
-    while ((result = __real_stat(r->full, st)) && reload(r)) {}
+    while ((result = real_stat_full(r->full, st)) && reload(r)) {}
+    if (!result) fill_identity(r->full, st);
     return result;
 }
 
@@ -252,7 +383,7 @@ int __wrap_fchdir(int fd)
     if (!S_ISDIR(by_fd.st_mode)) { errno = ENOTDIR; return -1; }
     /* Another module may have closed and reused the number: the path must
      * still name the descriptor's directory. */
-    if (pw_cwd_fd_path(fd, path, sizeof(path)) || __real_stat(path, &by_path) ||
+    if (pw_cwd_fd_path(fd, path, sizeof(path)) || real_stat_full(path, &by_path) ||
         by_path.st_dev != by_fd.st_dev || by_path.st_ino != by_fd.st_ino) {
         errno = EACCES;
         return -1;
@@ -414,7 +545,7 @@ int __wrap_access(const char *path, int mode)
     if (resolve(&r, path, 1)) return -1;
     while (__real_access(r.full, mode)) {
         if (reload(&r)) continue;
-        if (errno != EPERM || __real_stat(r.full, &st)) return -1;
+        if (errno != EPERM || real_stat_full(r.full, &st)) return -1;
         if (pw_cwd_mode_allows(st.st_mode, mode)) return 0;
         errno = EACCES;
         return -1;
@@ -529,7 +660,7 @@ static int symlink_resolved(const char *target, struct resolved *r)
     if (!lstat_resolved(r, &st)) { errno = EEXIST; return -1; }
     if (errno != ENOENT) return -1;
     parent_of(folded, directory);
-    if (__real_stat(directory, &st)) return -1;
+    if (real_stat_full(directory, &st)) return -1;
     if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
     if (pw_cwd_link_add(folded, target)) return -1;
     if (!save_table(folded)) return 0;
@@ -560,7 +691,7 @@ ssize_t __wrap_readlink(const char *path, char *buffer, size_t size)
     if (resolve(&r, path, 0)) return -1;
     do {
         if ((length = pw_cwd_link_target(r.full, buffer, size)) >= 0) return length;
-    } while ((result = __real_lstat(r.full, &st)) && reload(&r));
+    } while ((result = real_lstat_full(r.full, &st)) && reload(&r));
     if (!result) errno = EINVAL;
     return -1;
 }
@@ -633,6 +764,87 @@ DIR *__wrap_opendir(const char *path)
 
 /* The names of the directory r names, read whole: NUL-terminated in a
  * buffer the caller frees. 0, or -1 with errno. */
+/* Append one name to the growing buffer; 0, or -1 with errno. */
+static int append_name(const char *name, size_t length, char **names, size_t *bytes,
+                       size_t *count, size_t *size)
+{
+    if (*bytes + length + 1 > *size) {
+        char *bigger;
+
+        while (*bytes + length + 1 > *size) *size *= 2;
+        if (!(bigger = realloc(*names, *size))) { errno = ENOMEM; return -1; }
+        *names = bigger;
+    }
+    memcpy(*names + *bytes, name, length);
+    (*names)[*bytes + length] = 0;
+    *bytes += length + 1;
+    ++*count;
+    return 0;
+}
+
+/* ⚠ readdir does not list /data on this console. libc reads a directory with
+ * a buffer of its own choosing -- a page, 16 KiB here -- and /data's
+ * directories use 64 KiB blocks, so the call is refused for a buffer smaller
+ * than one block: EINVAL, or EPERM, depending on where it is tried. The
+ * launcher met this first and answered it with getdents over a whole block
+ * (native/pw_wine_library.c), and that is the method used here.
+ *
+ * Unlike the launcher's parser this one keeps every entry, directories
+ * included: these names are what resolves the components of a path, and
+ * dropping them loses \windows and \syswow64 along with the files.
+ *
+ * Nothing had noticed because the only caller is the case-insensitive search,
+ * which a prefix written in lower case reaches only when a name is spelled
+ * some other way -- and then every lookup fails at once. A 32-bit game asks
+ * for its imports exactly as its import table spells them, so GTA IV lost all
+ * twenty-one of them and the loader ended the process with c0000135. */
+/* ⚠ One buffer, not one per call. A whole directory block is 64 KiB here, and
+ * this console's libc refuses an allocation that size -- the same allocator
+ * that turns calloc of 145 KiB into EINVAL (docs/FINDINGS.md) -- so asking for
+ * one on every lookup fails as soon as the heap is busy, which arrives as
+ * STATUS_NO_MEMORY out of a DLL load and looks nothing like a directory
+ * problem. The launcher has always kept this buffer static; so does this. */
+static pthread_mutex_t dirents_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t dirents_buffer[64 * 1024];
+
+static int read_names_getdents(int fd, char **names, size_t *bytes, size_t *count, size_t *size)
+{
+    static const size_t block = sizeof(dirents_buffer);
+    uint8_t *buffer = dirents_buffer;
+    int got, saved;
+
+    pthread_mutex_lock(&dirents_lock);
+    while ((got = (int)getdents(fd, (struct dirent *)buffer, block)) > 0) {
+        size_t offset = 0;
+
+        while (offset < (size_t)got) {
+            uint16_t reclen;
+            uint8_t namlen;
+
+            if ((size_t)got - offset < 8) { saved = EINVAL; goto failed; }
+            memcpy(&reclen, buffer + offset + 4, 2);
+            namlen = buffer[offset + 7];
+            if (reclen < 8 || reclen > (size_t)got - offset || (size_t)namlen + 8 > reclen) {
+                saved = EINVAL; goto failed;
+            }
+            if (namlen && append_name((const char *)buffer + offset + 8, namlen,
+                                      names, bytes, count, size)) {
+                saved = errno; goto failed;
+            }
+            offset += reclen;
+        }
+    }
+    saved = errno;
+    pthread_mutex_unlock(&dirents_lock);
+    if (got < 0) { errno = saved; return -1; }
+    return 0;
+
+failed:
+    pthread_mutex_unlock(&dirents_lock);
+    errno = saved;
+    return -1;
+}
+
 static int read_names(const struct resolved *r, char **names, size_t *bytes, size_t *count)
 {
     struct dirent *entry;
@@ -641,39 +853,42 @@ static int read_names(const struct resolved *r, char **names, size_t *bytes, siz
     int fd, saved;
 
     *bytes = *count = 0;
-    if ((fd = __real_open(r->full, O_RDONLY)) < 0) return -1;
+    if (!(*names = malloc(size))) { errno = ENOMEM; return -1; }
+    if ((fd = __real_open(r->full, O_RDONLY)) < 0) { saved = errno; goto failed; }
+
+    /* The console's method first; see read_names_getdents. */
+    if (!read_names_getdents(fd, names, bytes, count, &size) && *count) {
+        __real_close(fd);
+        return 0;
+    }
+    *bytes = *count = 0;
+
+    /* Then libc's, for a file system where it does work. fdopendir owns the
+     * descriptor once it succeeds, so it must not be closed here as well. */
     if (!(dir = fdopendir(fd))) {
         saved = errno;
         __real_close(fd);
-        errno = saved;
-        return -1;
+        goto failed;
     }
-    if (!(*names = malloc(size))) {
-        closedir(dir);
-        errno = ENOMEM;
-        return -1;
-    }
+    errno = 0;   /* readdir ends by returning NULL; only errno tells which end */
     while ((entry = readdir(dir))) {
-        size_t length = strlen(entry->d_name) + 1;
-
-        if (*bytes + length > size) {
-            char *bigger;
-
-            while (*bytes + length > size) size *= 2;
-            if (!(bigger = realloc(*names, size))) {
-                free(*names);
-                closedir(dir);
-                errno = ENOMEM;
-                return -1;
-            }
-            *names = bigger;
+        if (append_name(entry->d_name, strlen(entry->d_name), names, bytes, count, &size)) {
+            saved = errno;
+            closedir(dir);
+            goto failed;
         }
-        memcpy(*names + *bytes, entry->d_name, length);
-        *bytes += length;
-        ++*count;
+        errno = 0;
     }
+    if ((saved = errno)) { closedir(dir); goto failed; }
     closedir(dir);
     return 0;
+
+failed:
+    free(*names);
+    *names = NULL;
+    *bytes = *count = 0;
+    errno = saved;
+    return -1;
 }
 
 int pw_cwd_scan_directory(int dirfd, const char *path, pw_cwd_visit visit, void *context,

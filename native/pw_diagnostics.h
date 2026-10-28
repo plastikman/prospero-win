@@ -12,6 +12,11 @@ enum { PW_DIAGNOSTICS_SESSIONS = 8 };
 int pw_diagnostics_open(const char *root, const char *build, const char *profile,
                         uint32_t cycle);
 void pw_diagnostics_log(const char *format, ...);
+/* Queue high-frequency telemetry for a worker so a slow diagnostic sink
+ * cannot stall Wine or the presentation thread. Queued records may be
+ * dropped when the bounded queue is full. */
+void pw_diagnostics_log_async(const char *format, ...);
+unsigned long pw_diagnostics_async_dropped(void);
 /* Writes buffered records to the session file; never waits for the network
  * (a background thread brings a dropped channel back). */
 void pw_diagnostics_tick(uint64_t now_ns);
@@ -22,7 +27,8 @@ void pw_diagnostics_status(char *buffer, size_t size);
  * the live channel; never takes a mutex. segment is the ntdll segment holding
  * pc (-1 when none), and segment_offset pc's offset in it. */
 void pw_diagnostics_emergency(int signal, uintptr_t address, uint64_t pc,
-                              int segment, uint64_t segment_offset);
+                              int segment, uint64_t segment_offset,
+                              const char *module, uint64_t module_offset);
 #ifdef PW_DIAGNOSTICS_TESTING
 void pw_diagnostics_test_retry_interval(uint64_t ns);
 #endif

@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 15 Oct 2026 06:38:00 -0700
+Subject: [PATCH] win32u: trace PS4 raw input payloads on user events
+
+Log the payload only when a keyboard key or mouse button is read through
+GetRawInputData. This confirms whether injected PS4 mappings arrive as the
+expected game input without tracing per-frame mouse movement.
+---
+diff --git a/dlls/win32u/rawinput.c b/dlls/win32u/rawinput.c
+index f33a9b56ae..b0300fd76a 100644
+--- a/dlls/win32u/rawinput.c
++++ b/dlls/win32u/rawinput.c
+@@ -557,6 +557,15 @@ UINT WINAPI NtUserGetRawInputData( HRAWINPUT handle, UINT command, void *data, U
+         goto failed;
+     }
+ 
++    if (rawinput->header.dwType == RIM_TYPEKEYBOARD)
++        WARN( "PS4-RAW keyboard vkey=%#x make=%#x flags=%#x message=%#x\n",
++              rawinput->data.keyboard.VKey, rawinput->data.keyboard.MakeCode,
++              rawinput->data.keyboard.Flags, rawinput->data.keyboard.Message );
++    else if (rawinput->header.dwType == RIM_TYPEMOUSE && rawinput->data.mouse.usButtonFlags)
++        WARN( "PS4-RAW mouse buttons=%#x data=%#x flags=%#x\n",
++              rawinput->data.mouse.usButtonFlags, rawinput->data.mouse.usButtonData,
++              rawinput->data.mouse.usFlags );
++
+     return rawinput->header.dwSize;
+ 
+ failed:
+-- 
+2.43.0

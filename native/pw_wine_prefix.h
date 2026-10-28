@@ -9,6 +9,11 @@
  * created, as for a prefix Wine has not made yet. */
 int pw_wine_prefix_temp_create(const char *prefix, PwPrefixTemp *temp);
 
+/* Sets nGlide 1.01's per-prefix Resolution value to By desktop (registry
+ * DWORD 1). Appends the setting only when it is not already present. Returns
+ * 1 when written, 0 when already set, or -1 on an I/O or path error. */
+int pw_wine_prefix_nglide_desktop_resolution(const char *prefix);
+
 /* WoW64 loads its CPU backend from the prefix's system32 only, so a prefix
  * made before the native backend shipped lacks it. Copies source (the
  * runtime's x86_64-windows/<name>) to <prefix>/drive_c/windows/system32/<name>

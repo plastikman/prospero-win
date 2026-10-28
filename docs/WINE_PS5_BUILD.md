@@ -935,6 +935,12 @@ The title runs one game per process (`src/pw_wine_launch.h`):
       fails, the game runs on the prefix's own CPU. The log shows the
       choice (`PW_WINE64 cpu=native prefix_cpu=1`: copied, `0`: already
       there, `-1`: not copied). 64-bit games never use the WoW64 CPU.
+    - `native_profile = true` is a targeted diagnostic for native WoW64.
+      It enables the per-thread watcher (`PW_NATIVE_WATCH=1`) and SIGPROF PC
+      sampler (`PW_NATIVE_PC=1`), reporting sampled native instruction
+      pointers for CPU-busy guest threads. Leave it off for ordinary runs: if
+      the PS4 signal bridge cannot safely handle the sample signal, Wine exits
+      the title rather than continuing with corrupted thread state.
   - `mode = xinput` also makes the DualSense the game's XInput controller
     0 (see [XInput controller](#xinput-controller)).
     - Cross, Circle, Square and Triangle are A, B, X and Y. L1/R1 are the

@@ -22,8 +22,24 @@ static int self;
 /* WINE_PRX_DIR names the fallback directory for modules that are not staged
  * beside the path Wine asks for; the title's sce_module is the default. */
 /* A failed dlopen names what it tried on stderr, which reaches ps5log
- * through ntdll's output sink (patch 0560). */
-static void report(const char *line){fprintf(stderr,"%s\n",line);}
+ * through ntdll's output sink (patch 0560).
+ *
+ * ⚠ AND klog, because that sink is ntdll's alone. win32u calls dlopen too --
+ * it is how Vulkan is reached, dlopen(SONAME_LIBVULKAN) -- and a PRX other
+ * than ntdll has no usable stderr here (docs/FINDINGS.md), so this text was
+ * written and dropped on every failure. All win32u itself then reports is
+ * ERR("Failed to load %s", SONAME_LIBVULKAN): the name it asked for, never the
+ * paths tried or the reason. libvulkan.prx was refused four times before
+ * anyone could read the one line that says which. */
+static void report(const char *line)
+{
+    extern int sceKernelDebugOutText(int channel,const char *text);
+    char klog[512];
+
+    fprintf(stderr,"%s\n",line);
+    snprintf(klog,sizeof(klog),"%s\n",line);
+    sceKernelDebugOutText(0,klog);
+}
 static void configure(void)
 {
     const PwWineDlOps ops={sceKernelLoadStartModule,sceKernelGetModuleInfo,
