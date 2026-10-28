@@ -26,6 +26,23 @@ void *pw_wine_heap_memalign(size_t alignment,size_t bytes);
 size_t pw_wine_heap_usable_size(const void *pointer);
 void pw_wine_heap_stats(PwWineHeapStats *stats);
 
+/* ⚠ Kept OUT of PwWineHeapStats on purpose. dlls/ntdll/unix/loader.c's
+ * pw_report_heap() declares its own 9-field copy of that struct on the stack
+ * instead of including this header, so adding a field there makes
+ * pw_wine_heap_stats write past its buffer -- a 40-byte stack smash that
+ * crashed the title in the loader's refusal path (package 1018, 2026-10-28).
+ * sizeof(PwWineHeapStats) must stay 72.
+ *
+ * Why the last allocation was refused, and how often the direct-memory backing
+ * declined so the heap fell back to anonymous (flexible) mappings: the PS4
+ * glue's fallback log latches after one line per process, so a count is the
+ * only way to see a repeated fallback. */
+typedef struct PwWineHeapFailures {
+    uint64_t last_failed_bytes,last_failure_reason;
+    uint64_t last_map_bytes,last_map_errno,backing_refusals;
+} PwWineHeapFailures;
+void pw_wine_heap_failures(PwWineHeapFailures *out);
+
 /* Where new spans and large blocks come from. By default anonymous mappings;
  * on the console those are flexible memory, of which a title has about
  * 440 MiB, so pw_wine_dmem_ps5.c installs direct memory instead. map returns

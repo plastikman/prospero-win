@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <errno.h>
 
 #if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
 #define MAP_ANONYMOUS MAP_ANON
@@ -35,14 +36,20 @@ static uint8_t *carve,*carve_end;
 static void *larges[MAX_LARGE];
 static uint32_t large_count;
 static PwWineHeapStats stats;
+static PwWineHeapFailures failures;
 
 static PwWineHeapBacking backing;
 static void *map(size_t bytes)
 {
     void *p=backing.map?backing.map(backing.context,bytes):NULL;
     if(p)return p;
+    /* The backing declined (or there is none): this mapping came from flexible
+     * memory instead of direct memory. Counted because the PS4 glue's fallback
+     * log latches after one line per process. */
+    failures.backing_refusals++;
     p=mmap(NULL,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    return p==MAP_FAILED?NULL:p;
+    if(p==MAP_FAILED){failures.last_map_bytes=bytes;failures.last_map_errno=(uint64_t)errno;return NULL;}
+    return p;
 }
 static void unmap(void *address,size_t bytes)
 {
@@ -276,4 +283,8 @@ void pw_wine_heap_stats(PwWineHeapStats *out)
 {
     if(!out)return;
     pthread_mutex_lock(&lock);*out=stats;pthread_mutex_unlock(&lock);
+}
+void pw_wine_heap_failures(PwWineHeapFailures *out)
+{
+    pthread_mutex_lock(&lock);*out=failures;pthread_mutex_unlock(&lock);
 }
