@@ -140,8 +140,6 @@ C_ASSERT(sizeof(struct pw_native_profile) == 104);
 #define PW_PROFILE_ENTRY(offset, kind) \
     "pushfq\n\t" \
     "pushq %rax\n\t" \
-    "pushq %rdx\n\t" \
-    "pushq %rcx\n\t" \
     "movq 24(%r15),%rax\n\t" \
     "testq %rax,%rax\n\t" \
     "jz 9f\n\t" \
@@ -449,7 +447,7 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
                    "movq %rsp,%r14\n\t"
                    "movl 0xa8(%r13),%edx\n\t"   /* context->Edx */
                    "movl 0xac(%r13),%ecx\n\t"   /* context->Ecx */
-                   "movl $0x3b,%eax\n\t"          /* PS4 compatibility stack selector */
+                   "movl 0xc8(%r13),%eax\n\t"   /* context->SegSs */
                    "movq %rax,0x20(%rsp)\n\t"
                    "mov %ax,%ds\n\t"
                    "mov %ax,%es\n\t"
@@ -458,7 +456,7 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
                    "movq %rax,0x18(%rsp)\n\t"
                    "movl 0xc0(%r13),%eax\n\t"   /* context->EFlags */
                    "movq %rax,0x10(%rsp)\n\t"
-                   "movl $0x33,%eax\n\t"          /* PS4 compatibility code selector */
+                   "movl 0xbc(%r13),%eax\n\t"   /* context->SegCs */
                    "movq %rax,0x8(%rsp)\n\t"
                    "movl 0xb8(%r13),%eax\n\t"   /* context->Eip */
                    "movq %rax,(%rsp)\n\t"
@@ -561,8 +559,6 @@ static NTSTATUS process_init(void)
     NTSTATUS (WINAPI **p__wine_unix_call_dispatcher)( unixlib_handle_t, unsigned int, void * );
     WOW64INFO *wow64info = NtCurrentTeb()->TlsSlots[WOW64_TLS_WOW64INFO];
 
-    WINE_MESSAGE( "ORBW00029 native diag: process_init entered\n" );
-
     if ((ULONG_PTR)syscall_32to64 >> 32 || (ULONG_PTR)unix_call_32to64 >> 32 ||
         (ULONG_PTR)code_buffer > 0x100000000ULL - sizeof(code_buffer))
     {
@@ -574,36 +570,19 @@ static NTSTATUS process_init(void)
      * not enter compatibility mode until its TLS/signal transition layer
      * has explicitly completed initialization. */
     status = init_xstate();
-    WINE_MESSAGE( "ORBW00029 native diag: xstate status=%08x avx=%u\n", (unsigned int)status, pw_native_avx );
     if (status) return status;
     status = WINE_UNIX_CALL( pw_native_process_init, &native );
-    WINE_MESSAGE( "ORBW00029 native diag: unix init status=%08x ready=%u fs_set=%p fs32=%04x\n",
-                  (unsigned int)status, native.transitions_ready,
-                  (void *)(ULONG_PTR)native.fs_set_proc, native.fs32_selector );
     if (status) return status;
-    if (!native.transitions_ready)
-    {
-        WINE_MESSAGE( "ORBW00029 native diag: transitions not ready\n" );
-        return STATUS_NOT_SUPPORTED;
-    }
-    if (!native.fs_set_proc)
-    {
-        WINE_MESSAGE( "ORBW00029 native diag: sysarch entry missing\n" );
-        return STATUS_ENTRYPOINT_NOT_FOUND;
-    }
+    if (!native.transitions_ready) return STATUS_NOT_SUPPORTED;
+    if (!native.fs_set_proc) return STATUS_ENTRYPOINT_NOT_FOUND;
     pw_native_sysarch = (void *)(ULONG_PTR)native.fs_set_proc;
 
     LdrGetDllHandle( NULL, 0, &str, &module );
     p__wine_unix_call_dispatcher = RtlFindExportedRoutineByName( module, "__wine_unix_call_dispatcher" );
-    if (!p__wine_unix_call_dispatcher)
-    {
-        WINE_MESSAGE( "ORBW00029 native diag: unix dispatcher export missing\n" );
-        return STATUS_ENTRYPOINT_NOT_FOUND;
-    }
+    if (!p__wine_unix_call_dispatcher) return STATUS_ENTRYPOINT_NOT_FOUND;
     __wine_unix_call_dispatcher = *p__wine_unix_call_dispatcher;
 
     RtlCaptureContext( &context );
-    WINE_MESSAGE( "ORBW00029 native diag: host context cs=%04x\n", context.SegCs );
     if (context.SegCs != PW_NATIVE_CS64) return STATUS_NOT_SUPPORTED;
 
     /* Do not obtain compatibility selectors from a 64-bit thread context. */
@@ -626,7 +605,6 @@ static NTSTATUS process_init(void)
     thunk->unix_thunk.cs    = cs64_sel;
 
     status = NtProtectVirtualMemory( GetCurrentProcess(), (void **)&thunk, &size, PAGE_EXECUTE_READ, &old_prot );
-    WINE_MESSAGE( "ORBW00029 native diag: protect status=%08x thunk=%p\n", (unsigned int)status, thunk );
     if (status) return status;
     wow64info->CpuFlags |= WOW64_CPUFLAGS_MSFT64;
     WINE_MESSAGE( "wow64native initialized: cs32=%04x ss32=%04x cs64=%04x avx=%u\n",
@@ -638,9 +616,7 @@ static NTSTATUS process_init(void)
 NTSTATUS WINAPI BTCpuProcessInit(void)
 {
     /* The pinned Wine caller ignores this status; Simulate enforces it. */
-    WINE_MESSAGE( "ORBW00029 native diag: BTCpuProcessInit entered\n" );
     process_status = process_init();
-    WINE_MESSAGE( "ORBW00029 native diag: BTCpuProcessInit status=%08x\n", (unsigned int)process_status );
     return process_status;
 }
 
@@ -674,7 +650,6 @@ void * WINAPI pw_native_prepare_simulate(void)
     if (status)
     {
         /* Do not dispatch a guest exception through uninitialized BOP code. */
-        WINE_MESSAGE( "ORBW00029 native diag: prepare_simulate terminating status=%08x\n", (unsigned int)status );
         NtTerminateProcess(GetCurrentProcess(), status);
         RtlRaiseStatus(status);
     }

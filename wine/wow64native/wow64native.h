@@ -6,8 +6,6 @@
 #define PW_NATIVE_CS32 0x33
 #define PW_NATIVE_SS32 0x3b
 #define PW_NATIVE_CS64 0x43
-#define PW_NATIVE_PROFILE_SAMPLE_COUNT 64
-#define PW_NATIVE_PROFILE_SAMPLE_SHIFT 10
 
 /* ntdll owns the signal protocol. Its optional Unix export accepts this
  * version and returns zero for an unsupported protocol. Each bit describes

@@ -54,8 +54,11 @@
 
 #include "pw_ws2_32_resolver.h"
 
-/* getnameinfo's buffer sizes: size_t on FreeBSD, socklen_t in glibc. */
-#ifdef __GLIBC__
+/* getnameinfo's buffer sizes: size_t on FreeBSD, socklen_t in glibc -- and
+ * socklen_t on the PS4, whose SDK headers declare it that way. Without
+ * PW_PS4_DNS here the PS4 build fails with "conflicting types for
+ * 'getnameinfo'". */
+#if defined(__GLIBC__) || defined(PW_PS4_DNS)
 typedef socklen_t pw_name_size;
 #else
 typedef size_t pw_name_size;
@@ -454,6 +457,17 @@ static struct hostent *pw_hostent(const char *name, int family, const void *addr
     host.h_length = length;
     host.h_addr_list = address_list;
     return &host;
+}
+
+/* ⚠ PS4: our ws2_32 unixlib patch calls pw_ps4_gethostbyname by name, so the
+ * symbol must exist or create-fself fails with "missing library for symbol".
+ * It used to front a separate PS4 sceNet resolver here; upstream's getaddrinfo
+ * now does that itself (sceNetResolverStartNtoa/Ntoa6, with IPv6 our version
+ * never had), so this just delegates rather than carrying a second resolver. */
+struct hostent *pw_ps4_gethostbyname(const char *name);
+struct hostent *pw_ps4_gethostbyname(const char *name)
+{
+    return gethostbyname(name);
 }
 
 struct hostent *gethostbyname(const char *name)
