@@ -32,6 +32,13 @@
  *                          ; when nothing is bound, keyboard otherwise
  *   mouse = right_stick    ; a stick moves the pointer: left_stick, right_stick, none
  *   mouse_speed = 1200     ; pointer pixels per second at full tilt
+ *   keyboard_stick = right_stick ; turn one stick into key presses: left_stick,
+ *                                ; right_stick or none (default none)
+ *   stick_deadzone = 25    ; activation threshold, percent (5..70)
+ *   stick_up = w           ; keys for the four stick directions; defaults WASD
+ *   stick_down = s
+ *   stick_left = a
+ *   stick_right = d
  *   cross = space          ; <button> = <key> | mouse_left | mouse_right |
  *   r2 = mouse_left        ;            mouse_middle | vk:0xNN | none
  *   player2 = pinball-p2   ; a keyboard preset for a second DualSense, the pad
@@ -105,6 +112,10 @@ typedef struct PwGameInput {
     PwGameInputMode mode;
     PwGameStick mouse;
     uint32_t mouse_speed;
+    PwGameStick keyboard_stick;      /* digital key presses from this stick */
+    uint8_t stick_deadzone;          /* percent, 5..70 */
+    uint8_t stick_keys_set;          /* directions explicitly set by this profile/preset */
+    uint16_t stick_keys[4];          /* up, down, left, right; defaults to W, S, A, D */
     PwGameBinding bindings[PW_GAME_BUTTON_COUNT];   /* in PW_GAME_BUTTON order */
     char preset[PW_APP_ID_CAPACITY];
     char player2[PW_APP_ID_CAPACITY];   /* the second pad's preset, profile only */

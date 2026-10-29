@@ -75,6 +75,19 @@
  * src/prospero-win-patches-ps4/0026-wine64-report-gnm-submit-done.patch,
  * dropped by the 2026-10-28 upstream merge. */
 extern int32_t sceGnmSubmitDone(void);
+#ifdef PW_RELOCATABLE_WINE
+/* Present only in the relocatable PRX build. Keep the eboot image mapped
+ * through Sony display/input setup, then release its low range immediately
+ * before Wine starts the selected Windows process.
+ *
+ * Restored 2026-10-28: the upstream sync dropped this, so the eboot stayed
+ * mapped at 0x400000-0x49c000 and sceKernelReserveVirtualRange returned
+ * ENOMEM for every fixed low reservation -- measured by vmprobe/1045 as
+ * `query ... name=executable hole=0`. FalloutNV.exe then relocated to
+ * 0x530000 (it had loaded at 0x400000 on 19 consecutive pre-sync runs) and
+ * Oblivion, which cannot relocate, died at STATUS_CONFLICTING_ADDRESSES. */
+extern int pw_relocated_wine_release_eboot(void) __attribute__((weak));
+#endif
 #ifndef PW_FIXED_PROFILE
 /* The id of the one profile a single-program title runs; "" for the launcher. */
 #define PW_FIXED_PROFILE ""
@@ -111,6 +124,19 @@ static const char *const runtime_roots[] = { "/app0", PW_SANDBOX_APP0 };
 /* 1 turns on Wine's wait watchdog (patch 0680): a snapshot of what every
  * thread waits on every two seconds, for stalls that logging hides. */
 #define PW_WINE64_WAIT_WATCHDOG 0
+#endif
+#ifndef PW_WINE64_HEAP_FLEXIBLE
+/* A/B control: keep Wine's Unix heap on its existing anonymous mmap backing
+ * instead of PS4 direct memory. Restored 2026-10-28 -- the upstream sync left
+ * build-relocatable-wine-ps4.sh validating and passing -D for this and for
+ * PW_WINE64_SERVER_DIRECT_OFF while no source read either, so both switches
+ * looked wired and did nothing. */
+#define PW_WINE64_HEAP_FLEXIBLE 0
+#endif
+#ifndef PW_WINE64_SERVER_DIRECT_OFF
+/* A/B control: route Wine server requests through the ordinary server thread
+ * rather than the direct path, leaving the CPU backend and game data alone. */
+#define PW_WINE64_SERVER_DIRECT_OFF 0
 #endif
 #ifndef PW_WINE64_SCRIPT
 /* 1 drives the launcher unattended for validation: it opens
@@ -1049,6 +1075,7 @@ int main(int argc, char **argv)
     const PwGameProfile *game = NULL;
     int scaling = PW_PRESENT_SCALE_FIT;
     PwWinePointer pointer = { 0, 0 };
+    PwWineKeyboardStick keyboard_stick_state = { 0 };
     int (*post_input)(const PwWineInput *) = NULL;
     void (*set_pad)(const PwWinePad *) = NULL;
     int (*rumble)(uint32_t *, uint32_t *) = NULL;
@@ -1109,6 +1136,16 @@ int main(int argc, char **argv)
     if (game) {
         int input_status = pw_wine_library_input(game, library_root, &game_input);
         int input2_status = pw_wine_library_player2_input(game, library_root, &game_input2);
+        /* [input] 1049: the 1048 stick diagnostic was gated on deflection, so
+         * "setting is off" and "axes frozen at centre" both came out silent.
+         * This line is unconditional and settles the first of the two. */
+        PS5LOG_LOG("PW_WINE64 input status=%s keyboard_stick=%d stick_deadzone=%u "
+                   "stick_keys=%#x,%#x,%#x,%#x keys_set=%#x mouse=%d mode=%d set=%#x",
+                   pw_result_name(input_status), (int)game_input.keyboard_stick,
+                   (unsigned)game_input.stick_deadzone, game_input.stick_keys[0],
+                   game_input.stick_keys[1], game_input.stick_keys[2], game_input.stick_keys[3],
+                   (unsigned)game_input.stick_keys_set, (int)game_input.mouse,
+                   (int)game_input.mode, (unsigned)game_input.set);
         player2 = input2_status == PW_OK;
         if (input2_status != PW_ERR_NOT_FOUND)
             PS5LOG_LOG("PW_WINE64 player2 preset=%s input=%s", game->input.player2,
@@ -1256,6 +1293,14 @@ int main(int argc, char **argv)
                        temp.count ? temp.folders[temp.count - 1] : "-");
         }
         if (PW_WINE64_WAIT_WATCHDOG) setenv("WINE_PS5_WAIT_WATCHDOG", "1", 1);
+        if (PW_WINE64_HEAP_FLEXIBLE) {
+            setenv("WINE_PS5_HEAP_FLEXIBLE", "1", 1);
+            PS5LOG_LOG("PW_WINE64 heap_direct=0 (anonymous mmap control)");
+        }
+        if (PW_WINE64_SERVER_DIRECT_OFF) {
+            setenv("WINE_PS5_SERVER_DIRECT", "0", 1);
+            PS5LOG_LOG("PW_WINE64 server_direct=0 (regular server thread)");
+        }
         /* [application] arguments follow the executable in Wine's argv. */
         int words = pw_wine_launch_split(game->app.arguments, argument_words,
                                          sizeof(argument_words), wine_argv + 2,
@@ -1382,6 +1427,15 @@ int main(int argc, char **argv)
         status = pw_wine_start_environment(&start, &config, &ops);
         PS5LOG_LOG("PW_WINE64 environment status=%d", status);
     }
+#ifdef PW_RELOCATABLE_WINE
+    if (status == PW_OK) {
+        if (game && pw_relocated_wine_release_eboot) {
+            int release_status = pw_relocated_wine_release_eboot();
+            PS5LOG_LOG("PW_WINE64 relocatable eboot release status=%d", release_status);
+            if (release_status) status = PW_ERR_STATE;
+        }
+    }
+#endif
     if (status == PW_OK) {
         status = pw_wine_start_run(&start, &config, &ops);
         PS5LOG_LOG("PW_WINE64 run status=%d", status);
@@ -1397,7 +1451,8 @@ int main(int argc, char **argv)
         uint64_t now = now_ns();
         pw_diagnostics_tick(now);
         PwPresentView view;
-        PwWineInput events[2 * PW_GAME_BUTTON_COUNT + 1];
+        /* +4 stick transitions (keyboard_stick) and +1 pointer move. */
+        PwWineInput events[2 * PW_GAME_BUTTON_COUNT + 5];
         int presented = 0;
 
         /* The USB keyboard and mouse; one plugged in later is found by a
@@ -1539,7 +1594,42 @@ int main(int argc, char **argv)
         if (pad_read) {
             size_t count = pw_wine_game_inputs(&game_input, seen->core.pressed_edges,
                                                seen->core.released_edges, events,
-                                               sizeof(events) / sizeof(events[0]) - 1);
+                                               sizeof(events) / sizeof(events[0]) - 5);
+            /* [input] keyboard_stick: one stick drives the four direction
+             * keys (WASD by default). Oblivion's profile sets left_stick. */
+            const PwPadPs5Stick *key_stick = NULL;
+            if (game_input.keyboard_stick != PW_GAME_STICK_NONE)
+                key_stick = game_input.keyboard_stick == PW_GAME_STICK_LEFT ?
+                            &seen->left_stick : &seen->right_stick;
+            size_t before_stick = count;
+            count += pw_wine_keyboard_stick_step(&game_input,
+                                                 key_stick ? key_stick->x : 0x80,
+                                                 key_stick ? key_stick->y : 0x80,
+                                                 key_stick != NULL, &keyboard_stick_state,
+                                                 &events[count],
+                                                 sizeof(events) / sizeof(events[0]) - count - 1);
+            /* Bounded: the first 40 deflections or emitted transitions. Says
+             * whether the setting is live, whether stick values arrive, and
+             * whether the step turned them into keys. */
+            {
+                static unsigned stick_logs, stick_frames;
+                int deflected = key_stick && (key_stick->x < 0x60 || key_stick->x > 0xa0 ||
+                                              key_stick->y < 0x60 || key_stick->y > 0xa0);
+                /* 1049: also sample unconditionally -- the first 10 frames and
+                 * every 120th after -- so a silent run still says whether the
+                 * setting is live and what the axes actually read. */
+                int sampled = stick_frames < 10 || stick_frames % 120 == 0;
+                stick_frames++;
+                if ((deflected || count != before_stick || sampled) && stick_logs < 60) {
+                    stick_logs++;
+                    PS5LOG_LOG("PW_WINE64 stick n=%u setting=%d x=%#x y=%#x dead=%u held=%#x events=%u",
+                               stick_logs, (int)game_input.keyboard_stick,
+                               key_stick ? key_stick->x : 0x80, key_stick ? key_stick->y : 0x80,
+                               (unsigned)game_input.stick_deadzone,
+                               (unsigned)keyboard_stick_state.held,
+                               (unsigned)(count - before_stick));
+                }
+            }
             if (game_input.mouse != PW_GAME_STICK_NONE) {
                 const PwPadPs5Stick *stick = game_input.mouse == PW_GAME_STICK_LEFT ?
                                              &seen->left_stick : &seen->right_stick;
@@ -1560,6 +1650,16 @@ int main(int argc, char **argv)
                     PS5LOG_LOG("PW_WINE64 rumble left=%u right=%u status=%s rc=%d trigger_rc=%d",
                                (unsigned)left, (unsigned)right, pw_result_name(vibrate),
                                pad.vibration_rc, pad.trigger_rc);
+            }
+        } else if (keyboard_stick_state.held && post_input) {
+            /* The pad stopped reporting with directions held: release them
+             * so the game is not left walking into a wall. */
+            size_t count = pw_wine_keyboard_stick_step(&game_input, 0x80, 0x80, 0,
+                                                       &keyboard_stick_state, events,
+                                                       sizeof(events) / sizeof(events[0]));
+            for (size_t j = 0; j < count; j++) {
+                if (post_input(&events[j]) == 0) posted++;
+                else refused++;
             }
         }
         /* The console's own keyboard: the two-finger click or the menu's
