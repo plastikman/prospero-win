@@ -66,6 +66,15 @@
 #define PW_TITLE_ID "PPSA99995"
 #endif
 #define PW_APP_NAME "prospero-win-wine64"
+
+/* ⚠ The system suspend path waits for the GNM driver's per-frame submission
+ * completion notification, including frames submitted through Vulkan/AGC.
+ * Without it Shell suspend times out with
+ * CPU_FAULT_SUBMITDONE_TIMEOUT_IN_SUSPEND_ASYNC even while idle, which the
+ * user sees as a crash when closing the game. Restored from
+ * src/prospero-win-patches-ps4/0026-wine64-report-gnm-submit-done.patch,
+ * dropped by the 2026-10-28 upstream merge. */
+extern int32_t sceGnmSubmitDone(void);
 #ifndef PW_FIXED_PROFILE
 /* The id of the one profile a single-program title runs; "" for the launcher. */
 #define PW_FIXED_PROFILE ""
@@ -1670,6 +1679,15 @@ int main(int argc, char **argv)
             PS5LOG_LOG("PW_WINE64 close timeout: leaving the game");
             restart_title(NULL, launch.cycle + 1u, "close-timeout");
             break;
+        }
+        {
+            /* Tell the system driver that this frame's command buffers have
+             * all been submitted. */
+            static int logged_submit_done;
+            int submit_done = sceGnmSubmitDone();
+            if (!logged_submit_done || submit_done)
+                PS5LOG_LOG("PW_WINE64 gnm submit_done rc=%d", submit_done);
+            logged_submit_done = 1;
         }
         if (tick % 60 == 0) {
             uint64_t v[16] = { 0 };
