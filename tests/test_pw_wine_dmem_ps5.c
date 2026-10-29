@@ -87,7 +87,6 @@ static void test_memory_budget(void)
     }
 }
 
-
 int sceKernelReserveVirtualRange(void **address, size_t bytes, int flags, size_t alignment)
 {
     void *at;

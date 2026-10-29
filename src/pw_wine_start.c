@@ -50,6 +50,8 @@ int pw_wine_start_load(PwWineStart *start, const PwWineStartConfig *config,
         pw_prx_lookup(start->descriptor, "__wine_ps5_memory_stats");
     start->fault_top = (unsigned int (*)(uint64_t *, unsigned int))
         pw_prx_lookup(start->descriptor, "__wine_virtual_fault_top");
+    start->ps4_setenv = (int (*)(const char *, const char *))
+        pw_prx_lookup(start->descriptor, "pw_ps4_setenv");
     if (!start->wine_main) return fail(start, PW_WINE_START_ENTRY, PW_ERR_NOT_FOUND);
 
     /* The firmware loads the module without running its entry. */
@@ -76,25 +78,11 @@ int pw_wine_start_environment(PwWineStart *start, const PwWineStartConfig *confi
         (config->extra_env_count && !config->extra_env))
         return PW_ERR_PRECONDITION;
     /* WINELOADERNOEXEC keeps __wine_main from re-executing a loader. */
-    /* ⚠ PS4: the title and each PRX have a private environ, because the SDK
-     * ships libc only as a static archive. ops->set_env writes the title's,
-     * which Wine -- running inside ntdll -- never sees. pw_ps4_setenv is
-     * exported by the module and writes its own, so set both. */
-    {
-        int (*module_setenv)(const char *, const char *) =
-            (int (*)(const char *, const char *))
-            (uintptr_t)pw_prx_lookup(start->descriptor, "pw_ps4_setenv");
-        if (module_setenv) {
-            module_setenv("WINEPREFIX", config->prefix);
-            module_setenv("WINE_PS5_NTDLL_DIR", config->ntdll_dir);
-            module_setenv("WINELOADERNOEXEC", "1");
-            for (uint32_t i = 0; i < config->extra_env_count; i++) {
-                const PwWineStartEnv *env = &config->extra_env[i];
-                if (env->name && env->value) module_setenv(env->name, env->value);
-            }
-        }
+    if (start->ps4_setenv) {
+        (void)start->ps4_setenv("WINEPREFIX", config->prefix);
+        (void)start->ps4_setenv("WINE_PS5_NTDLL_DIR", config->ntdll_dir);
+        (void)start->ps4_setenv("WINELOADERNOEXEC", "1");
     }
-
     if ((status = ops->set_env("WINEPREFIX", config->prefix)) != 0 ||
         (status = ops->set_env("WINE_PS5_NTDLL_DIR", config->ntdll_dir)) != 0 ||
         (status = ops->set_env("WINELOADERNOEXEC", "1")) != 0)
@@ -103,6 +91,7 @@ int pw_wine_start_environment(PwWineStart *start, const PwWineStartConfig *confi
         const PwWineStartEnv *env = &config->extra_env[i];
         if (!env->name || !env->value || !env->name[0])
             return fail(start, PW_WINE_START_ENVIRONMENT, PW_ERR_PRECONDITION);
+        if (start->ps4_setenv) (void)start->ps4_setenv(env->name, env->value);
         if ((status = ops->set_env(env->name, env->value)) != 0)
             return fail(start, PW_WINE_START_ENVIRONMENT, status);
     }

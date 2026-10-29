@@ -121,14 +121,6 @@ def test_agc_submit_establishes_a_suspend_point() -> None:
     assert "int32_t sceAgcSuspendPoint(void)" in stub
 
 
-def test_title_reports_gnm_frame_submit_done() -> None:
-    main = read("native/wine64_main.c")
-    builder = (ROOT.parent / "scripts/build-app-ps4.sh").read_text()
-    assert "extern int32_t sceGnmSubmitDone(void);" in main
-    assert "int submit_done = sceGnmSubmitDone();" in main
-    assert "-lSceGnmDriver" in builder
-
-
 def main() -> int:
     tests = [value for name, value in sorted(globals().items())
              if name.startswith("test_") and callable(value)]

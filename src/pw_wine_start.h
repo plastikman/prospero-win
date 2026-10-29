@@ -63,6 +63,12 @@ typedef struct PwWineStart {
     /* The pages that fault most often (Wine patch 0545), four values each:
      * count, page, last PC, info; NULL when ntdll does not export it. */
     unsigned int (*fault_top)(uint64_t *out, unsigned int count);
+    /* ⚠ PS4: ntdll.prx carries a private environment because this console's
+     * setenv reports success but never publishes `environ`. Resolved from the
+     * PRX descriptor rather than linked, and called alongside ops->set_env so
+     * Wine's getenv inside ntdll sees the variables. Without it init_paths()
+     * dies with "cannot get path to ntdll.so (set WINE_PS5_NTDLL_DIR)". */
+    int (*ps4_setenv)(const char *name, const char *value);
     int module_start_result;
     void *adopted;                   /* pw_wine_dl_adopt handle, NULL if not exported */
     int argc;

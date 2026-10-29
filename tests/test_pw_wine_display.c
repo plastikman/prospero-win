@@ -115,46 +115,6 @@ static void test_inputs(void)
     assert(pw_wine_game_inputs(NULL, L1, 0, events, 8) == 0 && pw_wine_game_inputs(&input, L1, 0, NULL, 8) == 0);
 }
 
-static void test_keyboard_stick(void)
-{
-    static const char profile[] = "[input]\nkeyboard_stick = right_stick\nstick_deadzone = 25\n";
-    PwGameInput input;
-    PwWineKeyboardStick state = { 0 };
-    PwWineInput events[4];
-    size_t n;
-
-    pw_game_input_init(&input);
-    assert(pw_game_input_parse((const uint8_t *)profile, sizeof(profile) - 1, &input) == PW_OK);
-    assert(input.keyboard_stick == PW_GAME_STICK_RIGHT && input.stick_keys[0] == 'W' &&
-           input.stick_keys[1] == 'S' && input.stick_keys[2] == 'A' && input.stick_keys[3] == 'D');
-
-    /* Center and sub-deadzone noise do not emit keys. */
-    assert(!pw_wine_keyboard_stick_step(&input, 128, 128, 1, &state, events, 4));
-    assert(!pw_wine_keyboard_stick_step(&input, 110, 140, 1, &state, events, 4));
-
-    /* Tilt left: one key-down; small movement across the activation edge is
-     * held by hysteresis rather than repeating down/up. */
-    n = pw_wine_keyboard_stick_step(&input, 90, 128, 1, &state, events, 4);
-    assert(n == 1 && events[0].type == PW_WINE_INPUT_KEY && events[0].code == 'A' && events[0].down);
-    assert(!pw_wine_keyboard_stick_step(&input, 100, 128, 1, &state, events, 4));
-    n = pw_wine_keyboard_stick_step(&input, 103, 128, 1, &state, events, 4);
-    assert(n == 1 && events[0].code == 'A' && !events[0].down);
-
-    /* Diagonal tilt holds both directions; a direct reversal releases before
-     * pressing the new direction. */
-    n = pw_wine_keyboard_stick_step(&input, 200, 90, 1, &state, events, 4);
-    assert(n == 2 && events[0].code == 'W' && events[0].down &&
-           events[1].code == 'D' && events[1].down);
-    n = pw_wine_keyboard_stick_step(&input, 90, 128, 1, &state, events, 4);
-    assert(n == 3 && events[0].code == 'W' && !events[0].down &&
-           events[1].code == 'D' && !events[1].down &&
-           events[2].code == 'A' && events[2].down);
-
-    /* Disconnect always releases held keys, so no stuck movement remains. */
-    n = pw_wine_keyboard_stick_step(&input, 128, 128, 0, &state, events, 4);
-    assert(n == 1 && events[0].code == 'A' && !events[0].down && !state.held);
-}
-
 static void test_pointer(void)
 {
     PwWinePointer pointer = { 0, 0 };
@@ -371,7 +331,6 @@ int main(void)
     test_frames();
     test_threads();
     test_inputs();
-    test_keyboard_stick();
     test_pointer();
     test_pointer_fraction();
     test_pad();

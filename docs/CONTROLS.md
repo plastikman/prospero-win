@@ -64,13 +64,6 @@ touchpad = space
   - `mouse_left`, `mouse_right` or `mouse_middle`;
   - `none`.
 - **`mouse`:** `left_stick`, `right_stick` or `none`.
-- **`keyboard_stick`:** `left_stick`, `right_stick` or `none`. The selected
-  stick sends held keyboard directions instead of pointer movement. By
-  default, up/down/left/right send W/S/A/D; `stick_up`, `stick_down`,
-  `stick_left` and `stick_right` can override those keys. `stick_deadzone`
-  sets the activation threshold from 5 to 70 percent (default 25). This is
-  independent of the D-pad, so a profile can use the right stick for movement
-  and keep D-pad directions mapped to the arrow keys.
 
 `mouse.input` is a starting point for games played with the mouse alone.
 
