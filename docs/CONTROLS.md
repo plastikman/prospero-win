@@ -64,6 +64,26 @@ touchpad = space
   - `mouse_left`, `mouse_right` or `mouse_middle`;
   - `none`.
 - **`mouse`:** `left_stick`, `right_stick` or `none`.
+- **`keyboard_stick`:** `left_stick`, `right_stick` or `none`. Some games
+  read the keyboard for movement and cannot be told to use a stick axis, so
+  a stick does nothing in them. This one presses the four direction keys
+  instead, which lets the other stick stay on the pointer:
+
+  ```ini
+  ; the left stick walks (W/A/S/D), the right stick aims
+  keyboard_stick = left_stick
+  mouse = right_stick
+  stick_deadzone = 25
+  ```
+
+- **`stick_up`, `stick_down`, `stick_left`, `stick_right`:** the keys
+  `keyboard_stick` sends, from the same list the buttons use. They default
+  to `w`, `s`, `a` and `d`; set them to the arrows for a game that walks
+  with those instead.
+- **`stick_deadzone`:** how far the stick must be pushed before a key is
+  sent, as a percentage of full deflection, `5` to `70` (default `25`). A
+  direction already held is kept slightly past the release point, so a stick
+  resting on the edge does not tap the key.
 
 `mouse.input` is a starting point for games played with the mouse alone.
 
@@ -86,7 +106,9 @@ Games from the Xbox 360 era and later read a controller through XInput. With
 
 The touchpad's left half gives Back without Create, whose press also opens
 the PS5's capture menu; the half is the one the click began on. Rumble
-works: the game's vibration drives the DualSense's motors. The
+works: the game's vibration drives the DualSense's motors, and L2 and R2
+vibrate with them. `rumble = 50` in `[input]` makes it half as strong, and
+`rumble = 0` turns it off (0 to 100, default 100). The
 `gamepad.input` preset is exactly this. You can still add button lines in an
 XInput preset to send keys as well.
 
@@ -107,6 +129,22 @@ Games that read a controller through DirectInput (many games from before
 preset instead. Keyboard and mouse input through DirectInput should work,
 since it comes from the same place as normal Windows input, but it hasn't
 been tested.
+
+### More players with controllers
+
+In xinput mode, the DualSenses of the other PS5 users who are signed in
+(a second account or a guest) are the game's XInput controllers 1, 2 and
+3, beside the first player's controller 0. A game's split screen or local
+multiplayer finds them as it would on a PC. They are opened once the game
+asks for a second controller, which most games do at start or when a
+player presses a button on the menu. Each player's controller rumbles on
+its own. A user who signs in while the game runs is found within two
+seconds and keeps the same controller until they sign out. A controller
+that fails to open is tried again only after that user signs out and in.
+Buttons, the pointer and closing the game stay the first player's, and
+while the in-game menu is open the other controllers read idle. A profile
+with a `player2` preset (below) gives the second player keys instead, and
+then no other controllers are opened.
 
 ### A second player
 

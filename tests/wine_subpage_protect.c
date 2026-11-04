@@ -8,7 +8,7 @@
 #include <stdio.h>
 
 #define PAGE 4096
-#define PAGES 16
+#define PAGES 20
 
 static unsigned char *base;
 static volatile LONG faults, fault_page, fault_write;
@@ -103,6 +103,27 @@ int main(void)
     printf("subpage neighbour writes: %.2f us each\n",
            (double)(end.QuadPart - start.QuadPart) * 1e6 / freq.QuadPart / 20000);
     ok = ok && base[12 * PAGE + 19999 % 4096] == (unsigned char)19999;
+
+    /* Many reads and writes beside an inaccessible page, as a garbage collector's
+     * heap: none is seen, and they stop being stepped over (the host page keeps the
+     * union of its pages' protections). Protecting the page again splits the host
+     * page, and touching it faults again. */
+    ok = ok && protect(17, PAGE_NOACCESS);
+    QueryPerformanceCounter(&start);
+    got = faults;
+    for (i = 0; i < 20000; i++)
+    {
+        ((volatile unsigned char *)base)[16 * PAGE + (i & 4095)] = (unsigned char)i;
+        sink = base[18 * PAGE + (i & 4095)];
+    }
+    QueryPerformanceCounter(&end);
+    ok = ok && expect("20000 reads and writes beside an inaccessible page", faults - got, 0);
+    printf("subpage accesses beside an inaccessible page: %.2f us each\n",
+           (double)(end.QuadPart - start.QuadPart) * 1e6 / freq.QuadPart / 40000);
+    ok = ok && protect(17, PAGE_READWRITE) && protect(17, PAGE_NOACCESS);
+    got = faults;
+    sink = base[17 * PAGE + 9];
+    ok = ok && expect("read of the inaccessible page protected again", faults - got, 1) && fault_page == 17;
 
     printf("subpage verdict=%s\n", ok ? "pass" : "fail");
     fflush(stdout);

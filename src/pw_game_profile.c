@@ -3,10 +3,10 @@
 #include <string.h>
 
 enum { SET_MODE = 1u << 0, SET_MOUSE = 1u << 1, SET_SPEED = 1u << 2, SET_PRESET = 1u << 3,
-       SET_PLAYER2 = 1u << 4, SET_KEYBOARD_STICK = 1u << 5, SET_STICK_DEADZONE = 1u << 6 };
-/* Restored 2026-10-28: the upstream sync dropped keyboard_stick/stick_deadzone
- * and took bit 4 for SET_PLAYER2, so these two moved to bits 5 and 6. Without
- * them Oblivion's profile parsed but the left stick did nothing. */
+       SET_PLAYER2 = 1u << 4, SET_RUMBLE = 1u << 5, SET_KEYBOARD_STICK = 1u << 6,
+       SET_STICK_DEADZONE = 1u << 7 };
+/* keyboard_stick names the stick that drives the four direction keys; the
+ * keys themselves are stick_up/down/left/right, defaulting to WASD. */
 enum { STICK_UP = 1u << 0, STICK_DOWN = 1u << 1, STICK_LEFT = 1u << 2, STICK_RIGHT = 1u << 3 };
 
 /* DualSense buttons in PW_GAME_BUTTON order, with their scePadRead bits. */
@@ -190,6 +190,14 @@ static int input_field(PwGameInput *input, const uint8_t *key, size_t key_length
             return PW_ERR_MALFORMED;
         input->mouse_speed = speed;
         input->set |= SET_SPEED;
+        return PW_OK;
+    }
+    if (is(key, key_length, "rumble")) {
+        uint32_t rumble;
+        if ((input->set & SET_RUMBLE) || number(v, n, &rumble) != PW_OK || rumble > PW_GAME_RUMBLE_MAX)
+            return PW_ERR_MALFORMED;
+        input->rumble = rumble;
+        input->set |= SET_RUMBLE;
         return PW_OK;
     }
     for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++) {
@@ -547,6 +555,7 @@ void pw_game_input_init(PwGameInput *input)
     if (!input) return;
     memset(input, 0, sizeof(*input));
     input->mouse_speed = PW_GAME_MOUSE_SPEED_DEFAULT;
+    input->rumble = PW_GAME_RUMBLE_MAX;
     input->stick_deadzone = 25;
     input->stick_keys[0] = 'W';
     input->stick_keys[1] = 'S';
@@ -605,12 +614,14 @@ void pw_game_input_overlay(PwGameInput *base, const PwGameInput *overrides)
     if (overrides->set & SET_MODE) base->mode = overrides->mode;
     if (overrides->set & SET_MOUSE) base->mouse = overrides->mouse;
     if (overrides->set & SET_SPEED) base->mouse_speed = overrides->mouse_speed;
+    if (overrides->set & SET_RUMBLE) base->rumble = overrides->rumble;
     if (overrides->set & SET_KEYBOARD_STICK) base->keyboard_stick = overrides->keyboard_stick;
     if (overrides->set & SET_STICK_DEADZONE) base->stick_deadzone = overrides->stick_deadzone;
     for (size_t i = 0; i < 4; i++)
         if (overrides->stick_keys_set & (1u << i)) base->stick_keys[i] = overrides->stick_keys[i];
     base->stick_keys_set |= overrides->stick_keys_set;
-    base->set |= overrides->set & (SET_MODE | SET_MOUSE | SET_SPEED | SET_KEYBOARD_STICK | SET_STICK_DEADZONE);
+    base->set |= overrides->set & (SET_MODE | SET_MOUSE | SET_SPEED | SET_RUMBLE | SET_KEYBOARD_STICK |
+                             SET_STICK_DEADZONE);
     for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++)
         if (overrides->bindings[i].kind != PW_GAME_BIND_UNSET) base->bindings[i] = overrides->bindings[i];
 }

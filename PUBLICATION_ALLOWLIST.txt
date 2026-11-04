@@ -86,6 +86,7 @@ tests/test_pw_audio_mix.c
 tests/test_pw_app_profile.c
 tests/test_pw_pad.c
 tests/test_pw_game_menu.c
+tests/test_pw_pad_players.c
 tests/test_pw_pad_ps5.c
 tests/test_status_vocabulary.py
 tests/test_classify_x86.py
@@ -216,6 +217,7 @@ wine/patches/0456-win32u-vulkan-keep-swapchain-chain-when-scaling.patch
 wine/patches/0457-win32u-vulkan-placed-map-properties-khr.patch
 wine/patches/0460-win32u-ps5-driver-vulkan-display-plane.patch
 wine/patches/0470-xinput-ps5-title-controller.patch
+wine/patches/0471-xinput-ps5-four-controllers.patch
 wine/patches/0560-ntdll-stderr-output-sink.patch
 wine/patches/0570-ntdll-ps5-reserve-virtual-range.patch
 wine/patches/0580-ntdll-ps5-config-dir-parent-ownership.patch
@@ -347,6 +349,7 @@ tools/publish_release.sh
 tests/test_publish_release.py
 .github/workflows/release.yml
 .github/release-notes.md
+.github/FUNDING.yml
 wine/ps5/pw_ws2_32_libc.c
 tests/test_pw_ws2_32_libc.c
 wine/patches/0545-ntdll-keep-the-pages-that-fault-most-often.patch
@@ -625,11 +628,20 @@ wine/patches/0878-crypt32-ps5-root-certificates-beside-the-runtime.patch
 wine/ps5/pw_gnutls_libc.c
 wine/patches/0877-secur32-log-gnutls-errors-and-the-clock-on-handshake-failure.patch
 tests/test_build_tls_ps5.py
+wine/patches/0956-gdi32-keep-a-window-s-pixel-format-with-a-native-opengl32.patch
+wine/patches/0957-kernelbase-fall-back-to-the-stored-computer-name.patch
 wine/patches/0965-win32u-ps5-no-pixel-format-message-loop-on-the-desktop.patch
 wine/patches/0970-ntdll-ps5-trace-each-process-query-class-once.patch
 wine/patches/0971-kernelbase-ps5-no-debugger-in-a-title.patch
 wine/patches/0972-faudio-keep-resampling-taps-within-the-samples.patch
 wine/patches/0973-ntdll-ps5-title-menu-snapshot.patch
 wine/patches/0974-ntdll-fault-on-protected-pages-that-share-a-host-page.patch
+wine/patches/0980-server-ps5-dump-long-waiting-stacks-in-the-watchdog.patch
+wine/patches/0981-win32u-register-builtin-classes-without-waiting.patch
+tests/test_wine_builtin_classes.py
+tests/wine_builtin_classes.c
 wine/patches/0982-ntdll-ps5-high-area-as-large-as-the-kernel-grants.patch
+wine/patches/0983-ntdll-ps5-name-the-occupant-of-a-refused-reservation.patch
+wine/patches/0984-win32u-ps5-tell-windows-when-the-controller-comes-or-goes.patch
+wine/patches/0986-ntdll-keep-a-host-page-whole-when-accesses-beside-an-inaccessible-page-run-hot.patch
 tests/test_wine_mouse_wheel.py

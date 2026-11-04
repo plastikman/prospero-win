@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Sun, 11 Oct 2026 12:00:00 +0200
+Subject: [PATCH] kernelbase: Fall back to ComputerName when ActiveComputerName
+ is missing.
+
+GetComputerNameExW reads the NetBIOS name from the volatile
+ActiveComputerName key, which only wineboot creates. A prefix that runs
+without wineboot (on PS5 a title cannot start it) has only the stored
+ComputerName\ComputerName key, so GetComputerNameW failed with
+ERROR_FILE_NOT_FOUND. dxdiagn's IDxDiagProvider::Initialize then
+returned E_FAIL, and GUN stopped at its DirectX check.
+
+When ActiveComputerName cannot be opened, read the NetBIOS name from
+ComputerName\ComputerName, the key wineboot copies it from.
+---
+ dlls/kernelbase/registry.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/kernelbase/registry.c b/dlls/kernelbase/registry.c
+index 7ec30c2..3a77f27 100644
+--- a/dlls/kernelbase/registry.c
++++ b/dlls/kernelbase/registry.c
+@@ -3360,7 +3360,12 @@ BOOL WINAPI GetComputerNameExW( COMPUTER_NAME_FORMAT type, WCHAR *name, DWORD *l
+         return FALSE;
+     }
+ 
+-    if (!(ret = RegOpenKeyExW( HKEY_LOCAL_MACHINE, keyname, 0, KEY_READ, &key )))
++    ret = RegOpenKeyExW( HKEY_LOCAL_MACHINE, keyname, 0, KEY_READ, &key );
++    /* ActiveComputerName is volatile and only wineboot creates it. */
++    if (ret && (type == ComputerNameNetBIOS || type == ComputerNamePhysicalNetBIOS))
++        ret = RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Control\\ComputerName\\ComputerName",
++                             0, KEY_READ, &key );
++    if (!ret)
+     {
+         DWORD size = *len * sizeof(WCHAR);
+         ret = RegQueryValueExW( key, valuename, NULL, NULL, (BYTE *)name, &size );
+-- 
+2.43.0
+

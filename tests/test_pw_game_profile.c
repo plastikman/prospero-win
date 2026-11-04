@@ -114,14 +114,14 @@ static void test_profile(void)
     assert(!p.input.set && p.input.bindings[CROSS].kind == PW_GAME_BIND_UNSET);
 
     assert(parse(APP "; comments and blank lines\n\n[display]\ndesktop = 1024x768\nscaling = Integer\n"
-                 "[input]\npreset = pinball\nmode = keyboard\nmouse = right_stick\nmouse_speed = 900\n"
+                 "[input]\npreset = pinball\nmode = keyboard\nmouse = right_stick\nmouse_speed = 900\nrumble = 40\n"
                  "cross = space\nL1 = z\nr1 = slash\nr2 = mouse_left\nl2 = mouse_right\n"
                  "r3 = mouse_middle\noptions = f3\nsquare = F12\ntriangle = vk:0x5B\n"
                  "circle = 7\ntouchpad = none\nup = up\n", &p) == PW_OK);
     assert(p.display.width == 1024 && p.display.height == 768);
     assert(p.display.scaling == PW_GAME_SCALING_INTEGER);
     assert(!strcmp(p.input.preset, "pinball") && p.input.mouse == PW_GAME_STICK_RIGHT);
-    assert(p.input.mouse_speed == 900 && p.input.mode == PW_GAME_INPUT_KEYBOARD);
+    assert(p.input.mouse_speed == 900 && p.input.mode == PW_GAME_INPUT_KEYBOARD && p.input.rumble == 40);
     assert(p.input.bindings[CROSS].kind == PW_GAME_BIND_KEY && p.input.bindings[CROSS].code == 0x20);
     assert(p.input.bindings[CROSS].mask == 0x4000u && p.input.bindings[L1].code == 'Z');
     assert(p.input.bindings[R1].code == 0xbf && p.input.bindings[OPTIONS].code == 0x72);
@@ -324,6 +324,10 @@ static void test_refusals(void)
         APP "[input]\nmouse_speed = fast\n",
         APP "[input]\nmouse_speed = 10\nmouse_speed = 10\n",
         APP "[input]\nmouse_speed = 1234567890\n",
+        APP "[input]\nrumble = 101\n",
+        APP "[input]\nrumble = -1\n",
+        APP "[input]\nrumble = strong\n",
+        APP "[input]\nrumble = 0\nrumble = 0\n",
         APP "[input]\ncross = space\ncross = enter\n",
         APP "[input]\ncross = hyperspace\n",
         APP "[input]\ncross = f0\n",
@@ -364,6 +368,7 @@ static void test_presets(void)
 
     pw_game_input_init(&input);
     assert(input.mouse_speed == PW_GAME_MOUSE_SPEED_DEFAULT && input.mode == PW_GAME_INPUT_KEYBOARD);
+    assert(input.rumble == PW_GAME_RUMBLE_MAX);
     assert(input.bindings[L1].mask == 0x400u && input.bindings[L1].kind == PW_GAME_BIND_UNSET);
     assert(preset("# shared pinball keys\n[input]\nl1 = z\nr1 = slash\ncross = space\n"
                   "mouse = right_stick\n", &input) == PW_OK);
@@ -379,6 +384,15 @@ static void test_presets(void)
     overrides.set = 0;
     pw_game_input_overlay(&input, &overrides);
     assert(input.mouse_speed == 400);
+
+    /* rumble = 0 turns it off; a preset's value stays unless the profile sets one. */
+    assert(preset("[input]\nrumble = 60\n", &input) == PW_OK && input.rumble == 60);
+    assert(parse(APP "[input]\npreset = pinball\n", &p) == PW_OK);
+    pw_game_input_overlay(&input, &p.input);
+    assert(input.rumble == 60);
+    assert(parse(APP "[input]\npreset = pinball\nrumble = 0\n", &p) == PW_OK);
+    pw_game_input_overlay(&input, &p.input);
+    assert(input.rumble == 0);
 
     /* A second pad's preset is named by the profile alone. */
     assert(parse(APP "[input]\npreset = bomb\nplayer2 = bomb-p2\n", &p) == PW_OK);
@@ -567,6 +581,58 @@ static void test_debug_env(void)
            PW_GAME_CPU_ENV_MAX + PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX <= PW_WINE_START_MAX_ENV);
 }
 
+/* keyboard_stick, its dead zone and the four direction keys. */
+static void test_keyboard_stick(void)
+{
+    PwGameProfile p;
+    PwGameInput in;
+    static const char *refused[] = {
+        "keyboard_stick = middle_stick",            /* not a stick */
+        "keyboard_stick = left_stick\nkeyboard_stick = right_stick",  /* twice */
+        "stick_deadzone = 4",                       /* below the range */
+        "stick_deadzone = 71",                      /* above it */
+        "stick_deadzone = left_stick",              /* not a number */
+        "stick_deadzone = 25\nstick_deadzone = 30", /* twice */
+        "stick_up = mouse_left",                    /* a key, not a button */
+    };
+
+    /* Defaults: no stick drives the keys, dead zone 25, WASD. */
+    assert(parse(APP "[input]\nmode = keyboard\n", &p) == PW_OK);
+    assert(p.input.keyboard_stick == PW_GAME_STICK_NONE);
+    assert(p.input.stick_deadzone == 25);
+    assert(p.input.stick_keys[0] == 'W' && p.input.stick_keys[1] == 'S' &&
+           p.input.stick_keys[2] == 'A' && p.input.stick_keys[3] == 'D');
+
+    /* Named stick, dead zone and remapped keys. */
+    assert(parse(APP "[input]\nmode = keyboard\nkeyboard_stick = left_stick\n"
+                     "stick_deadzone = 40\nstick_up = up\nstick_down = down\n"
+                     "stick_left = left\nstick_right = right\n", &p) == PW_OK);
+    assert(p.input.keyboard_stick == PW_GAME_STICK_LEFT);
+    assert(p.input.stick_deadzone == 40);
+    assert(p.input.stick_keys_set == 0xf);
+    assert(p.input.stick_keys[0] != 'W' && p.input.stick_keys[3] != 'D');
+
+    assert(parse(APP "[input]\nkeyboard_stick = right_stick\n", &p) == PW_OK &&
+           p.input.keyboard_stick == PW_GAME_STICK_RIGHT);
+    assert(parse(APP "[input]\nkeyboard_stick = none\n", &p) == PW_OK &&
+           p.input.keyboard_stick == PW_GAME_STICK_NONE);
+
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        char text[2048];
+        snprintf(text, sizeof(text), APP "[input]\n%s\n", refused[i]);
+        assert(parse(text, &p) != PW_OK);
+    }
+
+    /* A shared preset's stick settings, overridden by the profile. */
+    pw_game_input_init(&in);
+    assert(preset("[input]\nkeyboard_stick = right_stick\nstick_deadzone = 60\n", &in) == PW_OK);
+    assert(in.keyboard_stick == PW_GAME_STICK_RIGHT && in.stick_deadzone == 60);
+    assert(parse(APP "[input]\nkeyboard_stick = left_stick\n", &p) == PW_OK);
+    pw_game_input_overlay(&in, &p.input);
+    assert(in.keyboard_stick == PW_GAME_STICK_LEFT);
+    assert(in.stick_deadzone == 60);   /* the profile said nothing, so the preset holds */
+}
+
 int main(void)
 {
     test_graphics_env();
@@ -578,7 +644,8 @@ int main(void)
     test_refusals();
     test_presets();
     test_default_mode();
+    test_keyboard_stick();
     printf("game profile passed: application plus display and input, every binding kind, "
-           "runtime settings and their environment, the CPU backend choice, debug env variables, refusals, shared presets overridden by the profile\n");
+           "runtime settings and their environment, the CPU backend choice, debug env variables, refusals, shared presets overridden by the profile, a stick driving the direction keys\n");
     return 0;
 }

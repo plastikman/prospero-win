@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Fri, 16 Oct 2026 09:10:25 +0200
+Subject: [PATCH] win32u: Register the builtin classes without waiting on
+ another thread.
+
+register_builtin_classes() ran its body in a pthread_once, and the body
+takes the loader lock: it loads the classes' cursors through a callback
+into user32, and user32's part loads uxtheme.dll. A thread that held the
+loader lock (in a DllMain) and created its first window waited in the
+once for a thread that held the once and waited for the loader lock.
+
+On the PS5 this hung Source games at startup: vgui2.dll's static
+initializer calls OleInitialize under the loader lock, while another
+thread created its first window.
+
+Now no thread waits: each one registers the classes still missing (one
+that another thread registered first is looked up), and the first one
+runs user32's part.
+---
+ dlls/win32u/class.c | 74 ++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 53 insertions(+), 21 deletions(-)
+
+diff --git a/dlls/win32u/class.c b/dlls/win32u/class.c
+index 3ebef66..b5bcebe 100644
+--- a/dlls/win32u/class.c
++++ b/dlls/win32u/class.c
+@@ -59,7 +59,7 @@ struct builtin_class_descr
+     INT        extra;     /* window extra bytes */
+     ULONG_PTR  cursor;    /* cursor id */
+     HBRUSH     brush;     /* brush or system color */
+-    ATOM       atom;      /* class atom */
++    LONG       atom;      /* class atom, set by whichever thread registers it */
+ };
+ 
+ static struct builtin_class_descr builtin_classes[] =
+@@ -875,7 +875,7 @@ INT WINAPI NtUserGetClassName( HWND hwnd, BOOL real, UNICODE_STRING *name )
+     if (real && (fnid = get_window_fnid( hwnd )) && (fnid & 0x7fff) < ARRAY_SIZE(builtin_classes))
+     {
+         get_desktop_window(); /* create the desktop window to trigger builtin class registration */
+-        atom = builtin_classes[fnid & 0x7fff].atom;
++        atom = ReadAcquire( &builtin_classes[fnid & 0x7fff].atom );
+         return NtUserGetAtomName( atom, name );
+     }
+ 
+@@ -1057,7 +1057,27 @@ WORD get_class_word( HWND hwnd, INT offset )
+ ATOM get_builtin_class_atom( enum ntuser_client_procs proc )
+ {
+     get_desktop_window(); /* create the desktop window to trigger builtin class registration */
+-    return builtin_classes[proc].atom;
++    return ReadAcquire( &builtin_classes[proc].atom );
++}
++
++/***********************************************************************
++ *           find_class_atom
++ *
++ * The atom of a registered class, without registering the builtin classes.
++ */
++static ATOM find_class_atom( HINSTANCE instance, UNICODE_STRING *name )
++{
++    struct object_lock lock = OBJECT_LOCK_INIT;
++    const class_shm_t *class_shm;
++    NTSTATUS status;
++    CLASS *class;
++    ATOM atom = 0;
++
++    if (!(class = find_class( instance, name ))) return 0;
++    while ((status = get_shared_class( class, &lock, &class_shm )) == STATUS_PENDING)
++        atom = class_shm->info.atom;
++    release_class_ptr( class );
++    return status ? 0 : atom;
+ }
+ 
+ /***********************************************************************
+@@ -1071,6 +1091,7 @@ static void register_builtin( enum ntuser_client_procs proc )
+     struct builtin_class_descr *descr = builtin_classes + proc;
+     UNICODE_STRING name, version = { .Length = 0 };
+     WCHAR nameW[64];
++    ATOM atom;
+     WNDCLASSEXW class =
+     {
+         .cbSize = sizeof(class),
+@@ -1081,7 +1102,10 @@ static void register_builtin( enum ntuser_client_procs proc )
+         .lpfnWndProc = MAKE_WNDPROC( proc ),
+     };
+ 
+-    if (descr->atom) return; /* already registered */
++    if (ReadAcquire( &descr->atom )) return; /* already registered */
++    /* 64-bit Windows use sizeof(UINT64) for all processes, while 32-bit Windows use 6 for extra
++     * bytes size. Civilization II depends on the size being 6, so we use that even in wow64. */
++    if (proc == NTUSER_WNDPROC_EDIT && (sizeof(void *) == 4 || NtCurrentTeb()->WowTebOffset)) class.cbWndExtra = 6;
+     if (descr->cursor)
+         class.hCursor = LoadImageW( 0, (const WCHAR *)descr->cursor, IMAGE_CURSOR,
+                                     0, 0, LR_SHARED | LR_DEFAULTSIZE );
+@@ -1089,31 +1113,39 @@ static void register_builtin( enum ntuser_client_procs proc )
+     asciiz_to_unicode( nameW, descr->name );
+     RtlInitUnicodeString( &name, nameW );
+ 
+-    if ((descr->atom = NtUserRegisterClassExWOW( &class, &name, &version, NULL, MAKE_FNID(proc), 0, NULL ))) return;
++    if ((atom = NtUserRegisterClassExWOW( &class, &name, &version, NULL, MAKE_FNID(proc), 0, NULL )))
++    {
++        WriteRelease( &descr->atom, atom );
++        return;
++    }
+     if (class.hCursor) NtUserDestroyCursor( class.hCursor, 0 );
+-}
+-
+-static void register_builtins(void)
+-{
+-    struct builtin_class_descr *edit_class = builtin_classes + NTUSER_WNDPROC_EDIT;
+-    ULONG ret_len, i;
+-    void *ret_ptr;
+-
+-    /* 64-bit Windows use sizeof(UINT64) for all processes, while 32-bit Windows use 6 for extra
+-     * bytes size. Civilization II depends on the size being 6, so we use that even in wow64. */
+-    if (sizeof(void *) == 4 || NtCurrentTeb()->WowTebOffset) edit_class->extra = 6;
+-
+-    for (i = 0; i < ARRAY_SIZE(builtin_classes); i++) if (builtin_classes[i].name) register_builtin( i );
+-    KeUserModeCallback( NtUserInitBuiltinClasses, NULL, 0, &ret_ptr, &ret_len );
++    /* another thread registered it after the check above */
++    if ((atom = find_class_atom( user32_module, &name ))) WriteRelease( &descr->atom, atom );
+ }
+ 
+ /***********************************************************************
+  *           register_builtin_classes
++ *
++ * Loading the classes' cursors and user32's part (it loads uxtheme.dll)
++ * take the loader lock, so no thread waits here for another one: a thread
++ * that held the loader lock (in a DllMain) while another one held a once
++ * here and waited for the loader lock would never return. Each thread
++ * registers the classes still missing, and the first one runs user32's part.
+  */
+ void register_builtin_classes(void)
+ {
+-    static pthread_once_t init_once = PTHREAD_ONCE_INIT;
+-    pthread_once( &init_once, register_builtins );
++    static LONG registered, user32_init;
++    ULONG ret_len, i, error;
++    void *ret_ptr;
++
++    if (ReadAcquire( &registered )) return;
++    error = RtlGetLastWin32Error();  /* a class another thread registered first fails here */
++
++    for (i = 0; i < ARRAY_SIZE(builtin_classes); i++) if (builtin_classes[i].name) register_builtin( i );
++    WriteRelease( &registered, 1 );
++    RtlSetLastWin32Error( error );
++    if (!InterlockedExchange( &user32_init, 1 ))
++        KeUserModeCallback( NtUserInitBuiltinClasses, NULL, 0, &ret_ptr, &ret_len );
+ }
+ 
+ /***********************************************************************

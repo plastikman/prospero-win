@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Thu, 29 Oct 2026 18:00:00 +0100
+Subject: [PATCH] ntdll: Keep a host page whole when accesses beside an
+ inaccessible page run hot.
+
+Patch 0974 steps over every access that faults only because another page
+in its host page is protected, and reports a hot write beside a read-only
+page to the program. Nothing ended the stepping beside an inaccessible
+page: reads are not counted, and a write there has no read-only page to
+report. Unity's Mono garbage collector (Darkwood) writes and reads a heap
+page beside such a page all the time, and the console stepped about
+13,000 faults a second: loading took minutes and the game ran at 5 fps
+instead of 120.
+
+Every stepped access now counts. When a host page has had 256 of them, a
+write beside a read-only page is still reported there; any other access
+gives the host page the union of its pages' protections, as before 0974,
+and runs again. The host page is split again when a protection in it
+changes. A thread that faulted on the host page while another kept it
+whole runs its access again instead of getting an access violation.
+---
+ dlls/ntdll/unix/virtual.c | 107 ++++++++++++++++++++++++++++----------
+ 1 file changed, 80 insertions(+), 27 deletions(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 1d98ad6..843fb1e 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -1521,6 +1521,44 @@ static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vp
+     return size;
+ }
+ 
++/* Accesses stepped over in a host page before they count as hot. */
++#define SUBPAGE_HOT_STEPS 256
++
++/* Host pages whose accesses are stepped over (virtual_handle_fault); whole marks one
++ * that ran hot beside an inaccessible page and keeps the union of its pages'
++ * protections until one of them changes. */
++static struct { const char *page; unsigned int steps; BOOL whole; } subpage_heat[64];
++
++/***********************************************************************
++ *           subpage_forget
++ *
++ * A protection changes in a range: its host pages are split again.
++ */
++static void subpage_forget( const void *addr, size_t size )
++{
++    unsigned int i;
++
++    if (host_page_size == page_size) return;
++    for (i = 0; i < ARRAY_SIZE(subpage_heat); i++)
++        if (subpage_heat[i].whole && subpage_heat[i].page + host_page_size > (const char *)addr &&
++            subpage_heat[i].page < (const char *)addr + size)
++            subpage_heat[i].whole = FALSE;
++}
++
++
++/***********************************************************************
++ *           subpage_whole
++ *
++ * Whether a host page ran hot and keeps the union of its pages' protections.
++ */
++static BOOL subpage_whole( const char *page )
++{
++    unsigned int slot = ((UINT_PTR)page / host_page_size) % ARRAY_SIZE(subpage_heat);
++
++    return subpage_heat[slot].page == page && subpage_heat[slot].whole;
++}
++
++
+ /***********************************************************************
+  *           set_page_vprot
+  *
+@@ -1531,6 +1569,8 @@ static void set_page_vprot( const void *addr, size_t size, BYTE vprot )
+     size_t idx = (size_t)addr >> page_shift;
+     size_t end = ((size_t)addr + size + page_mask) >> page_shift;
+ 
++    subpage_forget( addr, size );
++
+ #ifdef _WIN64
+     while (idx >> pages_vprot_shift != end >> pages_vprot_shift)
+     {
+@@ -1555,6 +1595,8 @@ static void set_page_vprot_bits( const void *addr, size_t size, BYTE set, BYTE c
+     size_t idx = (size_t)addr >> page_shift;
+     size_t end = ((size_t)addr + size + page_mask) >> page_shift;
+ 
++    subpage_forget( addr, size );
++
+ #ifdef _WIN64
+     for ( ; idx < end; idx++)
+     {
+@@ -2355,7 +2397,8 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
+  * theirs, except in memory that is not an image: there a committed page that is
+  * read-only, or inaccessible, takes writing, or all access, away from the whole
+  * host page, so that touching it faults as on Windows. Accesses that only fault
+- * because of such a neighbour are stepped over in virtual_handle_fault.
++ * because of such a neighbour are stepped over in virtual_handle_fault, until
++ * they run hot beside an inaccessible page (subpage_hot).
+  */
+ static int get_host_page_unix_prot( const void *addr, const char *start, const char *end, BYTE set, BYTE clear )
+ {
+@@ -2368,6 +2411,7 @@ static int get_host_page_unix_prot( const void *addr, const char *start, const c
+     prot = get_unix_prot( (get_host_page_vprot( addr ) & ~clear) | set );
+     if (host_page_size == page_size || !(prot & (PROT_READ | PROT_WRITE))) return prot;
+     if (!(view = find_view( addr, 0 )) || (view->protect & SEC_IMAGE)) return prot;
++    if (subpage_whole( page )) return prot;
+     for (i = 0; i < host_page_size; i += page_size)
+     {
+         vprot = get_page_vprot( page + i );
+@@ -5209,24 +5253,22 @@ static NTSTATUS grow_thread_stack_to( struct thread_data *data, char *page, stru
+ }
+ 
+ 
+-/* Steps over writes beside a read-only page before such writes count as hot. */
+-#define SUBPAGE_HOT_STEPS 256
+-
+-static struct { const char *page; unsigned int steps; } subpage_heat[64];
+-
+ /***********************************************************************
+- *           subpage_hot_write
++ *           subpage_hot
+  *
+- * Counts a write stepped over in a host page because a page in it is read-only.
+- * Once the host page has had SUBPAGE_HOT_STEPS of them, returns that read-only
+- * page, to report the write there instead; NULL to step this one. The count
+- * starts again after a report, so a program that keeps the page read-only gets
+- * one report per SUBPAGE_HOT_STEPS writes and the rest are stepped, not a loop.
+- */
+-static char *subpage_hot_write( char *page )
++ * Counts an access stepped over in a host page because a page in it is read-only
++ * or inaccessible. Returns FALSE to step this one, until the host page has had
++ * SUBPAGE_HOT_STEPS of them. Then a write beside a read-only page is reported
++ * there instead (*report): the count starts again, so a program that keeps the
++ * page read-only gets one report per SUBPAGE_HOT_STEPS writes and the rest are
++ * stepped, not a loop. Any other hot access cannot be reported to the program
++ * (a read, or a write beside an inaccessible page that the program never touches,
++ * as a garbage collector's heap): the host page keeps the union of its pages'
++ * protections, as without this scheme, until one of them changes.
++ */
++static BOOL subpage_hot( char *page, BOOL write, char **report )
+ {
+     unsigned int slot = ((UINT_PTR)page / host_page_size) % ARRAY_SIZE(subpage_heat);
+-    char *ro = NULL;
+     size_t i;
+     BYTE vprot;
+ 
+@@ -5234,17 +5276,20 @@ static char *subpage_hot_write( char *page )
+     {
+         subpage_heat[slot].page = page;
+         subpage_heat[slot].steps = 0;
++        subpage_heat[slot].whole = FALSE;
+     }
+-    if (++subpage_heat[slot].steps < SUBPAGE_HOT_STEPS) return NULL;
+-    for (i = 0; i < host_page_size && !ro; i += page_size)
++    if (++subpage_heat[slot].steps < SUBPAGE_HOT_STEPS) return FALSE;
++    subpage_heat[slot].steps = 0;
++    *report = NULL;
++    for (i = 0; write && i < host_page_size && !*report; i += page_size)
+     {
+         vprot = get_page_vprot( page + i );
+         if ((vprot & VPROT_COMMITTED) && !(vprot & (VPROT_GUARD | VPROT_WRITEWATCH)) &&
+             (get_unix_prot( vprot ) & PROT_READ) && !(get_unix_prot( vprot ) & PROT_WRITE))
+-            ro = page + i;
++            *report = page + i;
+     }
+-    if (ro) subpage_heat[slot].steps = 0;
+-    return ro;
++    if (!*report) subpage_heat[slot].whole = TRUE;
++    return TRUE;
+ }
+ 
+ 
+@@ -5317,15 +5362,23 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+         int prot = get_unix_prot( get_page_vprot( addr ) );
+         char *protected_page;
+ 
+-        if (!(prot & need) || (get_host_page_unix_prot( page, NULL, NULL, 0, 0 ) & need))
++        if (!(prot & need))
+             ;
+-        else if (err == EXCEPTION_WRITE_FAULT && (protected_page = subpage_hot_write( page )))
++        else if (get_host_page_unix_prot( page, NULL, NULL, 0, 0 ) & need)
++        {
++            /* another thread kept the host page whole while this access faulted */
++            if (subpage_whole( page )) ret = STATUS_SUCCESS;
++        }
++        else if (subpage_hot( page, err == EXCEPTION_WRITE_FAULT, &protected_page ))
+         {
+-            /* Writes beside a read-only page come too often to step each one: report a
+-             * write to that page instead, as if this one had touched it. A program that
+-             * protects pages to learn when they change (an emulator's recompiled code)
+-             * then drops its protection, and the host page is writable again. */
+-            rec->ExceptionInformation[1] = (ULONG_PTR)protected_page;
++            /* Accesses beside a protected page come too often to step each one. Beside a
++             * read-only page, report a write to that page instead, as if this one had
++             * touched it: a program that protects pages to learn when they change (an
++             * emulator's recompiled code) then drops its protection, and the host page is
++             * writable again. Otherwise give the host page the union of its pages'
++             * protections and run the access again. */
++            if (protected_page) rec->ExceptionInformation[1] = (ULONG_PTR)protected_page;
++            else if (!mprotect_range( page, host_page_size, 0, 0 )) ret = STATUS_SUCCESS;
+         }
+         else if (!mprotect_exec( page, host_page_size, get_unix_prot( get_host_page_vprot( page ) ) ))
+         {

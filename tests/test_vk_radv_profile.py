@@ -81,8 +81,11 @@ def main() -> int:
             assert "PASS" in run.stdout, run.stdout
         include = vulkan_include()
         if include:
+            # The adapters use clock_gettime and usleep, which glibc declares under -std=c11 only with
+            # _DEFAULT_SOURCE; the PS5 SDK's headers declare them anyway.
             for unit in ("pw_vk_radv_profile_wrap.c", "pw_vulkan_radv.c"):
-                subprocess.run([cc, *flags, "-O2", f"-I{include}", "-fsyntax-only", str(BASE / unit)], check=True)
+                subprocess.run([cc, *flags, "-D_DEFAULT_SOURCE", "-O2", f"-I{include}", "-fsyntax-only",
+                                str(BASE / unit)], check=True)
             print(f"RADV profile: {count} entry points, wrappers compile against {include}/vulkan")
         else:
             print(f"RADV profile: {count} entry points; no Vulkan header {MIN_HEADER_VERSION} or newer, "

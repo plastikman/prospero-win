@@ -3,7 +3,8 @@
 """A read-only or inaccessible Windows page faults on access although its host
 page is larger and its neighbours stay writable, and the neighbours work
 without faults the program sees, in 64-bit and WoW64 processes
-(wine/patches/0974).
+(wine/patches/0974); accesses that keep coming beside an inaccessible page stop
+being stepped over (0986).
 
 Needs the host Wine from tools/build_host_wine.sh (PROSPERO_HOST_WINE, default
 .deps/wine-host/install/usr/bin/wine) and the mingw compilers; without them

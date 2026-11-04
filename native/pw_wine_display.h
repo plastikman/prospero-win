@@ -56,9 +56,9 @@ size_t pw_wine_game_inputs(const PwGameInput *input, uint32_t pressed, uint32_t 
  * across frames so key-down is sent only on a threshold crossing, and every
  * held direction is released when the controller disconnects.
  *
- * Restored 2026-10-28: the upstream sync removed this along with the
- * keyboard_stick/stick_deadzone profile keys, which left Oblivion's left
- * stick doing nothing while its buttons still worked. */
+ * For titles that read the keyboard for movement and cannot be configured
+ * to use a stick axis: one stick drives the four direction keys. This was
+ * restored after the upstream sync dropped the profile controls. */
 typedef struct PwWineKeyboardStick { uint8_t held; } PwWineKeyboardStick;
 size_t pw_wine_keyboard_stick_step(const PwGameInput *input, uint8_t stick_x, uint8_t stick_y,
                                   int connected, PwWineKeyboardStick *state,
