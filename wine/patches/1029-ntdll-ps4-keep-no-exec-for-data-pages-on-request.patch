@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: orbis-win <orbis-win@invalid>
+Subject: [PATCH] ntdll: honor PW_PS4_FORCE_EXEC=0 for data pages
+
+
+---
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -5823,6 +5823,22 @@
+ }
+ 
+ 
++#ifdef __PS4__
++/* PW_PS4_FORCE_EXEC=0 (a profile's "[debug] env" line) keeps no-exec on.
++ * Read once; unset or any other value keeps Wine's behaviour. */
++static BOOL ps4_keep_no_exec(void)
++{
++    static int cached;
++
++    if (!cached)
++    {
++        const char *value = getenv( "PW_PS4_FORCE_EXEC" );
++        cached = (value && value[0] == '0' && !value[1]) ? 1 : -1;
++    }
++    return cached > 0;
++}
++#endif
++
+ /***********************************************************************
+  *           virtual_set_force_exec
+  *
+@@ -5832,6 +5848,15 @@
+ {
+     struct file_view *view;
+     sigset_t sigset;
++#ifdef __PS4__
++    if (enable && ps4_keep_no_exec())
++    {
++        static LONG logged;
++        if (!__atomic_exchange_n( &logged, 1, __ATOMIC_RELAXED ))
++            ERR( "PW_PS4_FORCE_EXEC=0: no-exec stays on; only executable pages ask for PROT_EXEC\n" );
++        return;
++    }
++#endif
+ 
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+     if (!force_exec_prot != !enable)  /* change all existing views */

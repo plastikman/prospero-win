@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: orbis-win <orbis-win@invalid>
+Subject: [PATCH] ntdll: keep console debug output PS4-only
+
+Provide a no-op sink when compiling the desktop prefix builder. PS4 runtime
+logging continues to bind to the kernel implementation.
+
+---
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -83,6 +83,16 @@
+ #include "wine/list.h"
+ #include "wine/asm.h"
+ #include "unix_private.h"
++
++#ifndef __PROSPERO__
++/* Console-only diagnostics also compile in the host prefix builder. */
++int sceKernelDebugOutText( int channel, const char *text )
++{
++    (void)channel;
++    (void)text;
++    return 0;
++}
++#endif
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(unwind);

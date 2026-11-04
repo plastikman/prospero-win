@@ -7,15 +7,16 @@ interrupted stack from the signal path. Limit the extra record to four
 exceptions.
 
 ---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 5a3749ec54..8e22ce1df6 100644
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
-@@ -2045,6 +2045,20 @@
+@@ -1805,6 +1805,19 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
+                  data && data->teb ? data->teb->Tib.StackBase : NULL,
                   data && data->teb ? data->teb->Tib.StackLimit : NULL,
                   data && data->teb ? data->teb->DeallocationStack : NULL );
- 
-+        /* The crash reporter's FACECS dump is opaque here. Preserve the CPU
-+         * state in the log before Wine tries to launch its unavailable
-+         * debugger. Do not inspect the interrupted stack from this handler. */
++
++        /* Preserve CPU state before Wine tries to launch its unavailable debugger. */
 +        if (n <= 4)
 +            ERR( "PW_EXCEPTION_REGS n=%u rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx rsi=%016llx rdi=%016llx rbp=%016llx r8=%016llx r9=%016llx r10=%016llx r11=%016llx r12=%016llx r13=%016llx r14=%016llx r15=%016llx eflags=%08llx cs=%04x ss=%04x fs=%04x gs=%04x\n",
 +                 n, (unsigned long long)context->Rax, (unsigned long long)context->Rbx,

@@ -1,9 +1,77 @@
-Subject: [PATCH] server/win32u: retain the shared input pipe instead of dup on PS4
+From: Codex <codex@localhost>
+Subject: server/win32u: retain and poll the shared PS4 input pipe
 
+Retain the input-file owner for queue descriptors instead of duplicating the
+shared descriptor, and use poll(0) before draining because PS4 does not
+support setting this pipe nonblocking. Keep one title-side handle alive for
+all GUI queues.
+
+---
+diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
+index 4e0df7d5e6..60d63cfbec 100644
+--- a/dlls/win32u/ps5drv.c
++++ b/dlls/win32u/ps5drv.c
+@@ -42,6 +42,7 @@
+ 
+ #include <dlfcn.h>
+ #include <pthread.h>
++#include <poll.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -339,7 +340,9 @@ static BOOL ps5_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surfac
+ static void register_input_fd(void)
+ {
+     DWORD tid = GetCurrentThreadId();
+-    HANDLE handle;
++    static HANDLE handle;
++    static pthread_mutex_t handle_lock = PTHREAD_MUTEX_INITIALIZER;
++    NTSTATUS status;
+     UINT i;
+     int fd;
+ 
+@@ -354,14 +357,19 @@ static void register_input_fd(void)
+     input_threads[input_thread_count++] = tid;
+     pthread_mutex_unlock( &screen_lock );
+ 
+-    if (wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, &handle )) return;
++    /* Keep one owner for the shared title wake pipe. Queue poll objects borrow
++     * it; duplicating it fails on PS4 and independent owners double-close it. */
++    pthread_mutex_lock( &handle_lock );
++    status = handle ? 0 : wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, &handle );
++    pthread_mutex_unlock( &handle_lock );
++    if (status) { WARN( "input fd registration failed %#x\n", status ); return; }
+     SERVER_START_REQ( set_queue_fd )
+     {
+         req->handle = wine_server_obj_handle( handle );
+-        wine_server_call( req );
++        status = wine_server_call( req );
+     }
+     SERVER_END_REQ;
+-    NtClose( handle );
++    TRACE( "input queue tid=%04x fd=%d status=%#x\n", tid, fd, status );
+ }
+ 
+ static BOOL ps5_CreateWindow( HWND hwnd )
+@@ -603,7 +611,13 @@ static BOOL ps5_ProcessEvents( DWORD mask )
+         int fd = input_fd();
+         if (fd != -1)
+         {
++#ifdef __PROSPERO__
++            struct pollfd wake = { fd, POLLIN, 0 };
++            while (poll( &wake, 1, 0 ) > 0 && (wake.revents & POLLIN))
++                if (read( fd, buffer, sizeof(buffer) ) <= 0) break;
++#else
+             while (read( fd, buffer, sizeof(buffer) ) > 0) {}
++#endif
+             polled = TRUE;
+         }
+     }
 diff --git a/server/fd.c b/server/fd.c
+index 7e74486d80..31c2266484 100644
 --- a/server/fd.c
 +++ b/server/fd.c
-@@ -154,6 +154,7 @@
+@@ -155,6 +155,7 @@ struct fd
      WCHAR               *nt_name;     /* NT file name */
      data_size_t          nt_namelen;  /* length of NT file name */
      int                  unix_fd;     /* unix file descriptor */
@@ -11,7 +79,7 @@ diff --git a/server/fd.c b/server/fd.c
      unsigned int         no_fd_status;/* status to return when unix_fd is -1 */
      unsigned int         cacheable :1;/* can the fd be cached on the client side? */
      unsigned int         fs_locks :1; /* can we use filesystem locks for this fd? */
-@@ -1670,10 +1671,11 @@
+@@ -1694,10 +1695,11 @@ static void fd_destroy( struct object *obj )
      }
      else  /* no inode, close it right away */
      {
@@ -24,7 +92,7 @@ diff --git a/server/fd.c b/server/fd.c
  }
  
  /* check if the desired access is possible without violating */
-@@ -1791,6 +1793,7 @@
+@@ -1818,6 +1820,7 @@ static struct fd *alloc_fd_object(void)
      fd->options    = 0;
      fd->sharing    = 0;
      fd->unix_fd    = -1;
@@ -32,13 +100,12 @@ diff --git a/server/fd.c b/server/fd.c
      fd->unix_name  = NULL;
      fd->nt_name    = NULL;
      fd->nt_namelen = 0;
-@@ -2310,6 +2313,20 @@
+@@ -2403,6 +2406,19 @@ struct fd *create_anonymous_fd( const struct fd_ops *fd_user_ops, int unix_fd, s
      return NULL;
  }
  
-+/* The in-process server shares the native descriptor table. Keep its owner
-+ * alive instead of dup(), which PS4 titles cannot use. Allocation failure
-+ * leaves the borrowed descriptor open. */
++/* The in-process server shares the native descriptor table. Retain its owner
++ * instead of dup(), which PS4 titles cannot use. */
 +struct fd *create_borrowed_fd( const struct fd_ops *ops, int unix_fd,
 +                               struct object *user, struct object *owner )
 +{
@@ -54,18 +121,23 @@ diff --git a/server/fd.c b/server/fd.c
  void *get_fd_user( struct fd *fd )
  {
 diff --git a/server/file.h b/server/file.h
+index c46f95e939..bf10071f8e 100644
 --- a/server/file.h
 +++ b/server/file.h
-@@ -306,2 +306,5 @@
- 
+@@ -86,6 +86,8 @@ extern struct fd *open_fd( struct fd *root, const char *name, struct unicode_str
+                            unsigned int sharing, unsigned int options );
+ extern struct fd *create_anonymous_fd( const struct fd_ops *fd_user_ops,
+                                        int unix_fd, struct object *user, unsigned int options );
 +extern struct fd *create_borrowed_fd( const struct fd_ops *ops, int unix_fd,
 +                                       struct object *user, struct object *owner );
-+
- #endif  /* __WINE_SERVER_FILE_H */
+ extern struct fd *dup_fd_object( struct fd *orig, unsigned int access, unsigned int sharing,
+                                  unsigned int options );
+ extern struct fd *get_fd_object_for_mapping( struct fd *fd, unsigned int access, unsigned int sharing );
 diff --git a/server/queue.c b/server/queue.c
+index 4609402307..fd78bf9d78 100644
 --- a/server/queue.c
 +++ b/server/queue.c
-@@ -3104,13 +3104,19 @@
+@@ -3104,13 +3104,19 @@ DECL_HANDLER(set_queue_fd)
  
      if ((unix_fd = get_file_unix_fd( file )) != -1)
      {
@@ -86,81 +158,3 @@ diff --git a/server/queue.c b/server/queue.c
      }
      release_object( file );
  }
-diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
---- a/dlls/win32u/ps5drv.c
-+++ b/dlls/win32u/ps5drv.c
-@@ -42,6 +42,7 @@
- 
- #include <dlfcn.h>
- #include <pthread.h>
-+#include <poll.h>
- #include <stdint.h>
- #include <stdio.h>
- #include <stdlib.h>
-@@ -340,7 +341,9 @@
- static void register_input_fd(void)
- {
-     DWORD tid = GetCurrentThreadId();
--    HANDLE handle;
-+    static HANDLE handle;
-+    static pthread_mutex_t handle_lock = PTHREAD_MUTEX_INITIALIZER;
-+    NTSTATUS status;
-     UINT i;
-     int fd;
- 
-@@ -355,14 +358,19 @@
-     input_threads[input_thread_count++] = tid;
-     pthread_mutex_unlock( &screen_lock );
- 
--    if (wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, &handle )) return;
-+    /* One persistent handle owns the title's shared wake pipe. Queue poll
-+     * objects borrow it; creating separate file owners would double-close it. */
-+    pthread_mutex_lock( &handle_lock );
-+    status = handle ? 0 : wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, &handle );
-+    pthread_mutex_unlock( &handle_lock );
-+    if (status) { WARN( "input fd registration failed %#x\n", status ); return; }
-     SERVER_START_REQ( set_queue_fd )
-     {
-         req->handle = wine_server_obj_handle( handle );
--        wine_server_call( req );
-+        status = wine_server_call( req );
-     }
-     SERVER_END_REQ;
--    NtClose( handle );
-+    TRACE( "input queue tid=%04x fd=%d status=%#x\n", tid, fd, status );
- }
- 
- static BOOL ps5_CreateWindow( HWND hwnd )
-@@ -556,7 +564,18 @@
-         /* drain the wake pipe first: input posted from now on wakes again */
-         char buffer[64];
-         int fd = input_fd();
--        if (fd != -1) while (read( fd, buffer, sizeof(buffer) ) > 0) {}
-+        if (fd != -1)
-+        {
-+#ifdef __PROSPERO__
-+            /* PS4 refuses non-blocking mode. A second unconditional read
-+             * would park the UI thread after draining the available bytes. */
-+            struct pollfd wake = { fd, POLLIN, 0 };
-+            while (poll( &wake, 1, 0 ) > 0 && (wake.revents & POLLIN))
-+                if (read( fd, buffer, sizeof(buffer) ) <= 0) break;
-+#else
-+            while (read( fd, buffer, sizeof(buffer) ) > 0) {}
-+#endif
-+        }
-     }
-     while (processed < PS5_INPUT_BATCH && next_input( &event ))
-     {
-@@ -569,7 +588,11 @@
-             input.ki.wVk = event.code;
-             input.ki.wScan = NtUserMapVirtualKeyEx( event.code, MAPVK_VK_TO_VSC, NtUserGetKeyboardLayout( 0 ));
-             input.ki.dwFlags = event.down ? 0 : KEYEVENTF_KEYUP;
--            NtUserSendHardwareInput( hwnd, 0, &input, 0 );
-+            {
-+                NTSTATUS status = NtUserSendHardwareInput( hwnd, 0, &input, 0 );
-+                TRACE( "key hwnd=%p vk=%#x scan=%#x down=%u status=%#x\n",
-+                       hwnd, input.ki.wVk, input.ki.wScan, event.down, status );
-+            }
-             break;
-         case 2:
-             move_cursor( hwnd, event.x, event.y );

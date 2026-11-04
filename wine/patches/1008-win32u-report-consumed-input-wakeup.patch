@@ -1,20 +1,25 @@
 From: plastikman <plastikman@users.noreply.github.com>
-Subject: [PATCH] win32u: report a consumed input wake as handled
+Subject: win32u: report a consumed input wake as handled
 
+Track whether the shared input wake pipe actually had bytes to consume, and
+report that wake even if another GUI thread already drained its queued event.
+
+---
 diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
-index 336057aa9b..0b5f333793 100644
+index 60d63cfbec..2a1849054e 100644
 --- a/dlls/win32u/ps5drv.c
 +++ b/dlls/win32u/ps5drv.c
-@@ -551,6 +551,7 @@ static BOOL ps5_ProcessEvents( DWORD mask )
+@@ -595,7 +595,7 @@ static BOOL ps5_ProcessEvents( DWORD mask )
      struct ps5_input event;
      HWND hwnd = NtUserGetForegroundWindow();
      UINT processed = 0;
+-    BOOL polled = FALSE;
 +    BOOL wakeup = FALSE;
  
      if (!next_input) return FALSE;
      if (!hwnd && (hwnd = last_shown_window()))
-@@ -571,9 +572,12 @@ static BOOL ps5_ProcessEvents( DWORD mask )
-              * would park the UI thread after draining the available bytes. */
+@@ -614,11 +614,13 @@ static BOOL ps5_ProcessEvents( DWORD mask )
+ #ifdef __PROSPERO__
              struct pollfd wake = { fd, POLLIN, 0 };
              while (poll( &wake, 1, 0 ) > 0 && (wake.revents & POLLIN))
 +            {
@@ -25,16 +30,17 @@ index 336057aa9b..0b5f333793 100644
 -            while (read( fd, buffer, sizeof(buffer) ) > 0) {}
 +            while (read( fd, buffer, sizeof(buffer) ) > 0) wakeup = TRUE;
  #endif
+-            polled = TRUE;
          }
      }
-@@ -602,7 +627,10 @@ static BOOL ps5_ProcessEvents( DWORD mask )
-             break;
-         }
-     }
--    return processed != 0;
+     while (processed < PS5_INPUT_BATCH && next_input( &event ))
+@@ -654,7 +656,9 @@ static BOOL ps5_ProcessEvents( DWORD mask )
+      * neither clears its QS_DRIVER nor re-arms the fd: a zero-timeout
+      * message wait (DirectInput's GetDeviceState) then spins until the next
+      * input. A byte still in the pipe makes the re-armed fd fire again. */
+-    return processed != 0 || polled;
 +    /* A thread can consume the shared wake pipe after another GUI thread
-+     * already took the queued input. Report the wake as handled anyway, so
-+     * win32u clears QS_DRIVER and rearms this queue's fd. */
++     * already took the queued input. Report that wake as handled too. */
 +    return processed != 0 || wakeup;
  }
  

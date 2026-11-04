@@ -1,13 +1,15 @@
-From: Codex <codex@openai.com>
-Subject: [PATCH] ntdll: map low guest addresses on native faults
+From: Codex <codex@localhost>
+Subject: ntdll: map low guest addresses on native faults
 
-Fallout 3 faults at 0x05c2671c, below the old 0x06000000 diagnostic window.
-Report the kernel mapping for both the faulting address and the guest object
-pointer, without changing mapping or exception behavior.
+Extend Fallout 3 fault mapping diagnostics to the lower 32-bit game address
+range and query the guest object pointer in RDI alongside the fault address.
 
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index d4446af595..3d4f65081b 100644
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
-@@ -3023,37 +3023,38 @@
+@@ -2840,38 +2840,38 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
              int32_t protection, memory_type;
              uint8_t flags;
              char name[32];
@@ -17,24 +19,12 @@ pointer, without changing mapping or exception behavior.
          extern int sceKernelDebugOutText( int, const char * );
          static unsigned int guest_fault_trace_count;
          unsigned int guest_fault_n = 0;
--        int q_fault = -1, q_base = -1, q_after = -1;
-+        int q_fault = -1, q_object = -1, q_after = -1;
-         int hook_result;
+-        int q_fault = -1, q_base = -1, q_after = -1, hook_result;
++        int q_fault = -1, q_object = -1, q_after = -1, hook_result;
  
--        /* Fallout 3's 2026-10-27 native new-game run faulted while reading
--         * 0x067a0ec4 from a table whose base was 0x067a0718. Record the PS4
--         * mapping and the hook's decision before raising a Windows exception;
--         * this distinguishes a missing/protection-limited page from a bad
--         * game pointer without changing memory or reading faulting memory. */
-+        /* Log low guest-memory faults as well as the higher heap range. The
-+         * Fallout 3 new-game fault at 0x05c2671c was below the old 0x06000000
-+         * lower bound. Query both the fault address and the guest object
-+         * pointer (RDI) before raising the Windows exception; this distinguishes
-+         * a missing/protection-limited page from a bad pointer without reading
-+         * faulting memory or changing mappings. */
-         if ((signal == SIGBUS || signal == SIGSEGV) && siginfo &&
--            (uintptr_t)siginfo->si_addr >= 0x06000000 &&
-+            (uintptr_t)siginfo->si_addr >= 0x00400000 &&
+         /* Bound this targeted Fallout 3 guest-data-fault trace. */
+-        if (siginfo && (uintptr_t)siginfo->si_addr >= 0x06000000 &&
++        if (siginfo && (uintptr_t)siginfo->si_addr >= 0x00400000 &&
              (uintptr_t)siginfo->si_addr < 0x08000000 && !(ERROR_sig(sigcontext) & 0x10))
          {
              guest_fault_n = __atomic_add_fetch( &guest_fault_trace_count, 1, __ATOMIC_RELAXED );
@@ -45,8 +35,7 @@ pointer, without changing mapping or exception behavior.
                  memset( &before_fault, 0, sizeof(before_fault) );
 -                memset( &before_base, 0, sizeof(before_base) );
 +                memset( &before_object, 0, sizeof(before_object) );
-                 q_fault = sceKernelVirtualQuery( siginfo->si_addr, 1, &before_fault,
-                                                  sizeof(before_fault) );
+                 q_fault = sceKernelVirtualQuery( siginfo->si_addr, 1, &before_fault, sizeof(before_fault) );
 -                q_base = sceKernelVirtualQuery( (void *)(uintptr_t)RBX_sig(sigcontext), 1,
 -                                                &before_base, sizeof(before_base) );
 +                q_object = sceKernelVirtualQuery( (void *)(uintptr_t)RDI_sig(sigcontext), 1,
@@ -58,16 +47,15 @@ pointer, without changing mapping or exception behavior.
 -                          "ntdll ps4-guest-fault-map n=%u sig=%d code=%d addr=%p rip=%llx rsp=%llx rax=%llx rbx=%llx rsi=%llx rdi=%llx err=%llx qaddr=%d range=%p-%p prot=%x type=%x flags=%x name=%s qbase=%d base_range=%p-%p base_prot=%x base_name=%s\n",
 +                          "ntdll ps4-guest-fault-map n=%u sig=%d code=%d addr=%p rip=%llx rsp=%llx rax=%llx rbx=%llx rsi=%llx rdi=%llx err=%llx qaddr=%d range=%p-%p prot=%x type=%x flags=%x name=%s qobj=%d obj_range=%p-%p obj_prot=%x obj_name=%s\n",
                            guest_fault_n, signal, siginfo->si_code, siginfo->si_addr,
-                           (unsigned long long)RIP_sig(sigcontext),
-                           (unsigned long long)RSP_sig(sigcontext),
-@@ -3064,8 +3065,8 @@
-                           (unsigned long long)ERROR_sig(sigcontext), q_fault,
-                           before_fault.start, before_fault.end, before_fault.protection,
-                           before_fault.memory_type, before_fault.flags, before_fault.name,
--                          q_base, before_base.start, before_base.end,
--                          before_base.protection, before_base.name );
-+                          q_object, before_object.start, before_object.end,
-+                          before_object.protection, before_object.name );
+                           (unsigned long long)RIP_sig(sigcontext), (unsigned long long)RSP_sig(sigcontext),
+                           (unsigned long long)RAX_sig(sigcontext), (unsigned long long)RBX_sig(sigcontext),
+                           (unsigned long long)RSI_sig(sigcontext), (unsigned long long)RDI_sig(sigcontext),
+                           (unsigned long long)ERROR_sig(sigcontext), q_fault, before_fault.start,
+                           before_fault.end, before_fault.protection, before_fault.memory_type,
+-                          before_fault.flags, before_fault.name, q_base, before_base.start,
+-                          before_base.end, before_base.protection, before_base.name );
++                          before_fault.flags, before_fault.name, q_object, before_object.start,
++                          before_object.end, before_object.protection, before_object.name );
                  sceKernelDebugOutText( 0, line );
              }
          }

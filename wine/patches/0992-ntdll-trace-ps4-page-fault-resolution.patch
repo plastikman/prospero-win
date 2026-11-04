@@ -7,15 +7,20 @@ normal exception logger or server dispatch can run. Keep the trace bounded.
 
 ---
 diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
-index 0000000..0000000 100644
+index 825f1e166b..7145aaff53 100644
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
-@@ -3270,13 +3270,49 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
-     case TRAP_x86_PAGEFLT:  /* Page fault */
+@@ -2692,13 +2692,49 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
          rec.NumberParameters = 2;
          rec.ExceptionInformation[0] = (ERROR_sig(sigcontext) >> 1) & 0x09;
          rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
-+        {
+-        if (!virtual_handle_fault( data, &rec, (void *)RSP_sig(sigcontext) ) ||
+-            check_invalid_gsbase( data, sigcontext ))
+         {
+-            /* a neighbour's protection only: run the instruction, then close the host page */
+-            if (data->subpage_step) EFL_sig(sigcontext) |= 0x100;
+-            leave_handler( data, sigcontext );
+-            return;
 +            static unsigned int trace_count;
 +            unsigned int n = __atomic_add_fetch( &trace_count, 1, __ATOMIC_RELAXED );
 +            BOOL handled, invalid_gs;
@@ -53,16 +58,11 @@ index 0000000..0000000 100644
 +            }
 +            if (!handled || invalid_gs)
 +            {
++                /* a neighbour's protection only: run the instruction, then close the host page */
++                if (data->subpage_step) EFL_sig(sigcontext) |= 0x100;
 +                leave_handler( data, sigcontext );
 +                return;
 +            }
-+        }
--        if (!virtual_handle_fault( data, &rec, (void *)RSP_sig(sigcontext) ) ||
--            check_invalid_gsbase( data, sigcontext ))
--        {
--            leave_handler( data, sigcontext );
--            return;
--        }
+         }
          if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
              rec.ExceptionInformation[0] == EXCEPTION_EXECUTE_FAULT)
-         {

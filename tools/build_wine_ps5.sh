@@ -15,7 +15,7 @@
 #
 # Patch numbers are owned by range: 0100-0499 services, loader and
 # presentation; 0500-0899 execution core (signals, TEB, virtual memory);
-# 0900-0999 shared clock and input fast paths.
+# 0900-1099 shared fast paths and downstream PS4 diagnostics.
 #
 # Two links follow. The ELF link builds Wine's own targets against the
 # payload SDK and reports, rather than fails on, unresolved symbols. The PRX
@@ -149,7 +149,7 @@ done
 
 [ -z "$ps5vk_sdk" ] || [ -z "$radv" ] || fail "--ps5vk-sdk and --radv both name libvulkan.prx; give one"
 
-# The series: NNNN-lower-case-name.patch, unique numbers below 1000, each a
+# The series: NNNN-lower-case-name.patch, unique four-digit numbers, each a
 # mail-formatted patch with a subject. Printed in the order it is applied.
 series() {
     [ -d "$patches" ] || fail "no patch directory $patches"
@@ -163,8 +163,8 @@ series() {
             fail "patch name must be NNNN-lower-case-words.patch: $patch"
         number=$(printf '%s' "$patch" | cut -c1-4 | sed 's/^0*//')
         number=${number:-0}
-        [ "$number" -ge 100 ] && [ "$number" -le 999 ] ||
-            fail "patch number outside 0100-0999: $patch"
+        [ "$number" -ge 100 ] && [ "$number" -le 1099 ] ||
+            fail "patch number outside 0100-1099: $patch"
         [ "$number" -ne "$last" ] || fail "duplicate patch number: $patch"
         last=$number
         grep -q '^Subject: ' "$patches/$patch" || fail "patch has no Subject: $patch"

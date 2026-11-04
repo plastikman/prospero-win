@@ -1,27 +1,27 @@
 From: Codex <codex@localhost>
 Subject: ntdll: retry resolved PS4 guest page faults
 
-PS4 can replace direct-memory backing while a guest thread is using a page.
-If a user fault reports a not-present page but the kernel now confirms the
-32-bit guest mapping has the requested access, retry that instruction instead
-of raising an access violation. Do not retry protection faults or host faults.
+When a 32-bit guest user fault is not-present and the PS4 kernel now confirms
+the page mapping has the required access, resume the interrupted instruction.
+Keep protection faults and host faults on the normal exception path. The
+rebased tree uses segv_unresolved_hook after virtual_handle_fault(), so the
+retry check follows that hook and uses leave_handler() to resume safely.
 
 ---
 diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
-index fe6305b029..dbc34da07b 100644
+index 61fa8d8331..da454408f6 100644
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
-@@ -3063,6 +3063,54 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
-                 sceKernelDebugOutText( 0, line );
-             }
+@@ -2851,6 +2851,51 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
+             leave_handler( data, sigcontext );
+             return;
          }
-+        /* A PS4 direct-memory page can be replaced while another guest
-+         * thread is accessing it. If the original fault was "not present"
-+         * but the kernel now confirms the mapping has the requested access,
-+         * retry the instruction instead of turning a resolved mapping race
-+         * into a Windows access violation. Limit this to user faults in the
-+         * 32-bit guest address space; never retry host-side faults. */
-+        if (!hook_result && (signal == SIGBUS || signal == SIGSEGV) && siginfo &&
++        /* A PS4 direct-memory page can be replaced while a guest thread is
++         * accessing it. If this was a not-present user fault but the kernel
++         * now confirms the 32-bit guest mapping has the requested access,
++         * retry the instruction instead of raising a Windows access violation.
++         * Do not retry protection faults or host faults. */
++        if ((signal == SIGBUS || signal == SIGSEGV) && siginfo &&
 +            (uintptr_t)siginfo->si_addr >= 0x00010000 &&
 +            (uintptr_t)siginfo->si_addr < 0x100000000ULL &&
 +            (ERROR_sig(sigcontext) & 0x4) && !(ERROR_sig(sigcontext) & 0x1))
@@ -37,15 +37,13 @@ index fe6305b029..dbc34da07b 100644
 +            static unsigned int retry_log_count;
 +            int access = (ERROR_sig(sigcontext) & 0x10) ? PROT_EXEC :
 +                         (ERROR_sig(sigcontext) & 0x2) ? PROT_WRITE : PROT_READ;
-+            int query_rc;
 +            uintptr_t address = (uintptr_t)siginfo->si_addr;
++            int query_rc;
 +
 +            memset( &retry_info, 0, sizeof(retry_info) );
-+            query_rc = sceKernelVirtualQuery( siginfo->si_addr, 1, &retry_info,
-+                                              sizeof(retry_info) );
++            query_rc = sceKernelVirtualQuery( siginfo->si_addr, 1, &retry_info, sizeof(retry_info) );
 +            if (!query_rc && (uintptr_t)retry_info.start <= address &&
-+                (uintptr_t)retry_info.end > address &&
-+                (retry_info.protection & access) == access)
++                (uintptr_t)retry_info.end > address && (retry_info.protection & access) == access)
 +            {
 +                unsigned int n = __atomic_add_fetch( &retry_log_count, 1, __ATOMIC_RELAXED );
 +                if (n <= 16)
@@ -55,14 +53,14 @@ index fe6305b029..dbc34da07b 100644
 +                    snprintf( line, sizeof(line),
 +                              "ntdll ps4-retry-resolved-fault n=%u addr=%p rip=%p err=%llx access=%x query=%d range=%p-%p prot=%x name=%s\n",
 +                              n, siginfo->si_addr, (void *)RIP_sig(sigcontext),
-+                              (unsigned long long)ERROR_sig(sigcontext), access,
-+                              query_rc, retry_info.start, retry_info.end,
-+                              retry_info.protection, retry_info.name );
++                              (unsigned long long)ERROR_sig(sigcontext), access, query_rc,
++                              retry_info.start, retry_info.end, retry_info.protection, retry_info.name );
 +                    sceKernelDebugOutText( 0, line );
 +                }
++                leave_handler( data, sigcontext );
 +                return;
 +            }
 +        }
-         if (hook_result) return;
      }
-     /* The native WoW64 path returned from iretq at 0x7bef14c9, but only the
+ #endif
+     if (handle_syscall_fault( data, sigcontext, &rec, &context.c )) return;

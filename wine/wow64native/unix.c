@@ -9,6 +9,10 @@
 #include "wine/debug.h"
 #include <stdlib.h>
 #include <string.h>
+#ifdef __PROSPERO__
+#include <errno.h>
+#include <sys/mman.h>
+#endif
 #include <time.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(wow);

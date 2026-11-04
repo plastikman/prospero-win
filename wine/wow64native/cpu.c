@@ -447,7 +447,7 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
                    "movq %rsp,%r14\n\t"
                    "movl 0xa8(%r13),%edx\n\t"   /* context->Edx */
                    "movl 0xac(%r13),%ecx\n\t"   /* context->Ecx */
-                   "movl 0xc8(%r13),%eax\n\t"   /* context->SegSs */
+                   "movl $0x3b,%eax\n\t"       /* PS4 compatibility stack selector */
                    "movq %rax,0x20(%rsp)\n\t"
                    "mov %ax,%ds\n\t"
                    "mov %ax,%es\n\t"
@@ -456,7 +456,7 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
                    "movq %rax,0x18(%rsp)\n\t"
                    "movl 0xc0(%r13),%eax\n\t"   /* context->EFlags */
                    "movq %rax,0x10(%rsp)\n\t"
-                   "movl 0xbc(%r13),%eax\n\t"   /* context->SegCs */
+                   "movl $0x33,%eax\n\t"       /* PS4 compatibility code selector */
                    "movq %rax,0x8(%rsp)\n\t"
                    "movl 0xb8(%r13),%eax\n\t"   /* context->Eip */
                    "movq %rax,(%rsp)\n\t"

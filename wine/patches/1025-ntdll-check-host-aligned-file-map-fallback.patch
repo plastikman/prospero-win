@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: orbis-win <orbis-win@invalid>
+Subject: [PATCH] ntdll: check host-aligned map fallback reads
+
+
+---
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2944,8 +2944,38 @@
+              map_addr, map_addr + map_size, view->protect, vprot );
+     }
+ 
+-    mprotect( map_addr, map_size, PROT_READ | PROT_WRITE );
+-    pread( fd, map_addr, size, offset );
++    if (mprotect( host_addr, host_size, PROT_READ | PROT_WRITE ) == -1)
++    {
++        int err = errno;
++        ERR( "map-file fallback mprotect failed map=%p size=%lx host=%p host_size=%lx errno=%d\n",
++             map_addr, (unsigned long)map_size, host_addr, (unsigned long)host_size, err );
++        return err == ENOMEM ? STATUS_NO_MEMORY : STATUS_ACCESS_DENIED;
++    }
++
++    {
++        size_t done = 0;
++
++        while (done < size)
++        {
++            ssize_t count = pread( fd, map_addr + done, size - done, offset + done );
++
++            if (count < 0 && errno == EINTR) continue;
++            if (count < 0)
++            {
++                int err = errno;
++                ERR( "map-file fallback pread failed map=%p size=%lx offset=%s done=%lx errno=%d\n",
++                     map_addr, (unsigned long)size, wine_dbgstr_longlong(offset),
++                     (unsigned long)done, err );
++                return STATUS_INVALID_PARAMETER;
++            }
++            if (!count)
++            {
++                memset( map_addr + done, 0, size - done );
++                break;
++            }
++            done += count;
++        }
++    }
+     return STATUS_SUCCESS;
+ }
+ 

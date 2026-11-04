@@ -1,11 +1,15 @@
-From: Codex <codex@openai.com>
-Subject: [PATCH] ntdll: query full 32-bit guest fault range
+From: Codex <codex@localhost>
+Subject: ntdll: query full 32-bit guest fault range
 
-Fallout 3 faulted at 0x1e070068, above the previous 0x08000000 upper bound. Trace faults across the 32-bit address space and query the code page as well as the fault address and candidate guest pointers.
+Extend the bounded PS4 guest fault trace across the full 32-bit user range
+and query the faulting code page alongside the address and object pointers.
 
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 4c15eb7018..58a6fd3845 100644
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
-@@ -3023,41 +3023,44 @@
+@@ -2840,34 +2840,38 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
              int32_t protection, memory_type;
              uint8_t flags;
              char name[32];
@@ -15,24 +19,13 @@ Fallout 3 faulted at 0x1e070068, above the previous 0x08000000 upper bound. Trac
          extern int sceKernelDebugOutText( int, const char * );
          static unsigned int guest_fault_trace_count;
          unsigned int guest_fault_n = 0;
--        int q_fault = -1, q_rbx = -1, q_object = -1, q_after = -1;
-+        int q_fault = -1, q_rbx = -1, q_object = -1, q_code = -1, q_after = -1;
-         int hook_result;
+-        int q_fault = -1, q_rbx = -1, q_object = -1, q_after = -1, hook_result;
++        int q_fault = -1, q_rbx = -1, q_object = -1, q_code = -1, q_after = -1, hook_result;
  
--        /* Log low guest-memory faults, including null/near-null accesses. The
--         * Fallout 3 load fault at 0x8100 was below the previous 0x00400000
--         * lower bound. Query the fault address and candidate guest pointers
--         * (RBX and RDI) before raising the Windows exception. This distinguishes
--         * a missing/protection-limited page from a bad pointer without reading
--         * faulting memory or changing mappings. */
-+        /* Log guest faults throughout the 32-bit address range, including
-+         * addresses above 0x08000000. Query the fault address, candidate guest
-+         * pointers (RBX and RDI), and the code address before raising the
-+         * Windows exception. This identifies mapping/protection state without
-+         * reading faulting memory or changing mappings. */
-         if ((signal == SIGBUS || signal == SIGSEGV) && siginfo &&
--            (uintptr_t)siginfo->si_addr < 0x08000000 && !(ERROR_sig(sigcontext) & 0x10))
-+            (uintptr_t)siginfo->si_addr < 0x80000000 && !(ERROR_sig(sigcontext) & 0x10))
+         /* Bound this targeted Fallout 3 guest-data-fault trace. */
+-        if (siginfo && (uintptr_t)siginfo->si_addr < 0x08000000 &&
++        if (siginfo && (uintptr_t)siginfo->si_addr < 0x80000000 &&
+             !(ERROR_sig(sigcontext) & 0x10))
          {
              guest_fault_n = __atomic_add_fetch( &guest_fault_trace_count, 1, __ATOMIC_RELAXED );
              if (guest_fault_n <= 12)
@@ -43,8 +36,7 @@ Fallout 3 faulted at 0x1e070068, above the previous 0x08000000 upper bound. Trac
                  memset( &before_rbx, 0, sizeof(before_rbx) );
                  memset( &before_object, 0, sizeof(before_object) );
 +                memset( &before_code, 0, sizeof(before_code) );
-                 q_fault = sceKernelVirtualQuery( siginfo->si_addr, 1, &before_fault,
-                                                  sizeof(before_fault) );
+                 q_fault = sceKernelVirtualQuery( siginfo->si_addr, 1, &before_fault, sizeof(before_fault) );
                  q_rbx = sceKernelVirtualQuery( (void *)(uintptr_t)RBX_sig(sigcontext), 1,
                                                 &before_rbx, sizeof(before_rbx) );
                  q_object = sceKernelVirtualQuery( (void *)(uintptr_t)RDI_sig(sigcontext), 1,
@@ -59,11 +51,11 @@ Fallout 3 faulted at 0x1e070068, above the previous 0x08000000 upper bound. Trac
 -                          "ntdll ps4-guest-fault-map n=%u sig=%d code=%d addr=%p rip=%llx rsp=%llx rax=%llx rbx=%llx rsi=%llx rdi=%llx err=%llx qaddr=%d range=%p-%p prot=%x type=%x flags=%x name=%s qrbx=%d rbx_range=%p-%p rbx_prot=%x rbx_name=%s qobj=%d obj_range=%p-%p obj_prot=%x obj_name=%s\n",
 +                          "ntdll ps4-guest-fault-map n=%u sig=%d code=%d addr=%p rip=%llx rsp=%llx rax=%llx rbx=%llx rsi=%llx rdi=%llx err=%llx qaddr=%d range=%p-%p prot=%x type=%x flags=%x name=%s qrbx=%d rbx_range=%p-%p rbx_prot=%x rbx_name=%s qobj=%d obj_range=%p-%p obj_prot=%x obj_name=%s qcode=%d code_range=%p-%p code_prot=%x code_name=%s\n",
                            guest_fault_n, signal, siginfo->si_code, siginfo->si_addr,
-                           (unsigned long long)RIP_sig(sigcontext),
-                           (unsigned long long)RSP_sig(sigcontext),
-@@ -3071,7 +3074,9 @@
-                           q_rbx, before_rbx.start, before_rbx.end,
-                           before_rbx.protection, before_rbx.name,
+                           (unsigned long long)RIP_sig(sigcontext), (unsigned long long)RSP_sig(sigcontext),
+                           (unsigned long long)RAX_sig(sigcontext), (unsigned long long)RBX_sig(sigcontext),
+@@ -2877,7 +2881,9 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
+                           before_fault.flags, before_fault.name, q_rbx, before_rbx.start,
+                           before_rbx.end, before_rbx.protection, before_rbx.name,
                            q_object, before_object.start, before_object.end,
 -                          before_object.protection, before_object.name );
 +                          before_object.protection, before_object.name,

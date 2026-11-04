@@ -1,18 +1,21 @@
 From: Codex <codex@localhost>
-Subject: ntdll: trace stack for system-thread faults
+Subject: ntdll: trace PS4 system-thread stack at startup
 
-Log the supplied Wine system-thread stack and callback at startup. On a
-stack-underflow fault, include the saved pthread identity and a bounded frame
-chain from the allocated thread-data region. This distinguishes a bad stack
-start from a later stack overrun and identifies the system-thread routine.
+Log the supplied Wine system-thread stack and callback at startup. The older
+stack-underflow frame-chain hunk depended on a diagnostic block absent from
+the rebased signal path; retain the startup diagnostic, while exception
+context and TEB bounds remain covered by patches 0991 and 0994.
 
 ---
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 4658522376..606bdf83d6 100644
 --- a/dlls/ntdll/unix/server.c
 +++ b/dlls/ntdll/unix/server.c
-@@ -2527,6 +2527,14 @@
+@@ -2370,6 +2370,16 @@ void server_init_thread( struct thread_data *data )
+ 
      data->pthread_id = pthread_self();
      pthread_setspecific( thread_data_key, data );
- #ifdef __PROSPERO__
++#ifdef __PROSPERO__
 +    if (!data->teb)
 +    {
 +        ULONG_PTR rsp;
@@ -21,46 +24,7 @@ start from a later stack overrun and identifies the system-thread routine.
 +             (unsigned)data->tid, data, (void *)(ULONG_PTR)data->pthread_id, data->start, data->param,
 +             (void *)rsp, get_kernel_stack(data), (char *)get_kernel_stack(data) + kernel_stack_size );
 +    }
-     /* ⚠ DIAGNOSTIC: see spawn_thread in dlls/ntdll/unix/thread.c. A 32-bit
-      * thread never reaches wow64, and nothing between pthread_create and
-      * BTCpuThreadInit says a word. These lines are that stretch. */
---- a/dlls/ntdll/unix/signal_x86_64.c
-+++ b/dlls/ntdll/unix/signal_x86_64.c
-@@ -2734,6 +2734,8 @@
-         ULONG_PTR data_low = (ULONG_PTR)data;
-         ULONG_PTR data_high = data_low + signal_stack_mask + 1 + kernel_stack_size;
-         ULONG_PTR caller = 0;
-+        ULONG_PTR frame = context->Rbp;
-+        unsigned int depth;
++#endif
+     if (data->ps5_spawn_us && ps5_now_us() - data->ps5_spawn_us > 100000)
+         fprintf( stderr, "wine-ps5: slow thread start ms=%llu\n", (ps5_now_us() - data->ps5_spawn_us) / 1000 );
  
-         /* A faulting RBP can be corrupt. Read its saved return address only
-          * when the slot is still inside the allocation associated with this
-@@ -2741,10 +2743,24 @@
-         if (context->Rbp >= data_low && context->Rbp <= data_high - 2 * sizeof(ULONG_PTR))
-             caller = *(ULONG_PTR *)(context->Rbp + sizeof(ULONG_PTR));
- 
--        ERR_(seh)( "PW_FAULT_STACK tid=%04x data=%p teb=%p stack=%p-%p rsp=%p rbp=%p caller=%p\n",
--                   (unsigned)data->tid, data, data->teb, (void *)stack_low,
--                   (void *)stack_high, (void *)context->Rsp, (void *)context->Rbp,
--                   (void *)caller );
-+        ERR_(seh)( "PW_FAULT_STACK tid=%04x data=%p teb=%p pthread=%p start=%p param=%p stack=%p-%p rsp=%p rbp=%p caller=%p\n",
-+                   (unsigned)data->tid, data, data->teb, (void *)(ULONG_PTR)data->pthread_id,
-+                   data->start, data->param, (void *)stack_low, (void *)stack_high,
-+                   (void *)context->Rsp, (void *)context->Rbp, (void *)caller );
-+        for (depth = 0; depth < 6; depth++)
-+        {
-+            ULONG_PTR previous, ret;
-+
-+            if ((frame & (sizeof(ULONG_PTR) - 1)) || frame < data_low ||
-+                frame > data_high - 2 * sizeof(ULONG_PTR)) break;
-+            previous = *(const volatile ULONG_PTR *)frame;
-+            ret = *(const volatile ULONG_PTR *)(frame + sizeof(ULONG_PTR));
-+            ERR_(seh)( "PW_FAULT_FRAME depth=%u fp=%p prev=%p ret=%p\n",
-+                       depth, (void *)frame, (void *)previous, (void *)ret );
-+            if (previous <= frame || previous >= stack_high - 2 * sizeof(ULONG_PTR) ||
-+                previous - frame > kernel_stack_size) break;
-+            frame = previous;
-+        }
-         if (caller)
-         {
-             char caller_module[256];

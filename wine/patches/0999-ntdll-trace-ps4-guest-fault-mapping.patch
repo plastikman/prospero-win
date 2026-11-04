@@ -1,20 +1,25 @@
 From: Codex <codex@localhost>
 Subject: ntdll: trace PS4 guest data-fault mappings
 
-The native Fallout 3 new-game transition faulted on a table read in the
-0x067a0000 region. Log kernel mapping metadata before and after Wine's page
-fault hook, plus the faulting registers. Do not read from or repair the page.
+Record bounded PS4 virtual-query metadata around the unresolved WoW64 guest
+page-fault hook for the Fallout 3 0x06000000-0x08000000 data range. The
+rebased tree uses segv_unresolved_hook after Wine page-fault handling, so
+the trace wraps that current hook while preserving its result and behavior.
 
 ---
 diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
-index fe9ad0080f..fe6305b029 100644
+index 8e22ce1df6..61fa8d8331 100644
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
-@@ -2954,7 +2954,75 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
-         }
+@@ -2788,10 +2788,69 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
      }
+ #ifdef __PROSPERO__
+     if (segv_unresolved_hook && rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+-        TRAP_sig(sigcontext) == TRAP_x86_PAGEFLT && segv_unresolved_hook( siginfo, _sigcontext ))
++        TRAP_sig(sigcontext) == TRAP_x86_PAGEFLT)
      {
--        int hook_result = segv_hook ? segv_hook( siginfo, _sigcontext ) : 0;
+-        leave_handler( data, sigcontext );
+-        return;
 +        struct ps4_guest_fault_query
 +        {
 +            void *start, *end;
@@ -27,16 +32,10 @@ index fe9ad0080f..fe6305b029 100644
 +        extern int sceKernelDebugOutText( int, const char * );
 +        static unsigned int guest_fault_trace_count;
 +        unsigned int guest_fault_n = 0;
-+        int q_fault = -1, q_base = -1, q_after = -1;
-+        int hook_result;
++        int q_fault = -1, q_base = -1, q_after = -1, hook_result;
 +
-+        /* Fallout 3's 2026-10-27 native new-game run faulted while reading
-+         * 0x067a0ec4 from a table whose base was 0x067a0718. Record the PS4
-+         * mapping and the hook's decision before raising a Windows exception;
-+         * this distinguishes a missing/protection-limited page from a bad
-+         * game pointer without changing memory or reading faulting memory. */
-+        if ((signal == SIGBUS || signal == SIGSEGV) && siginfo &&
-+            (uintptr_t)siginfo->si_addr >= 0x06000000 &&
++        /* Bound this targeted Fallout 3 guest-data-fault trace. */
++        if (siginfo && (uintptr_t)siginfo->si_addr >= 0x06000000 &&
 +            (uintptr_t)siginfo->si_addr < 0x08000000 && !(ERROR_sig(sigcontext) & 0x10))
 +        {
 +            guest_fault_n = __atomic_add_fetch( &guest_fault_trace_count, 1, __ATOMIC_RELAXED );
@@ -45,8 +44,7 @@ index fe9ad0080f..fe6305b029 100644
 +                char line[384];
 +                memset( &before_fault, 0, sizeof(before_fault) );
 +                memset( &before_base, 0, sizeof(before_base) );
-+                q_fault = sceKernelVirtualQuery( siginfo->si_addr, 1, &before_fault,
-+                                                 sizeof(before_fault) );
++                q_fault = sceKernelVirtualQuery( siginfo->si_addr, 1, &before_fault, sizeof(before_fault) );
 +                q_base = sceKernelVirtualQuery( (void *)(uintptr_t)RBX_sig(sigcontext), 1,
 +                                                &before_base, sizeof(before_base) );
 +                before_fault.name[sizeof(before_fault.name) - 1] = 0;
@@ -54,36 +52,35 @@ index fe9ad0080f..fe6305b029 100644
 +                snprintf( line, sizeof(line),
 +                          "ntdll ps4-guest-fault-map n=%u sig=%d code=%d addr=%p rip=%llx rsp=%llx rax=%llx rbx=%llx rsi=%llx rdi=%llx err=%llx qaddr=%d range=%p-%p prot=%x type=%x flags=%x name=%s qbase=%d base_range=%p-%p base_prot=%x base_name=%s\n",
 +                          guest_fault_n, signal, siginfo->si_code, siginfo->si_addr,
-+                          (unsigned long long)RIP_sig(sigcontext),
-+                          (unsigned long long)RSP_sig(sigcontext),
-+                          (unsigned long long)RAX_sig(sigcontext),
-+                          (unsigned long long)RBX_sig(sigcontext),
-+                          (unsigned long long)RSI_sig(sigcontext),
-+                          (unsigned long long)RDI_sig(sigcontext),
-+                          (unsigned long long)ERROR_sig(sigcontext), q_fault,
-+                          before_fault.start, before_fault.end, before_fault.protection,
-+                          before_fault.memory_type, before_fault.flags, before_fault.name,
-+                          q_base, before_base.start, before_base.end,
-+                          before_base.protection, before_base.name );
++                          (unsigned long long)RIP_sig(sigcontext), (unsigned long long)RSP_sig(sigcontext),
++                          (unsigned long long)RAX_sig(sigcontext), (unsigned long long)RBX_sig(sigcontext),
++                          (unsigned long long)RSI_sig(sigcontext), (unsigned long long)RDI_sig(sigcontext),
++                          (unsigned long long)ERROR_sig(sigcontext), q_fault, before_fault.start,
++                          before_fault.end, before_fault.protection, before_fault.memory_type,
++                          before_fault.flags, before_fault.name, q_base, before_base.start,
++                          before_base.end, before_base.protection, before_base.name );
 +                sceKernelDebugOutText( 0, line );
 +            }
 +        }
 +
-+        hook_result = segv_hook ? segv_hook( siginfo, _sigcontext ) : 0;
++        hook_result = segv_unresolved_hook( siginfo, _sigcontext );
 +        if (guest_fault_n && guest_fault_n <= 12)
 +        {
 +            char line[192];
 +            memset( &after_fault, 0, sizeof(after_fault) );
-+            q_after = sceKernelVirtualQuery( siginfo->si_addr, 1, &after_fault,
-+                                             sizeof(after_fault) );
++            q_after = sceKernelVirtualQuery( siginfo->si_addr, 1, &after_fault, sizeof(after_fault) );
 +            after_fault.name[sizeof(after_fault.name) - 1] = 0;
 +            snprintf( line, sizeof(line),
-+                      "ntdll ps4-guest-fault-hook n=%u hook=%d result=%d qaddr=%d range=%p-%p prot=%x type=%x flags=%x name=%s\n",
-+                      guest_fault_n, !!segv_hook, hook_result, q_after,
-+                      after_fault.start, after_fault.end, after_fault.protection,
-+                      after_fault.memory_type, after_fault.flags, after_fault.name );
++                      "ntdll ps4-guest-fault-hook n=%u hook=1 result=%d qaddr=%d range=%p-%p prot=%x type=%x flags=%x name=%s\n",
++                      guest_fault_n, hook_result, q_after, after_fault.start, after_fault.end,
++                      after_fault.protection, after_fault.memory_type, after_fault.flags, after_fault.name );
 +            sceKernelDebugOutText( 0, line );
 +        }
- 
-         /* 0960 replaced the low Oblivion instruction page with flexible
-          * memory and the kernel then reported it RX, but the guest still
++        if (hook_result)
++        {
++            leave_handler( data, sigcontext );
++            return;
++        }
+     }
+ #endif
+     if (handle_syscall_fault( data, sigcontext, &rec, &context.c )) return;

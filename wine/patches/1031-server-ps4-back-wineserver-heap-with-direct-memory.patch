@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: orbis-win <orbis-win@invalid>
+Subject: [PATCH] server: back PS4 wineserver heap with direct memory
+
+Restore the profile-gated direct-memory backing for the in-process wineserver heap, with bounded reporting every 500,000 allocations.
+---
+
+diff --git a/server/main.c b/server/main.c
+--- a/server/main.c
++++ b/server/main.c
+@@ -260,6 +260,10 @@
+     pthread_attr_t attr;
+     pthread_t thread;
+ 
++#ifdef __PROSPERO__
++    extern void pw_wineserver_heap_init( void );
++    pw_wineserver_heap_init();
++#endif
+     sock_init();
+     open_master_socket();
+     set_current_time();
+diff --git a/server/object.c b/server/object.c
+--- a/server/object.c
++++ b/server/object.c
+@@ -190,9 +190,26 @@
+ }
+ 
+ /* malloc replacement */
++#ifdef __PROSPERO__
++static unsigned long long pw_heap_report_calls;
++extern void pw_wineserver_heap_report( void );
++
++static void pw_maybe_report_heap( void )
++{
++    if (++pw_heap_report_calls >= 500000)
++    {
++        pw_heap_report_calls = 0;
++        pw_wineserver_heap_report();
++    }
++}
++#endif
++
+ void *mem_alloc( size_t size )
+ {
+     void *ptr = malloc( size );
++#ifdef __PROSPERO__
++    pw_maybe_report_heap();
++#endif
+     if (ptr) mark_block_uninitialized( ptr, size );
+     else set_error( STATUS_NO_MEMORY );
+     return ptr;
+@@ -202,6 +219,9 @@
+ void *memdup( const void *data, size_t len )
+ {
+     void *ptr = malloc( len );
++#ifdef __PROSPERO__
++    pw_maybe_report_heap();
++#endif
+     if (ptr) memcpy( ptr, data, len );
+     else set_error( STATUS_NO_MEMORY );
+     return ptr;

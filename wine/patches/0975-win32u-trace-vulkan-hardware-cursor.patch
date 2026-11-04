@@ -8,17 +8,19 @@ without logging once per presented frame.
 
 ---
 diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
+index 9e44e099ca..c8c18a13bc 100644
 --- a/dlls/win32u/ps5drv.c
 +++ b/dlls/win32u/ps5drv.c
-@@ -741,5 +741,7 @@ void ps5drv_vulkan_cursor( void *vulkan_handle )
+@@ -769,17 +769,36 @@ static void ps5_SetCursor( HWND hwnd, HCURSOR handle )
+ void ps5drv_vulkan_cursor( void *vulkan_handle )
+ {
      static int (*show)( const UINT32 *, UINT, UINT, INT, INT, UINT, UINT );
-     static BOOL looked;
-+    static BOOL reported, last_visible;
+-    static BOOL looked;
++    static BOOL looked, reported, last_visible;
 +    static int last_result;
-     const UINT32 *image;
-     UINT width, height;
-     POINT top_left;
-@@ -751,9 +753,26 @@ void ps5drv_vulkan_cursor( void *vulkan_handle )
+ 
+     if (!looked)
+     {
          looked = TRUE;
          show = dlsym( vulkan_handle, "pw_videoout_cursor" );
      }
@@ -29,23 +31,24 @@ diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
 +        reported = TRUE;
 +        return;
 +    }
-     image = ps5drv_lock_cursor( &width, &height, &top_left );
--    show( width && height ? image : NULL, width, height, top_left.x, top_left.y, screen_width, screen_height );
+     pthread_mutex_lock( &screen_lock );
+-    show( cursor_width && cursor_height ? cursor_image : NULL, cursor_width, cursor_height,
+-          cursor.x - cursor_hotspot.x, cursor.y - cursor_hotspot.y, screen_width, screen_height );
 +    {
-+        BOOL visible = image && width && height;
-+        int result = show( visible ? image : NULL, width, height, top_left.x, top_left.y,
++        BOOL visible = cursor_image && cursor_width && cursor_height;
++        int result = show( visible ? cursor_image : NULL, cursor_width, cursor_height,
++                           cursor.x - cursor_hotspot.x, cursor.y - cursor_hotspot.y,
 +                           screen_width, screen_height );
 +
 +        if (!reported || visible != last_visible || result != last_result)
 +            ERR( "PW_VK_CURSOR visible=%u image=%p size=%ux%u pos=%d,%d desktop=%ux%u result=%d\n",
-+                 visible, image, width, height, top_left.x, top_left.y, screen_width,
-+                 screen_height, result );
++                 visible, cursor_image, cursor_width, cursor_height,
++                 cursor.x - cursor_hotspot.x, cursor.y - cursor_hotspot.y,
++                 screen_width, screen_height, result );
 +        reported = TRUE;
 +        last_visible = visible;
 +        last_result = result;
 +    }
-     ps5drv_unlock_cursor();
+     pthread_mutex_unlock( &screen_lock );
  }
  #endif
--- 
-2.43.0

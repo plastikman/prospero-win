@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: orbis-win <orbis-win@invalid>
+Subject: [PATCH] ntdll: keep private copy of unaligned committed mappings
+
+
+---
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2930,8 +2930,18 @@
+              (unsigned long long)offset, fd, prot, flags, vprot, removable,
+              (unsigned long)page_mask, (unsigned long)host_page_mask,
+              mmap_attempted, mmap_errno, mmap_errno ? strerror(mmap_errno) : "not attempted" );
+-        ERR( "unaligned shared mapping %p-%p not supported\n", map_addr, map_addr + map_size );
+-        return STATUS_INVALID_PARAMETER;
++        /* A pagefile-backed committed section has no persistent file state to
++         * preserve. If its Windows-page view is not aligned to the host page,
++         * keep a process-local copy rather than rejecting the entire view.
++         * Persistent file mappings must retain shared write semantics. */
++        if (!(view->protect & SEC_COMMIT) || (view->protect & SEC_FILE))
++        {
++            ERR( "unaligned shared mapping %p-%p not supported (view=%#x vprot=%#x)\n",
++                 map_addr, map_addr + map_size, view->protect, vprot );
++            return STATUS_INVALID_PARAMETER;
++        }
++        ERR( "unaligned committed mapping %p-%p, using private copy (view=%#x vprot=%#x)\n",
++             map_addr, map_addr + map_size, view->protect, vprot );
+     }
+ 
+     mprotect( map_addr, map_size, PROT_READ | PROT_WRITE );

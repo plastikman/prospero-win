@@ -1,65 +1,66 @@
-From: Codex <codex@local>
+From: Codex <codex@localhost>
 Subject: ntdll: log bounded syscall-fault stack words
 
-When a syscall faults while running on Wine's reserved kernel stack, capture
-bounded words at the interrupted RSP and RBP. This preserves the return-chain
-context needed to diagnose invalid control flow without reading outside the
-active syscall frame.
+Capture bounded RSP/RBP words only within the active Wine syscall stack.
+Initialize the syscall-frame bound before sampling so the diagnostic never
+uses an indeterminate frame pointer.
 
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 3ed530530f..d4446af595 100644
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
-@@ -2659,5 +2659,54 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONTEXT *context )
-                    ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7] );
+@@ -2431,6 +2431,7 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigconte
+     DWORD i;
+ 
+     if (!is_inside_syscall( data, RSP_sig(sigcontext) )) return FALSE;
++    frame = get_syscall_frame( data );
+ 
+     TRACE_(seh)( "code=%x flags=%x addr=%p ip=%lx\n",
+                  rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress, context->Rip );
+@@ -2474,6 +2475,36 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigconte
+             ERR_(seh)( "syscall fault %#x %s %p\n", (int)rec->ExceptionCode,
+                        context->Rip ? "at" : "calling NULL from", where );
      }
-+
-+    /* A syscall fault runs on Wine's reserved kernel stack. If the interrupted
-+     * RSP/RBP are inside that stack, capture a few words while the context is
-+     * still live; this helps distinguish a bad indirect target from a damaged
-+     * saved return chain. Keep the reads inside the active syscall frame. */
 +    if (frame)
 +    {
 +        ULONG_PTR stack_low = (ULONG_PTR)get_kernel_stack( data );
 +        ULONG_PTR stack_high = (ULONG_PTR)frame;
 +        ULONG_PTR rsp_words[8] = {0}, rbp_words[8] = {0};
-+        unsigned int rsp_count = 0, rbp_count = 0, i;
++        unsigned int rsp_count = 0, rbp_count = 0, word;
 +
 +        if (context->Rsp >= stack_low && context->Rsp <= stack_high &&
-+            stack_high - context->Rsp >= sizeof(rsp_words))
-+        {
-+            memcpy( rsp_words, (const void *)(ULONG_PTR)context->Rsp, sizeof(rsp_words) );
-+            rsp_count = ARRAY_SIZE(rsp_words);
-+        }
-+        else if (context->Rsp >= stack_low && context->Rsp <= stack_high &&
-+                 stack_high - context->Rsp >= sizeof(ULONG_PTR))
++            stack_high - context->Rsp >= sizeof(ULONG_PTR))
 +        {
 +            rsp_count = (stack_high - context->Rsp) / sizeof(ULONG_PTR);
 +            if (rsp_count > ARRAY_SIZE(rsp_words)) rsp_count = ARRAY_SIZE(rsp_words);
-+            memcpy( rsp_words, (const void *)(ULONG_PTR)context->Rsp,
-+                    rsp_count * sizeof(ULONG_PTR) );
++            memcpy( rsp_words, (const void *)(ULONG_PTR)context->Rsp, rsp_count * sizeof(ULONG_PTR) );
 +        }
 +        if (context->Rbp >= stack_low && context->Rbp <= stack_high &&
-+            stack_high - context->Rbp >= sizeof(rbp_words))
-+        {
-+            memcpy( rbp_words, (const void *)(ULONG_PTR)context->Rbp, sizeof(rbp_words) );
-+            rbp_count = ARRAY_SIZE(rbp_words);
-+        }
-+        else if (context->Rbp >= stack_low && context->Rbp <= stack_high &&
-+                 stack_high - context->Rbp >= sizeof(ULONG_PTR))
++            stack_high - context->Rbp >= sizeof(ULONG_PTR))
 +        {
 +            rbp_count = (stack_high - context->Rbp) / sizeof(ULONG_PTR);
 +            if (rbp_count > ARRAY_SIZE(rbp_words)) rbp_count = ARRAY_SIZE(rbp_words);
-+            memcpy( rbp_words, (const void *)(ULONG_PTR)context->Rbp,
-+                    rbp_count * sizeof(ULONG_PTR) );
++            memcpy( rbp_words, (const void *)(ULONG_PTR)context->Rbp, rbp_count * sizeof(ULONG_PTR) );
 +        }
 +        ERR_(seh)( "fault stack bounds=%016lx-%016lx rsp_words=%u rbp_words=%u\n",
 +                   stack_low, stack_high, rsp_count, rbp_count );
-+        for (i = 0; i < 8; i += 4)
++        for (word = 0; word < 8; word += 4)
 +            ERR_(seh)( "fault stack rsp+%02x=%016lx %016lx %016lx %016lx rbp+%02x=%016lx %016lx %016lx %016lx\n",
-+                       i * (unsigned int)sizeof(ULONG_PTR), rsp_words[i], rsp_words[i + 1],
-+                       rsp_words[i + 2], rsp_words[i + 3],
-+                       i * (unsigned int)sizeof(ULONG_PTR), rbp_words[i], rbp_words[i + 1],
-+                       rbp_words[i + 2], rbp_words[i + 3] );
++                       word * (unsigned int)sizeof(ULONG_PTR), rsp_words[word], rsp_words[word + 1],
++                       rsp_words[word + 2], rsp_words[word + 3],
++                       word * (unsigned int)sizeof(ULONG_PTR), rbp_words[word], rbp_words[word + 1],
++                       rbp_words[word + 2], rbp_words[word + 3] );
 +    }
- 
-     /* Context.Rsp can be an unmapped WoW64 stack address. */
  #endif
+ 
+     if (data->jmp_buf)
+@@ -2485,7 +2516,7 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigconte
+         data->jmp_buf = NULL;
+         return TRUE;
+     }
+-    if ((frame = get_syscall_frame( data )))
++    if (frame)
+     {
+         TRACE_(seh)( "returning to user mode ip=%016lx ret=%08x\n", frame->rip, rec->ExceptionCode );
+         RAX_sig(sigcontext) = rec->ExceptionCode;
