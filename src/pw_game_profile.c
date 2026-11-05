@@ -506,9 +506,17 @@ int pw_game_cpu_native(const PwGameProfile *profile)
 
 size_t pw_game_cpu_env(const PwGameProfile *profile, PwGameEnv *env)
 {
-    if (!env || !pw_game_cpu_native(profile)) return 0;
-    /* patch 0611; the native CPU never runs without the batching */
-    env[0] = (PwGameEnv){ "WINE_PS5_WOW64_CPU", "wow64native.dll" };
+    int native;
+
+    if (!profile || !env || profile->app.architecture != PW_APP_ARCH_PE32) return 0;
+    native = pw_game_cpu_native(profile);
+    /* Patch 0611. Select both backends explicitly; otherwise a translator
+     * profile inherits whatever CPU DLL its prefix registered under
+     * HKLM\Software\Microsoft\Wow64\x86 -- Wine's stock wow64cpu.dll in a
+     * fresh prefix, which cannot run on the PS4 (MDK, 2026-11-05). */
+    env[0] = (PwGameEnv){ "WINE_PS5_WOW64_CPU", native ? "wow64native.dll" : "wowprospero.dll" };
+    if (!native) return 1;
+    /* The native CPU never runs without the Vulkan batching. */
     env[1] = (PwGameEnv){ "PW_VK_BATCH", "1" };
     return 2;
 }

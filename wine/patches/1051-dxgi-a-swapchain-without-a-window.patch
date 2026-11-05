@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Subject: [PATCH] dxgi: Give a composition swapchain a window to live on.
+
+With 0879 in place GTA IV stops crashing and starts spinning instead. The
+log says why, on the line after the one that used to fault:
+
+    fixme:dcomp:DCompositionCreateDevice ...: returning a stub device.
+    fixme:dxgi:dxgi_factory_CreateSwapChainForComposition iface 00BBC5E8,
+        device 00BBAD90, desc 0021FE10, output 00000000, swapchain 0021FCD0 stub!
+
+After that: nothing for thirty seconds, a full core burnt, frames_put=0,
+vk_shown=0. The game asked for a swapchain with no window attached -- the
+buffers were to go to DirectComposition -- got E_NOTIMPL, and has nowhere
+to present.
+
+A composition swapchain is defined by not having a window. On this console
+that costs nothing: the ps5 driver answers every surface request with a
+headless surface whatever HWND it is handed (dlls/win32u/ps5drv.c), and
+RADV's WSI scans a headless swapchain out through sceVideoOutRegisterBuffers
+and sceVideoOutSubmitFlip -- the same path the bundle's triangle example
+reaches the television with. So the window a composition swapchain lacks is
+the one thing it is cheap to invent, and inventing it is the whole
+difference between a swapchain and E_NOTIMPL.
+
+⚠ The window outlives the swapchain: releasing a swapchain does not come
+back through the factory, so there is nowhere to destroy it from. One
+desktop child per composition swapchain is left behind. Games create these
+once, so the cost is bounded; a caller that recreated its swapchain on
+every resize would accumulate them.
+
+⚠ dxgi is a PE module and comes from the host Wine build, not the ps5 one.
+The change has to be made there and the rebuilt dxgi.dll copied into the
+shipped runtime for both architectures, exactly as 0879's dcomp.dll was.
+diff --git a/dlls/dxgi/factory.c b/dlls/dxgi/factory.c
+index c6bb47fa9d..c99008400c 100644
+--- a/dlls/dxgi/factory.c
++++ b/dlls/dxgi/factory.c
+@@ -387,13 +387,58 @@ static void STDMETHODCALLTYPE dxgi_factory_UnregisterOcclusionStatus(IWineDXGIFa
+     FIXME("iface %p, cookie %#lx stub!\n", iface, cookie);
+ }
+ 
++/* A composition swapchain is one that has no window: the caller means to hand
++ * its buffers to DirectComposition and let the compositor place them. There is
++ * no compositor here, and there is no window system either -- the ps5 driver
++ * answers every surface request with a headless surface whatever HWND it is
++ * given (dlls/win32u/ps5drv.c), and RADV scans that out with
++ * sceVideoOutSubmitFlip. The window a composition swapchain lacks is therefore
++ * the one thing it costs nothing to invent, and inventing it is the whole
++ * difference between a swapchain and E_NOTIMPL.
++ *
++ * GTA IV reaches this through 1911.dll, which creates a DirectComposition
++ * device and then asks for its swapchain here. With the stub it received none,
++ * presented nothing, and spun on a full core with the screen never painted.
++ *
++ * ⚠ The window outlives the swapchain. Releasing a swapchain does not come
++ * back through the factory, so there is nowhere to destroy it from; one
++ * desktop child per composition swapchain is left behind. Games create these
++ * once, so the cost is bounded, and leaking a window is better than failing
++ * the call -- but a caller that recreates its swapchain per resize would
++ * accumulate them. */
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWineDXGIFactory *iface,
+         IUnknown *device, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *output, IDXGISwapChain1 **swapchain)
+ {
+-    FIXME("iface %p, device %p, desc %p, output %p, swapchain %p stub!\n",
++    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc = {.Windowed = TRUE};
++    unsigned int width, height;
++    HWND window;
++    HRESULT hr;
++
++    TRACE("iface %p, device %p, desc %p, output %p, swapchain %p.\n",
+             iface, device, desc, output, swapchain);
+ 
+-    return E_NOTIMPL;
++    if (!device || !desc || !swapchain)
++    {
++        WARN("Invalid pointer.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
++    /* A zero extent means "ask the window", and the window is ours, so it has
++     * to be the desktop rather than whatever a default-sized popup came out as. */
++    if (!(width = desc->Width)) width = GetSystemMetrics(SM_CXSCREEN);
++    if (!(height = desc->Height)) height = GetSystemMetrics(SM_CYSCREEN);
++
++    if (!(window = CreateWindowExW(WS_EX_NOACTIVATE, L"Static", NULL, WS_POPUP,
++            0, 0, width, height, NULL, NULL, NULL, NULL)))
++    {
++        ERR("Failed to create a window for a composition swapchain.\n");
++        return DXGI_ERROR_UNSUPPORTED;
++    }
++
++    hr = IWineDXGIFactory_CreateSwapChainForHwnd(iface, device, window, desc,
++            &fullscreen_desc, output, swapchain);
++    if (FAILED(hr)) DestroyWindow( window );
++    return hr;
+ }
+ 
+ static UINT STDMETHODCALLTYPE dxgi_factory_GetCreationFlags(IWineDXGIFactory *iface)

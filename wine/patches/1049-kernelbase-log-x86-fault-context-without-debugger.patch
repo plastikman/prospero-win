@@ -1,0 +1,14 @@
+diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
+index 579b70d542..916c4d6d6a 100644
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -965,6 +965,9 @@ LONG WINAPI UnhandledExceptionFilter( EXCEPTION_POINTERS *epointers )
+         {
+             char buffer[256];
+ 
++#ifdef __i386__
++            log_exception_context32( epointers );
++#endif
+             format_exception_msg( epointers, buffer, sizeof(buffer) );
+             MESSAGE( "wine: %s (thread %04lx), no debugger, ending the process\n",
+                      buffer, GetCurrentThreadId() );

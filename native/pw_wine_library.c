@@ -115,7 +115,11 @@ static int scan_getdents(PwWineLibrary *library, const char *directory)
     int fd = open(directory, O_RDONLY | O_DIRECTORY), got, error;
 
     if (fd < 0) return -1;
+#ifdef __PS4__
+    while ((got = (int)getdents(fd, (struct dirent *)buffer, sizeof(buffer))) > 0)
+#else
     while ((got = getdents(fd, (char *)buffer, sizeof(buffer))) > 0)
+#endif
         if (pw_wine_library_dirents(buffer, (size_t)got, add_name, library) < 0) {
             errno = EINVAL;
             got = -1;

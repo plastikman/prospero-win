@@ -13,3 +13,7 @@
 2026-11-05T12:52:19-08:00 applied archive 0902-win32u-ps5-keep-the-pixels-a-window-above-owns.patch to both trees; recorded as series 1048-win32u-ps5-keep-the-pixels-a-window-above-owns.patch
 2026-11-05T12:52:19-08:00 applied archive 0740-win32u-ps5-vulkan-hardware-cursor.patch to both trees; recorded as series 1049-win32u-ps5-vulkan-hardware-cursor.patch
 2026-11-05T12:53:03-08:00 reverted 1049 (archive 0740): superseded by upstream ps5drv_vulkan_cursor (redefinition)
+2026-11-05T13:55:29-08:00 applied archive 1012 (log PW_EXCEPTION32 when no debugger) to wine-host tree; series 1049
+2026-11-05T13:59:23-08:00 applied archive 0749 (debug output from a non-Wine thread) to both trees; series 1050
+2026-11-05T13:59:49-08:00 applied archive 0860-dxgi-a-swapchain-without-a-window.patch to wine-host tree; series 1051-dxgi-a-swapchain-without-a-window.patch
+2026-11-05T13:59:49-08:00 applied archive 0879-dcomp-a-device-that-exists.patch to wine-host tree; series 1052-dcomp-a-device-that-exists.patch

@@ -91,7 +91,8 @@ static int rotate(void)
 {
     close(fd); fd = -1;
     if (rename(current, previous) != 0) { disk_failed(errno); return -1; }
-    fd = open(current, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    fd = open(current, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) (void)fchmod(fd, 0666);
     bytes = strlen(identity);
     if (fd < 0 || put_all(fd, identity, bytes) != 0) { disk_failed(errno); return -1; }
     return 0;
@@ -251,8 +252,13 @@ int pw_diagnostics_open(const char *root, const char *build, const char *profile
     if (!root || snprintf(directory, sizeof(directory), "%s/logs", root) >= (int)sizeof(directory)) {
         disk_error = ENAMETOOLONG; goto out;
     }
-    if (mkdir(root, 0700) != 0 && errno != EEXIST) { disk_error = errno; goto out; }
-    if (mkdir(directory, 0700) != 0 && errno != EEXIST) { disk_error = errno; goto out; }
+    /* ⚠ 0777/0666 and chmod (archive 0008): the logs are read over FTP, and
+     * GoldHEN's server does not run as the title; a 0700 directory or 0600
+     * file (the title's umask applies to open's mode) cannot be listed. */
+    if (mkdir(root, 0777) != 0 && errno != EEXIST) { disk_error = errno; goto out; }
+    if (mkdir(directory, 0777) != 0 && errno != EEXIST) { disk_error = errno; goto out; }
+    (void)chmod(root, 0777);
+    (void)chmod(directory, 0777);
     snprintf(index, sizeof(index), "%s/next.txt", directory);
     counter = open(index, O_RDONLY);
     if (counter >= 0) {
@@ -263,15 +269,16 @@ int pw_diagnostics_open(const char *root, const char *build, const char *profile
     snprintf(current, sizeof(current), "%s/session-%u.log", directory, next);
     snprintf(previous, sizeof(previous), "%s/session-%u.previous.log", directory, next);
     (void)unlink(previous);
-    fd = open(current, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    fd = open(current, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) { disk_error = errno; goto out; }
+    (void)fchmod(fd, 0666);
     /* Identity repeats on rotation so a retained tail can be identified. */
     snprintf(identity, sizeof(identity), "PW_REPORT/1 build=%s profile=%s cycle=%u pid=%ld time=%lld\n",
              build ? build : "unknown", profile ? profile : "launcher", cycle,
              (long)getpid(), (long long)time(NULL));
     bytes = strlen(identity);
     if (put_all(fd, identity, bytes) != 0) { disk_error = errno; close(fd); fd = -1; goto out; }
-    counter = open(index, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    counter = open(index, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (counter < 0) { disk_error = errno; close(fd); fd = -1; goto out; }
     int n = snprintf(number, sizeof(number), "%u\n", (next + 1) % PW_DIAGNOSTICS_SESSIONS);
     int saved = put_all(counter, number, (size_t)n);

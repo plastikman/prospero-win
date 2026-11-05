@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Thu, 8 Oct 2026 11:55:00 +0000
+Subject: [PATCH] ntdll: debug output from a thread that is not Wine's.
+
+The server died serving GTA IV's get_handle_fd, and the faulting instruction
+was never in the handler:
+
+    rip = ntdll+0x53173 = __wine_dbg_header   (debug.c:364)
+    fault address 0x7c, rbx 0x78
+
+get_info reads get_thread_data()->debug_info. get_thread_data is
+pthread_getspecific, and the in-process server runs on a thread the server
+creates itself (start_inprocess_server), which has none, so it answers NULL.
+debug_info is an inline char[0x800], so NULL->debug_info is not a fault but the
+offset itself, 0x78, and the first field read through it lands on 0x7c.
+
+Any debug output from the server thread therefore killed the process. That is
+why no server-side ERR has appeared in a log, and it means the crash was the
+second fault: handle_syscall_fault was reporting an earlier one when the
+reporting killed it.
+
+Two reads, not one. __wine_dbg_header prints GetCurrentThreadId() on the line
+after get_info's, which is PsGetCurrentThreadId, which is
+get_thread_data()->tid at offset 0x1c -- so fixing get_info alone moved the
+crash from 0x7c to 0x1c and no further. Both are here. The debug path has no
+third: get_info and that id are its only reaches into thread data.
+
+A thread without Wine's data gets the buffer the process uses before threading
+starts, and no thread id.
+
+---
+diff --git a/dlls/ntdll/unix/debug.c b/dlls/ntdll/unix/debug.c
+index fe747fe055..dcc89c48b2 100644
+--- a/dlls/ntdll/unix/debug.c
++++ b/dlls/ntdll/unix/debug.c
+@@ -68,7 +68,26 @@ static const char * const debug_classes[] = { "fixme", "err", "warn", "trace" };
+ static inline struct debug_info *get_info(void)
+ {
+     if (!init_done) return &initial_info;
++#ifdef __PROSPERO__
++    /* ⚠ Not every thread here is one of Wine's. The in-process server runs on
++     * a thread the server itself creates (start_inprocess_server), and
++     * get_thread_data is pthread_getspecific, which answers NULL on it.
++     * debug_info is an inline array, so NULL->debug_info is not a fault but the
++     * offset itself, 0x78, and the first read through it lands on 0x7c:
++     *
++     *     SIGSEGV, fault address 0x7c, rbx 0x78, in __wine_dbg_header
++     *
++     * So every ERR the server ever tried to print killed it -- which is why not
++     * one of them has appeared in a log. Give a thread without Wine's data the
++     * shared buffer the process uses before threading starts. */
++    {
++        struct thread_data *data = get_thread_data();
++        if (!data) return &initial_info;
++        return (struct debug_info *)data->debug_info;
++    }
++#else
+     return (struct debug_info *)get_thread_data()->debug_info;
++#endif
+ }
+ 
+ /* add a string to the output buffer */
+diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
+index 5d2b5252c4..b2ee6a4684 100644
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -2548,5 +2548,15 @@ HANDLE WINAPI PsGetCurrentProcessId(void)
+  */
+ HANDLE WINAPI PsGetCurrentThreadId(void)
+ {
++#ifdef __PROSPERO__
++    /* ⚠ The same thread without Wine's data as in get_info: tid sits at 0x1c
++     * of thread_data, so on the server's own thread this read is of 0x1c. It is
++     * reached from the line after the one get_info is on --
++     * __wine_dbg_header prints GetCurrentThreadId(), which is this -- so fixing
++     * only get_info moved the crash by one line. No thread, no id. */
++    struct thread_data *data = get_thread_data();
++    return ULongToHandle( data ? data->tid : 0 );
++#else
+     return ULongToHandle( get_thread_data()->tid );
++#endif
+ }

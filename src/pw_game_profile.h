@@ -187,9 +187,10 @@ size_t pw_game_runtime_env(const PwGameRuntime *runtime, PwGameEnv *env);
  * cpu when set, else native. OpenGL games draw through Zink, whose Vulkan
  * calls the batching covers like DXVK's. */
 int pw_game_cpu_native(const PwGameProfile *profile);
-/* The variables that select the native CPU, which always comes with Vulkan
- * batching (WINE_PS5_WOW64_CPU, PW_VK_BATCH), into env, which has room for
- * PW_GAME_CPU_ENV_MAX; how many (0 for the translator). */
+/* The variables that select a 32-bit game's WoW64 CPU into env, which has
+ * room for PW_GAME_CPU_ENV_MAX; how many. WINE_PS5_WOW64_CPU names
+ * wow64native.dll (with PW_VK_BATCH) or wowprospero.dll explicitly, so the
+ * prefix's Wow64\x86 key is never consulted; 0 for a 64-bit game. */
 size_t pw_game_cpu_env(const PwGameProfile *profile, PwGameEnv *env);
 
 /* Graphics-specific environment, at most PW_GAME_GRAPHICS_ENV_MAX entries.

@@ -190,18 +190,20 @@ static void test_cpu(void)
     assert(pw_game_cpu_env(&p, env) == 2 && !strcmp(env[1].name, "PW_VK_BATCH"));
     assert(parse(APP_ARCH("pe64", "zink"), &p) == PW_OK && pw_game_cpu_env(&p, env) == 0);
     assert(parse(APP_ARCH("pe32", "zink") "[runtime]\ncpu=translator\n", &p) == PW_OK &&
-           pw_game_cpu_env(&p, env) == 0);
+           pw_game_cpu_env(&p, env) == 1 && !strcmp(env[0].value, "wowprospero.dll"));
 
     /* explicit choices override the default both ways */
     assert(parse(APP_ARCH("pe32", "opengl") "[runtime]\ncpu = translator\n", &p) == PW_OK);
     assert(p.runtime.cpu == PW_GAME_CPU_TRANSLATOR && pw_game_cpu_native(&p) == 0 &&
-           pw_game_cpu_env(&p, env) == 0);
+           pw_game_cpu_env(&p, env) == 1);
+    assert(!strcmp(env[0].name, "WINE_PS5_WOW64_CPU") && !strcmp(env[0].value, "wowprospero.dll"));
     assert(parse(APP_ARCH("pe32", "gdi") "[runtime]\ncpu = native\n", &p) == PW_OK);
     assert(p.runtime.cpu == PW_GAME_CPU_NATIVE && pw_game_cpu_native(&p) == 1 &&
            pw_game_cpu_env(&p, env) == 2);
     assert(parse(APP_ARCH("pe32", "dxvk") "[runtime]\nCPU = Translator\n", &p) == PW_OK);
     assert(p.runtime.cpu == PW_GAME_CPU_TRANSLATOR && pw_game_cpu_native(&p) == 0 &&
-           pw_game_cpu_env(&p, env) == 0);
+           pw_game_cpu_env(&p, env) == 1);
+    assert(!strcmp(env[0].name, "WINE_PS5_WOW64_CPU") && !strcmp(env[0].value, "wowprospero.dll"));
     /* a 64-bit game never uses the WoW64 CPU, even when asked */
     assert(parse(APP_ARCH("pe64", "dxvk") "[runtime]\ncpu = native\n", &p) == PW_OK);
     assert(pw_game_cpu_native(&p) == 0 && pw_game_cpu_env(&p, env) == 0);

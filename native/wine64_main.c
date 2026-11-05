@@ -86,7 +86,10 @@ extern int32_t sceGnmSubmitDone(void);
  * `query ... name=executable hole=0`. FalloutNV.exe then relocated to
  * 0x530000 (it had loaded at 0x400000 on 19 consecutive pre-sync runs) and
  * Oblivion, which cannot relocate, died at STATUS_CONFLICTING_ADDRESSES. */
-extern int pw_relocated_wine_release_eboot(void) __attribute__((weak));
+/* Strong, not weak (archive 0204): the relocatable build always links
+ * app_entry.c, which defines it, and a missing definition must fail the link
+ * rather than produce a package that silently keeps 0x400000 mapped. */
+extern int pw_relocated_wine_release_eboot(void);
 #endif
 #ifndef PW_FIXED_PROFILE
 /* The id of the one profile a single-program title runs; "" for the launcher. */
@@ -755,6 +758,18 @@ static void on_exit_report(void)
     pw_diagnostics_close("wine64-exit");
 }
 
+/* A game that cannot be set up must go back to the launcher, never strand the
+ * console: on PS4 main() returns into the relocated app PRX's entry, which
+ * parks forever (src/reloc-wine-app/app_entry.c), so a plain `return 1` is a
+ * permanent black screen (Half-Life without Mesa Zink, 2026-11-05). Log why
+ * and restart into the launcher; returns 1 only if that restart failed. */
+static int game_setup_failed(const char *reason)
+{
+    PS5LOG_LOG("PW_WINE64 game setup failed reason=%s", reason);
+    restart_title(NULL, launch.cycle + 1u, reason);
+    return 1;
+}
+
 /* ---- library ------------------------------------------------------------ */
 
 /* Complete the one-shot helper exchange before loading profiles or starting
@@ -1023,7 +1038,10 @@ int main(int argc, char **argv)
     static char prefix[PW_WINE_LIBRARY_PATH + PW_APP_ID_CAPACITY], desktop[24], view[8] = "window";
     static char radv_cache[PW_WINE_LIBRARY_PATH + 16];
     enum { WINE64_FIXED_ENV_COUNT = 7,
-           WINE64_PROFILE_ENV_CAPACITY = 3 + PW_GAME_GRAPHICS_ENV_MAX + PW_GAME_RUNTIME_ENV_MAX + PW_GAME_CPU_ENV_MAX +
+           /* desktop, overrides, SDL_JOYSTICK_RAWINPUT and the PS4
+            * mprotect marker, plus the three launcher A/B switches. (The
+            * synced 3 + ... undercounted the PS4 mprotect marker by one.) */
+           WINE64_PROFILE_ENV_CAPACITY = 7 + PW_GAME_GRAPHICS_ENV_MAX + PW_GAME_RUNTIME_ENV_MAX + PW_GAME_CPU_ENV_MAX +
                                          PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX };
     static PwWineStartEnv extra[WINE64_FIXED_ENV_COUNT + WINE64_PROFILE_ENV_CAPACITY] = {
         { "WINEDEBUG", PW_WINE64_DEBUG },
@@ -1122,7 +1140,9 @@ int main(int argc, char **argv)
     (void)pw_wine_launch_parse(argc, argv, catalog, catalog_count, &launch);
     (void)pw_diagnostics_open(library_root, PW_BUILD_ID,
                               launch.app ? launch.app->id : "launcher", launch.cycle);
-    PS5LOG_LOG("PW_WINE64 build_marker=20261105-native-frame-state app_prx=resolver-diagnostic-0204");
+    /* The package's own identity (title, APP_VER, commit), defined by
+     * scripts/build-app-ps4.sh, so every run is attributable from its log. */
+    PS5LOG_LOG("PW_WINE64 build_marker=%s", PW_BUILD_ID);
     PS5LOG_LOG("PW_WINE64 args argc=%d mode=%s profile=%s cycle=%u refused=%u", argc,
                launch.mode == PW_WINE_LAUNCH_GAME ? "game" : "launcher",
                launch.app ? launch.app->id : "-", (unsigned)launch.cycle, launch.refused);
@@ -1177,7 +1197,7 @@ int main(int argc, char **argv)
             extra[config.extra_env_count++] = (PwWineStartEnv){ "WINEDLLOVERRIDES", effective_dll_overrides };
         else if (overrides_status != PW_OK) {
             PS5LOG_LOG("PW_WINE64 DLL overrides refused: %s", game->app.id);
-            return 1;
+            return game_setup_failed("dll-overrides-refused");
         }
         {
             PwGameEnv graphics_env[PW_GAME_GRAPHICS_ENV_MAX];
@@ -1198,7 +1218,7 @@ int main(int argc, char **argv)
             }
             PS5LOG_LOG("PW_WINE64 zink provider=%s copied=%u architecture=%s", pw_result_name(provider_status),
                        copied, game->app.architecture == PW_APP_ARCH_PE32 ? "pe32" : "pe64");
-            if (provider_status != PW_OK) return 1;
+            if (provider_status != PW_OK) return game_setup_failed("zink-provider-missing");
         }
         /* xinput mode: SDL2 games (Half-Life) look for controllers through
          * raw input first, which Wine on the PS5 has none of, and then skip
@@ -1247,20 +1267,26 @@ int main(int argc, char **argv)
         {
             PwGameEnv cpu_env[PW_GAME_CPU_ENV_MAX];
             size_t cpu_count = pw_game_cpu_env(game, cpu_env);
+            const char *cpu_dll = cpu_count ? cpu_env[0].value : NULL;
+            const char *cpu_mode = game->app.architecture == PW_APP_ARCH_PE32 ?
+                                   (pw_game_cpu_native(game) ? "native" : "translator") : "n/a";
             int installed = -2;
 
             for (size_t i = 0; i < cpu_count; i++)
                 extra[config.extra_env_count++] = (PwWineStartEnv){ cpu_env[i].name, cpu_env[i].value };
-            /* WoW64 loads its CPU from the prefix's system32; when this copy
-             * fails, patch 0611 falls back to the prefix's own CPU. */
-            for (size_t i = 0; cpu_count && installed < 0 &&
+            /* WoW64 loads the selected CPU from the prefix's system32. Keep
+             * that copy paired with the override, so an older prefix that
+             * registered another CPU (or only wow64cpu.dll) still works; when
+             * the copy fails, patch 0611 falls back to the prefix's own CPU. */
+            for (size_t i = 0; cpu_dll && installed < 0 &&
                                i < sizeof(runtime_roots) / sizeof(runtime_roots[0]); i++) {
                 char source[256];
-                snprintf(source, sizeof(source), "%s" PW_WINE64_PE_RUNTIME "/wow64native.dll",
-                         runtime_roots[i]);
-                installed = pw_wine_prefix_cpu_install(prefix, source, "wow64native.dll");
+                snprintf(source, sizeof(source), "%s" PW_WINE64_PE_RUNTIME "/%s",
+                         runtime_roots[i], cpu_dll);
+                installed = pw_wine_prefix_cpu_install(prefix, source, cpu_dll);
             }
-            PS5LOG_LOG("PW_WINE64 cpu=%s prefix_cpu=%d", cpu_count ? "native" : "translator", installed);
+            PS5LOG_LOG("PW_WINE64 cpu=%s backend=%s prefix_cpu=%d", cpu_mode,
+                       cpu_dll ? cpu_dll : "prefix", installed);
         }
         /* [debug] winedebug: this game's channels in place of the title's. */
         if (game->winedebug[0]) {
@@ -1304,13 +1330,17 @@ int main(int argc, char **argv)
             PS5LOG_LOG("PW_WINE64 prefix temp folders=%d last=%s", folders,
                        temp.count ? temp.folders[temp.count - 1] : "-");
         }
-        if (PW_WINE64_WAIT_WATCHDOG) setenv("WINE_PS5_WAIT_WATCHDOG", "1", 1);
+        /* ⚠ Not setenv(): the title and ntdll.prx each have a private
+         * environ on the PS4, so only extra[] (pw_ps4_setenv) reaches Wine
+         * (archive 0039/0070/0073). */
+        if (PW_WINE64_WAIT_WATCHDOG)
+            extra[config.extra_env_count++] = (PwWineStartEnv){ "WINE_PS5_WAIT_WATCHDOG", "1" };
         if (PW_WINE64_HEAP_FLEXIBLE) {
-            setenv("WINE_PS5_HEAP_FLEXIBLE", "1", 1);
+            extra[config.extra_env_count++] = (PwWineStartEnv){ "WINE_PS5_HEAP_FLEXIBLE", "1" };
             PS5LOG_LOG("PW_WINE64 heap_direct=0 (anonymous mmap control)");
         }
         if (PW_WINE64_SERVER_DIRECT_OFF) {
-            setenv("WINE_PS5_SERVER_DIRECT", "0", 1);
+            extra[config.extra_env_count++] = (PwWineStartEnv){ "WINE_PS5_SERVER_DIRECT", "0" };
             PS5LOG_LOG("PW_WINE64 server_direct=0 (regular server thread)");
         }
         /* [application] arguments follow the executable in Wine's argv. */
@@ -1331,6 +1361,15 @@ int main(int argc, char **argv)
     }
     PS5LOG_LOG("PW_WINE64 ntdll=%s prefix=%s exe=%s", config.ntdll_path, config.prefix,
                launch.executable);
+#ifdef __PS4__
+    /* ⚠ NOT ON PS4 (archive 0005). capture_fd() closes the descriptor first,
+     * and on this kernel the socket pair does not land on it and dup2 onto
+     * fd 1 or 2 is EPERM: every console run logs fd2_capture=failed and
+     * fd1_capture=failed status=-3 and is left with fds 1 and 2 CLOSED, so a
+     * later open() can take those numbers and receive stray stdio writes.
+     * Wine's output reaches the log through __wine_ps5_set_output_sink. */
+    PS5LOG_LOG("PW_WINE64 fd_capture=skipped reason=dup2-onto-1-or-2-is-EPERM");
+#else
     {
         static PwFdForward forward_stderr = { -1, "WINESERVER" }, forward_stdout = { -1, "STDOUT" };
         status = capture_fd(2, &forward_stderr);
@@ -1338,6 +1377,7 @@ int main(int argc, char **argv)
         status = capture_fd(1, &forward_stdout);
         if (status != 0) PS5LOG_LOG("PW_WINE64 fd1_capture=failed status=%d", status);
     }
+#endif
 
     status = pw_wine_start_load(&start, &config, &ops);
     PS5LOG_LOG("PW_WINE64 load status=%d stage=%d module=0x%x segments=%u module_start=%d "
@@ -1454,7 +1494,7 @@ int main(int argc, char **argv)
     }
 #ifdef PW_RELOCATABLE_WINE
     if (status == PW_OK) {
-        if (game && pw_relocated_wine_release_eboot) {
+        if (game) {
             int release_status = pw_relocated_wine_release_eboot();
             PS5LOG_LOG("PW_WINE64 relocatable eboot release status=%d", release_status);
             if (release_status) status = PW_ERR_STATE;
