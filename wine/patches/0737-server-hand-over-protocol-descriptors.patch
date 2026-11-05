@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Thu, 8 Oct 2026 07:10:00 +0000
+Subject: [PATCH] server: send protocol descriptors by number, not by SCM_RIGHTS.
+
+With the in-process server started, ntdll died on the first exchange of the
+protocol:
+
+    start_main_thread -> server_init_process -> wine_server_receive_fd
+                      -> abort_thread   (SIGSYS, uncatchable here)
+
+server_init_process receives the thread's request pipe before anything else,
+and send_client_fd puts it in an SCM_RIGHTS control message. Passing a
+descriptor that way duplicates it into the receiver, which this console refuses
+for every kind of descriptor (src/dup-probe). The send failed, the server took
+that for a dead client and killed the process, and the client read the
+resulting end of file as "the server closed the connection" and aborted the
+thread -- a crash rather than an exit, because the abort raises SIGSYS.
+
+The in-process server is a thread of the client's own process and shares its
+descriptor table, so a descriptor needs no transport at all: its number already
+names the same open file on both sides. The message becomes { handle, fd }, two
+32-bit words, and ntdll reads exactly that.
+
+One consequence is easy to miss. After handing over a request pipe the server
+closed its end, which was right when the client held a duplicate; here it holds
+that very descriptor, and closing it would shut the pipe the client is about to
+use. That close is now skipped.
+---
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index bdfad82511..d3b31a5960 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1034,11 +1034,37 @@ void CDECL wine_server_send_fd( int fd )
+  */
+ int wine_server_receive_fd( obj_handle_t *handle )
+ {
++#ifndef __PROSPERO__
+     struct iovec vec;
+     struct msghdr msghdr;
+     char cmsg_buffer[256];
+-    int ret, fd = -1;
++    int fd = -1;
++#endif
++    int ret;
+ 
++#ifdef __PROSPERO__
++    /* the descriptor arrives as its own number: the in-process server is a
++     * thread of this process and shares its descriptor table, and nothing can
++     * be duplicated here, so no control message is involved. The message is
++     * { handle, fd }, two 32-bit words -- see send_client_fd. */
++    for (;;)
++    {
++        unsigned int msg[2];
++
++        if ((ret = recv( fd_socket, msg, sizeof(msg), 0 )) == sizeof(msg))
++        {
++            *handle = msg[0];
++            return (int)msg[1];
++        }
++        if (ret > 0) server_protocol_error( "partial descriptor message: %d bytes\n", ret );
++        if (!ret) break;
++        if (errno == EINTR) continue;
++        if (errno == EPIPE) break;
++        server_protocol_perror("recv");
++    }
++    /* the server closed the connection; time to die... */
++    abort_thread(0);
++#else
+     msghdr.msg_name    = NULL;
+     msghdr.msg_namelen = 0;
+     msghdr.msg_iov     = &vec;
+@@ -1077,6 +1103,7 @@ int wine_server_receive_fd( obj_handle_t *handle )
+     }
+     /* the server closed the connection; time to die... */
+     abort_thread(0);
++#endif
+ }
+ 
+ 
+diff --git a/server/request.c b/server/request.c
+index e23b5affba..5098849cb3 100644
+--- a/server/request.c
++++ b/server/request.c
+@@ -485,12 +485,15 @@ int receive_fd( struct process *process )
+ /* send an fd to a client */
+ int send_client_fd( struct process *process, int fd, obj_handle_t handle )
+ {
++#ifndef __PROSPERO__
+     struct iovec vec;
+     struct msghdr msghdr;
+     char cmsg_buffer[256];
+     struct cmsghdr *cmsg;
++#endif
+     int ret;
+ 
++#ifndef __PROSPERO__
+     msghdr.msg_name    = NULL;
+     msghdr.msg_namelen = 0;
+     msghdr.msg_iov     = &vec;
+@@ -508,13 +511,37 @@ int send_client_fd( struct process *process, int fd, obj_handle_t handle )
+     cmsg->cmsg_type  = SCM_RIGHTS;
+     *(int *)CMSG_DATA(cmsg) = fd;
+     msghdr.msg_controllen = cmsg->cmsg_len;
++#endif
+ 
+     if (debug_level)
+         fprintf( stderr, "%04x: *fd* %04x -> %d\n", current ? current->id : process->id, handle, fd );
+ 
++#ifdef __PROSPERO__
++    /* ⚠ The descriptor travels as its own number, not in an SCM_RIGHTS
++     * control message. Passing a descriptor over a unix socket duplicates it
++     * into the receiver, and no descriptor can be duplicated on this console
++     * (src/dup-probe: dup, dup2, fcntl(F_DUPFD) and sceKernelRdup are all
++     * refused, for every kind of descriptor). The in-process server is a thread
++     * of the client's own process and shares its descriptor table, so the
++     * number alone names the same open file on both sides.
++     *
++     * The message is { handle, fd }, two 32-bit words; ntdll reads exactly this
++     * in wine_server_receive_fd. */
++    {
++        unsigned int msg[2];
++
++        msg[0] = handle;
++        msg[1] = (unsigned int)fd;
++        ret = send( get_unix_fd( process->msg_fd ), msg, sizeof(msg), 0 );
++        if (ret == sizeof(msg)) return 0;
++        /* a partial message is a protocol error below, never a success */
++        if (ret > 0) ret = sizeof(msg);
++    }
++#else
+     ret = sendmsg( get_unix_fd( process->msg_fd ), &msghdr, 0 );
+ 
+     if (ret == sizeof(handle)) return 0;
++#endif
+ 
+     if (ret >= 0)
+     {
+diff --git a/server/thread.c b/server/thread.c
+index 5f4c432cef..32afbe9653 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -472,7 +472,12 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
+             close( request_pipe[1] );
+             return NULL;
+         }
++#ifndef __PROSPERO__
++        /* the client received a descriptor of its own, so this one is spent.
++         * On PS4 it received this very descriptor -- closing it here would
++         * shut the request pipe the client is about to use. */
+         close( request_pipe[1] );
++#endif
+         fd = request_pipe[0];
+     }
+ 

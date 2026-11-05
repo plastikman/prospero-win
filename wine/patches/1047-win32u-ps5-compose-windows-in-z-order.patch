@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Subject: [PATCH] win32u: Compose the ps5 windows in z order.
+
+The driver composes every top level window into one screen buffer, but a flush
+wrote the window's whole dirty rectangle, so a window below could draw over a
+window above it.  Nothing restores what it covered: each window only paints
+what it was told is damaged, and the covering window was not told anything.
+
+Explorer's desktop window does this to Space Cadet Pinball.  The game window
+is at (97,44)-(703,511) on the 800x600 desktop, and two milliseconds after it
+paints, the desktop window below it repaints a corner of its own background:
+
+    window_surface_flush Flushing hwnd 10046 ... dirty (0,0)-(608,467)
+    window_surface_flush Flushing hwnd 1002a ... dirty (0,0)-(240,189)
+
+which overwrites screen (97,44)-(240,189): the window's left border, the left
+third of its caption and its system menu.
+
+The window surface clip region win32u hands the driver does not help here: the
+server computes it from the window's own shape and its child windows that own
+a pixel format, not from the windows above it, so a driver whose windows are
+real windows gets its z order from the display server.  This one has no
+display server, so track the order here: sort the window array into the
+desktop's z order whenever a position changes, and clip a flush to the parts
+of its dirty rectangle that the windows above it leave visible.
+
+This is not by itself why Pinball shows no caption.  That is a full-screen
+clear, fixed in the patch after this one, which also uses the rectangle
+subtraction and the z order added here.
+
+diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
+index 336057aa9b..6cc27b0acb 100644
+--- a/dlls/win32u/ps5drv.c
++++ b/dlls/win32u/ps5drv.c
+@@ -75,7 +75,7 @@ struct ps5_input
+     UINT down;
+ };
+ 
+-enum { PS5_MAX_WINDOWS = 64, PS5_INPUT_BATCH = 64 };
++enum { PS5_MAX_WINDOWS = 64, PS5_INPUT_BATCH = 64, PS5_MAX_PARTS = 32 };
+ 
+ struct ps5_window
+ {
+@@ -96,6 +96,7 @@ static UINT screen_width = 800, screen_height = 600;
+  * then centres on the TV as it does any frame. */
+ static UINT content_width, content_height;
+ static UINT32 *screen;
++/* the desktop's top level windows, in its z order, the topmost first */
+ static struct ps5_window windows[PS5_MAX_WINDOWS];
+ static UINT window_count;
+ static POINT cursor;
+@@ -264,6 +265,59 @@ static LONG ps5_ChangeDisplaySettings( DEVMODEW *displays, const WCHAR *primary_
+ /***********************************************************************
+  *           window surfaces
+  */
++/* The screen holds one composed image, so a window must not draw over the
++ * windows above it: a_minus_b splits the part of a that b leaves, into at
++ * most four rectangles, and unoccluded_parts repeats that for every window
++ * above the one being drawn. */
++static UINT a_minus_b( RECT *out, const RECT *a, const RECT *b )
++{
++    RECT overlap;
++    UINT count = 0;
++
++    if (!intersect_rect( &overlap, a, b ))
++    {
++        out[0] = *a;
++        return 1;
++    }
++    if (a->top < overlap.top)
++        SetRect( &out[count++], a->left, a->top, a->right, overlap.top );
++    if (overlap.bottom < a->bottom)
++        SetRect( &out[count++], a->left, overlap.bottom, a->right, a->bottom );
++    if (a->left < overlap.left)
++        SetRect( &out[count++], a->left, overlap.top, overlap.left, overlap.bottom );
++    if (overlap.right < a->right)
++        SetRect( &out[count++], overlap.right, overlap.top, a->right, overlap.bottom );
++    return count;
++}
++
++/* screen_lock held: the parts of rect that the windows above index z leave
++ * visible.  windows is in the desktop's z order, the topmost first. */
++static UINT unoccluded_parts( RECT *parts, UINT max, const RECT *rect, UINT z )
++{
++    UINT count = 1, above, i, n;
++
++    parts[0] = *rect;
++    for (above = 0; above < z && count; above++)
++    {
++        RECT next[PS5_MAX_PARTS];
++
++        if (!windows[above].shown) continue;
++        for (i = 0, n = 0; i < count; i++)
++        {
++            RECT split[4];
++            UINT split_count = a_minus_b( split, &parts[i], &windows[above].visible ), j;
++
++            /* Too many fragments to track: rather than lose the window's own
++             * pixels, stop clipping here and leave the parts found so far. */
++            if (n + split_count > max) return count;
++            for (j = 0; j < split_count; j++) next[n++] = split[j];
++        }
++        memcpy( parts, next, n * sizeof(*parts) );
++        count = n;
++    }
++    return count;
++}
++
+ static void ps5_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
+ {
+ }
+@@ -275,6 +329,8 @@ static BOOL ps5_surface_flush( struct window_surface *surface, const RECT *rect,
+     struct ps5_window *window;
+     UINT stride = color_info->bmiHeader.biWidth * 4;
+     RECT target, clip = {0, 0, screen_width, screen_height};
++    RECT parts[PS5_MAX_PARTS];
++    UINT count = 0, i;
+     INT y;
+ 
+     pthread_mutex_lock( &screen_lock );
+@@ -284,15 +340,19 @@ static BOOL ps5_surface_flush( struct window_surface *surface, const RECT *rect,
+         target = *dirty;
+         OffsetRect( &target, window->visible.left, window->visible.top );
+         if (intersect_rect( &target, &target, &clip ) && intersect_rect( &target, &target, &window->visible ))
++            count = unoccluded_parts( parts, ARRAY_SIZE(parts), &target, window - windows );
++
++        for (i = 0; i < count; i++)
+         {
+-            for (y = target.top; y < target.bottom; y++)
++            for (y = parts[i].top; y < parts[i].bottom; y++)
+             {
+                 const BYTE *src = (const BYTE *)color_bits + (y - window->visible.top) * stride +
+-                                  (target.left - window->visible.left) * 4;
+-                memcpy( screen + y * screen_width + target.left, src, (target.right - target.left) * 4 );
++                                  (parts[i].left - window->visible.left) * 4;
++                memcpy( screen + y * screen_width + parts[i].left, src,
++                        (parts[i].right - parts[i].left) * 4 );
+             }
+-            present_screen();
+         }
++        if (count) present_screen();
+     }
+     pthread_mutex_unlock( &screen_lock );
+     return TRUE;
+@@ -379,6 +439,33 @@ static BOOL ps5_CreateWindow( HWND hwnd )
+     return TRUE;
+ }
+ 
++/* No lock held, this calls back into win32u: sort windows into the desktop's
++ * z order, the topmost first, so that a flush knows which windows are above
++ * the one it draws.  A window the desktop no longer lists keeps its place
++ * until DestroyWindow removes it. */
++static void update_z_order(void)
++{
++    HWND *children = list_window_children( get_desktop_window() );
++    UINT next = 0, i, j;
++
++    if (!children) return;
++    pthread_mutex_lock( &screen_lock );
++    for (i = 0; children[i] && next < window_count; i++)
++    {
++        for (j = next; j < window_count; j++) if (windows[j].hwnd == children[i]) break;
++        if (j == window_count) continue;
++        if (j != next)
++        {
++            struct ps5_window moved = windows[j];
++            windows[j] = windows[next];
++            windows[next] = moved;
++        }
++        next++;
++    }
++    pthread_mutex_unlock( &screen_lock );
++    free( children );
++}
++
+ static void ps5_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                                   const struct window_rects *new_rects, struct window_surface *surface )
+ {
+@@ -407,6 +494,7 @@ static void ps5_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
+         window->shown = shown;
+     }
+     pthread_mutex_unlock( &screen_lock );
++    update_z_order();
+     if (repaint) NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
+ }
+ 
+@@ -422,7 +510,8 @@ static void ps5_DestroyWindow( HWND hwnd )
+             clear_screen_rect( &window->visible );
+             present_screen();
+         }
+-        *window = windows[--window_count];
++        /* close the gap, keeping the rest of the z order */
++        memmove( window, window + 1, (windows + --window_count - window) * sizeof(*window) );
+     }
+     pthread_mutex_unlock( &screen_lock );
+ }

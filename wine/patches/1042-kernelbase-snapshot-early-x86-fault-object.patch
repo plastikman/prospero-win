@@ -1,0 +1,41 @@
+From 1072 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] kernelbase: snapshot x86 fault object before diagnostics
+
+The detailed exception logger performs remote log writes and virtual memory
+queries before it reads ESI. Another game thread can mutate or remap the object
+in that interval. Capture the first four DWORDs immediately on entry, then emit
+that snapshot beside the captured registers.
+
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -532,12 +532,30 @@
+ {
+     const CONTEXT *ctx = ptr->ContextRecord;
+     DWORD stack[8] = {0};
++    DWORD early_object[4] = {0};
+     SIZE_T bytes_read = 0;
++    SIZE_T early_object_size = 0;
++    BOOL early_object_read = FALSE;
+ 
+     if (!ctx) return;
++    /* Snapshot the object before logging or querying other memory. A later
++     * diagnostic read can observe a different value if another game thread
++     * mutates or remaps this object while exception reporting is underway. */
++    if (ctx->Esi)
++        early_object_read = ReadProcessMemory( GetCurrentProcess(),
++                                               (const void *)(ULONG_PTR)ctx->Esi,
++                                               early_object, sizeof(early_object),
++                                               &early_object_size );
+     MESSAGE( "PW_EXCEPTION32 tid=%04lx eip=%08lx esp=%08lx ebp=%08lx eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx esi=%08lx edi=%08lx\n",
+              GetCurrentThreadId(), ctx->Eip, ctx->Esp, ctx->Ebp, ctx->Eax,
+              ctx->Ebx, ctx->Ecx, ctx->Edx, ctx->Esi, ctx->Edi );
++    if (early_object_read)
++        MESSAGE( "PW_EXCEPTION32 early-object addr=%08lx bytes=%lu words=%08lx,%08lx,%08lx,%08lx\n",
++                 ctx->Esi, (ULONG)early_object_size, early_object[0], early_object[1],
++                 early_object[2], early_object[3] );
++    else if (ctx->Esi)
++        MESSAGE( "PW_EXCEPTION32 early-object read failed addr=%08lx error=%lu\n",
++                 ctx->Esi, GetLastError() );
+ 
+     if (ReadProcessMemory( GetCurrentProcess(), (const void *)(ULONG_PTR)ctx->Esp,
+                            stack, sizeof(stack), &bytes_read ))

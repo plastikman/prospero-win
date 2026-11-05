@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Wed, 21 Oct 2026 00:00:00 -0700
+Subject: [PATCH] kernelbase: log x86 exception registers and stack on PS4
+
+The PS4 runtime cannot start winedbg after an unhandled 32-bit game fault.
+Record the fault-time x86 registers and a bounded stack sample at that point
+so the next run can identify the caller and arguments without enabling noisy
+SEH tracing across the whole process.
+---
+ dlls/kernelbase/debug.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
+index 8dbb6779ff..1c3ef5f938 100644
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -525,6 +525,31 @@ static void format_exception_msg( const EXCEPTION_POINTERS *ptr, char *buffer, i
+     snprintf( buffer + len,  size - len, " at address %p", ptr->ExceptionRecord->ExceptionAddress );
+ }
+ 
++#ifdef __i386__
++/* The PS4 WoW64 route cannot launch winedbg, so retain the fault-time x86
++ * registers and stack at the point where Wine would normally start it. */
++static void log_exception_context32( const EXCEPTION_POINTERS *ptr )
++{
++    const CONTEXT *ctx = ptr->ContextRecord;
++    DWORD stack[8] = {0};
++    SIZE_T bytes_read = 0;
++
++    if (!ctx) return;
++    MESSAGE( "PW_EXCEPTION32 tid=%04lx eip=%08lx esp=%08lx ebp=%08lx eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx esi=%08lx edi=%08lx\n",
++             GetCurrentThreadId(), ctx->Eip, ctx->Esp, ctx->Ebp, ctx->Eax,
++             ctx->Ebx, ctx->Ecx, ctx->Edx, ctx->Esi, ctx->Edi );
++
++    if (ReadProcessMemory( GetCurrentProcess(), (const void *)(ULONG_PTR)ctx->Esp,
++                           stack, sizeof(stack), &bytes_read ))
++        MESSAGE( "PW_EXCEPTION32 stack bytes=%lu words=%08lx,%08lx,%08lx,%08lx,%08lx,%08lx,%08lx,%08lx\n",
++                 (ULONG)bytes_read, stack[0], stack[1], stack[2], stack[3],
++                 stack[4], stack[5], stack[6], stack[7] );
++    else
++        MESSAGE( "PW_EXCEPTION32 stack read failed esp=%08lx error=%lu\n",
++                 ctx->Esp, GetLastError() );
++}
++#endif
++
+ 
+ /******************************************************************
+  *		start_debugger
+@@ -545,6 +570,9 @@ static BOOL start_debugger( EXCEPTION_POINTERS *epointers, HANDLE event )
+ 
+     format_exception_msg( epointers, buffer, sizeof(buffer) );
+     MESSAGE( "wine: %s (thread %04lx), starting debugger...\n", buffer, GetCurrentThreadId() );
++#ifdef __i386__
++    log_exception_context32( epointers );
++#endif
+ 
+     InitializeObjectAttributes( &attr, &nameW, 0, 0, NULL );
+     if (!NtOpenKey( &dbg_key, KEY_READ, &attr ))

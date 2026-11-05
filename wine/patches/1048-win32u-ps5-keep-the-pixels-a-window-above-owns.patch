@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Subject: [PATCH] win32u: Keep the pixels a window above owns on ps5.
+
+A window that hid, moved or was destroyed cleared its whole visible rectangle
+from the screen buffer.  The buffer holds one composed image, so that erased
+whatever the windows above it had painted there, and nothing paints it again:
+each window only redraws what it is told is damaged, and the window above was
+never told anything.
+
+Space Cadet Pinball lost its frame to this.  Explorer's desktop window is the
+size of the desktop, and it is torn down three milliseconds after the game
+window first paints:
+
+    window_surface_flush Flushing hwnd 10046 ... dirty (0,0)-(608,467)
+    user_destroy_window (1002a)
+    dump_winpos_flags flags: ... SWP_HIDEWINDOW
+    destroy_window 1002a
+
+The hide cleared (0,0)-(800,600) -- the whole screen -- taking the game
+window's caption, borders and the splash it was showing with it.  Two seconds
+later the game repainted its client and the table came back, but the
+non-client area never did, because nothing had invalidated it.  On video the
+window is fully decorated for exactly one frame, then black.
+
+Clear only the parts of the rectangle no other window owns.  A window above
+still owns its pixels there and keeps them.  A window below had been covered,
+so the screen holds the leaving window's pixels rather than its own, and it is
+invalidated once the lock is dropped so it paints them again.
+
+With this, tearing the desktop window down around a 606x467 game window at
+(97,44) clears four rectangles beside it instead of the whole screen:
+
+    clear_screen_rect clearing screen (0,0)-(800,44)
+    clear_screen_rect clearing screen (0,511)-(800,600)
+    clear_screen_rect clearing screen (0,44)-(97,511)
+    clear_screen_rect clearing screen (703,44)-(800,511)
+
+--- a/dlls/win32u/ps5drv.c
++++ b/dlls/win32u/ps5drv.c
+@@ -318,6 +318,50 @@
+     return count;
+ }
+ 
++/* screen_lock held: the parts of rect that no shown window other than the one
++ * at index skip covers. */
++static UINT unowned_parts( RECT *parts, UINT max, const RECT *rect, UINT skip )
++{
++    UINT count = 1, i, j, n;
++
++    parts[0] = *rect;
++    for (i = 0; i < window_count && count; i++)
++    {
++        RECT next[PS5_MAX_PARTS];
++
++        if (i == skip || !windows[i].shown) continue;
++        for (j = 0, n = 0; j < count; j++)
++        {
++            RECT split[4];
++            UINT split_count = a_minus_b( split, &parts[j], &windows[i].visible ), k;
++
++            if (n + split_count > max) return count;
++            for (k = 0; k < split_count; k++) next[n++] = split[k];
++        }
++        memcpy( parts, next, n * sizeof(*parts) );
++        count = n;
++    }
++    return count;
++}
++
++/* screen_lock held: the window at index z gives up rect, because it is hiding,
++ * moving or going away.  Only the parts no other window owns are cleared: a
++ * window above it still owns its pixels there, and blanking them would erase a
++ * frame nothing will paint again.  A window below it had been covered, so the
++ * screen holds this window's pixels rather than its own; it is named in repaint
++ * and the caller invalidates it once the lock is dropped. */
++static UINT give_up_screen_rect( const RECT *rect, UINT z, HWND *repaint, UINT max )
++{
++    RECT parts[PS5_MAX_PARTS], overlap;
++    UINT count = unowned_parts( parts, ARRAY_SIZE(parts), rect, z ), i, n = 0;
++
++    for (i = 0; i < count; i++) clear_screen_rect( &parts[i] );
++    for (i = z + 1; i < window_count && n < max; i++)
++        if (windows[i].shown && intersect_rect( &overlap, rect, &windows[i].visible ))
++            repaint[n++] = windows[i].hwnd;
++    return n;
++}
++
+ static void ps5_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
+ {
+ }
+@@ -472,6 +516,8 @@
+     struct ps5_window *window;
+     BOOL shown = (NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_VISIBLE) &&
+                  NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window();
++    HWND uncovered[PS5_MAX_WINDOWS];
++    UINT uncovered_count = 0, i;
+     BOOL repaint = FALSE;
+ 
+     pthread_mutex_lock( &screen_lock );
+@@ -485,7 +531,8 @@
+     {
+         if (window->shown && (!shown || !EqualRect( &window->visible, &new_rects->visible )))
+         {
+-            clear_screen_rect( &window->visible );
++            uncovered_count = give_up_screen_rect( &window->visible, window - windows,
++                                                   uncovered, ARRAY_SIZE(uncovered) );
+             present_screen();
+         }
+         /* a window just shown may have painted before it had this surface */
+@@ -495,25 +542,32 @@
+     }
+     pthread_mutex_unlock( &screen_lock );
+     update_z_order();
++    for (i = 0; i < uncovered_count; i++)
++        NtUserRedrawWindow( uncovered[i], NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
+     if (repaint) NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
+ }
+ 
+ static void ps5_DestroyWindow( HWND hwnd )
+ {
+     struct ps5_window *window;
++    HWND uncovered[PS5_MAX_WINDOWS];
++    UINT uncovered_count = 0, i;
+ 
+     pthread_mutex_lock( &screen_lock );
+     if ((window = find_window( hwnd )))
+     {
+         if (window->shown)
+         {
+-            clear_screen_rect( &window->visible );
++            uncovered_count = give_up_screen_rect( &window->visible, window - windows,
++                                                   uncovered, ARRAY_SIZE(uncovered) );
+             present_screen();
+         }
+         /* close the gap, keeping the rest of the z order */
+         memmove( window, window + 1, (windows + --window_count - window) * sizeof(*window) );
+     }
+     pthread_mutex_unlock( &screen_lock );
++    for (i = 0; i < uncovered_count; i++)
++        NtUserRedrawWindow( uncovered[i], NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
+ }
+ 
+ /* No explorer sizes the desktop the server created: make it the monitor. */

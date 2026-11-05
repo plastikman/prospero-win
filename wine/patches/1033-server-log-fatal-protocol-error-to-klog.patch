@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Subject: [PATCH] server: log PS4 protocol failures to klog
+
+The server PRX's stderr is not captured on the console. When a client request
+has a protocol error, emit the same bounded reason to klog before the server
+terminates the client thread. This carries forward the established PS4
+diagnostic from src/wine-patches-ps4/0865; this patch has a new queue number
+because upstream already uses 0865 for a different patch.
+---
+diff --git a/server/request.c b/server/request.c
+--- a/server/request.c
++++ b/server/request.c
+@@ -145,6 +145,25 @@ void fatal_protocol_error( struct thread *thread, const char *err, ... )
+     fprintf( stderr, "Protocol error:%04x: ", thread->id );
+     vfprintf( stderr, err, args );
+     va_end( args );
++#ifdef __PROSPERO__
++    {
++        extern int sceKernelDebugOutText( int channel, const char *text );
++        char line[256];
++        int n;
++
++        n = snprintf( line, sizeof(line), "wineserver: protocol error %04x: ", thread->id );
++        if (n > 0 && n < (int)sizeof(line))
++        {
++            va_start( args, err );
++            vsnprintf( line + n, sizeof(line) - n, err, args );
++            va_end( args );
++            sceKernelDebugOutText( 0, line );
++        }
++    }
++#endif
+     thread->exit_code = 1;
+     kill_thread( thread, 1 );
+ }
+-- 
+2.47.3

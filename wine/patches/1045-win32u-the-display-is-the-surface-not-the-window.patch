@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Subject: [PATCH] win32u: Let the host say how big a surface is on this console.
+
+With 0880 the composition swapchain reaches Vulkan, and the screen goes
+black -- the title hands the display over the moment a Vulkan surface is
+created ("display released to vulkan close=state shown=0"). Then:
+
+    thunk32_vkCreateSwapchainKHR 0xba1c88, 0x21fa38, 0, 0x21f9f8
+    fixme:dxgi:hresult_from_vk_result Unhandled VkResult -3.
+
+VK_ERROR_INITIALIZATION_FAILED, and the whole stack tears itself down:
+swapchain, surface, images, memory. Nothing paints, and nothing can,
+because the title's own video output is already closed.
+
+adjust_surface_capabilities overwrites the host's image extents with the
+window's client rect, so that an application sees what the Win32 WSI would
+have told it. That is right where a window system exists. Here there is
+none: ps5drv answers every vulkan_surface_create with a headless surface
+whatever HWND it is handed, and RADV's WSI scans that out through
+sceVideoOutRegisterBuffers, which registers buffers of the video mode's
+size and of no other size. So the client rect is a fiction, the extents
+are not, and telling vkd3d to ask for a swapchain the size of the window
+dxgi invented in 0880 asks the scanout for something it cannot make.
+
+Leave the host's extents alone under __PROSPERO__. The maxImageCount fix
+above it stays: that one is about what applications expect, not about what
+the window system can do.
+
+Two more things, because a refusal here is otherwise a bare number:
+
+  - vkCreateSwapchainKHR raised the requested extent to the host's minimum
+    and never lowered it to the host's maximum, so an oversized request was
+    refused rather than clamped. Clamp both ways.
+
+  - On failure, log the request and the capabilities it was built from.
+    RADV's own stderr goes nowhere from inside a PRX, so these eleven
+    fields are the only evidence there is about which one it objected to.
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 7fadce04de..cddf9eaf41 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -1602,6 +1602,25 @@ static void adjust_surface_capabilities( struct vulkan_instance *instance, struc
+      */
+     if (!capabilities->maxImageCount) capabilities->maxImageCount = max( capabilities->minImageCount, 16 );
+ 
++#ifdef __PROSPERO__
++    /* ⚠ The window is a fiction on this console and the host's extents are not.
++     * Every surface here is the display: ps5drv answers vulkan_surface_create
++     * with a headless surface whatever HWND it is handed, and RADV's WSI scans
++     * that out through sceVideoOutRegisterBuffers, which registers buffers of
++     * the video mode's size and of no other size. Overwriting the host's
++     * extents with a client rect therefore tells the application to ask for a
++     * swapchain the scanout cannot make, and RADV refuses it with
++     * VK_ERROR_INITIALIZATION_FAILED and no message on any channel we receive.
++     *
++     * GTA IV reached exactly that: a composition swapchain at the size of the
++     * window dxgi invented for it, vkCreateSwapchainKHR -> -3, and a black
++     * screen, because by then the title had already handed the display over to
++     * Vulkan and nothing else was ever going to paint it.
++     *
++     * The maxImageCount fix above stays -- it is about what applications
++     * expect, not about what the window system can do. */
++    (void)client_rect;
++#else
+     /* Update the image extents to match what the Win32 WSI would provide. */
+     /* FIXME: handle DPI scaling, somehow */
+     get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) );
+@@ -1611,6 +1630,7 @@ static void adjust_surface_capabilities( struct vulkan_instance *instance, struc
+     capabilities->maxImageExtent.height = client_rect.bottom - client_rect.top;
+     capabilities->currentExtent.width = client_rect.right - client_rect.left;
+     capabilities->currentExtent.height = client_rect.bottom - client_rect.top;
++#endif
+ }
+ 
+ static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( VkPhysicalDevice client_physical_device, VkSurfaceKHR client_surface,
+@@ -1851,6 +1871,14 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+ 
+     create_info_host.imageExtent.width = max( create_info_host.imageExtent.width, capabilities.minImageExtent.width );
+     create_info_host.imageExtent.height = max( create_info_host.imageExtent.height, capabilities.minImageExtent.height );
++    /* ⚠ And back down again. The extent was only ever raised to the host's
++     * minimum; a caller that asks for more than the host's maximum -- which on
++     * this console is the video mode, the one size the scanout has buffers for
++     * -- gets its swapchain refused rather than clamped. */
++    if (capabilities.maxImageExtent.width)
++        create_info_host.imageExtent.width = min( create_info_host.imageExtent.width, capabilities.maxImageExtent.width );
++    if (capabilities.maxImageExtent.height)
++        create_info_host.imageExtent.height = min( create_info_host.imageExtent.height, capabilities.maxImageExtent.height );
+ 
+     /* If the swapchain image size is not equal to the presentation size (e.g. because of DPI virtualization or
+      * display mode change emulation), MoltenVK's vkQueuePresentKHR returns VK_SUBOPTIMAL_KHR.
+@@ -1871,6 +1899,27 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+ 
+     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
+     {
++        /* ⚠ Say what was asked for. A host WSI that refuses a swapchain here
++         * reports nothing through any channel this console delivers -- RADV's
++         * own stderr goes nowhere from inside a PRX -- so the request and the
++         * capabilities it was built from are the only evidence there is, and
++         * without them a refusal is a bare number with eleven fields behind
++         * it. */
++        ERR( "vkCreateSwapchainKHR failed, res %d: format %u, colorSpace %u, extent %ux%u, images %u, "
++             "layers %u, usage %#x, sharing %u, preTransform %#x, compositeAlpha %#x, presentMode %u, "
++             "clipped %u, old %p\n", res, create_info_host.imageFormat, create_info_host.imageColorSpace,
++             create_info_host.imageExtent.width, create_info_host.imageExtent.height,
++             create_info_host.minImageCount, create_info_host.imageArrayLayers, create_info_host.imageUsage,
++             create_info_host.imageSharingMode, create_info_host.preTransform, create_info_host.compositeAlpha,
++             create_info_host.presentMode, create_info_host.clipped,
++             (void *)(UINT_PTR)create_info_host.oldSwapchain );
++        ERR( "host capabilities: images %u..%u, extent %ux%u (%ux%u..%ux%u), layers %u, transforms %#x, "
++             "alpha %#x, usage %#x\n", capabilities.minImageCount, capabilities.maxImageCount,
++             capabilities.currentExtent.width, capabilities.currentExtent.height,
++             capabilities.minImageExtent.width, capabilities.minImageExtent.height,
++             capabilities.maxImageExtent.width, capabilities.maxImageExtent.height,
++             capabilities.maxImageArrayLayers, capabilities.supportedTransforms,
++             capabilities.supportedCompositeAlpha, capabilities.supportedUsageFlags );
+         free( swapchain );
+         return res;
+     }

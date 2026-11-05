@@ -1,0 +1,36 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] kernelbase: Log the faulting page in PW_EXCEPTION32 (fault-page record of archive 1007).
+
+Archive 1007 re-creates log_exception_context32() from scratch and so
+cannot follow 0962-0965/0973; this carries only its generic fault-page
+VirtualQuery record on top of them.
+---
+--- a/dlls/kernelbase/debug.c	2026-11-05 12:18:07.988223485 -0800
++++ b/dlls/kernelbase/debug.c	2026-11-05 12:18:07.988223485 -0800
+@@ -597,6 +597,26 @@
+         ULONG_PTR fault = ptr->ExceptionRecord->NumberParameters > 1 ?
+                           ptr->ExceptionRecord->ExceptionInformation[1] : 0;
+ 
++        /* ⚠ The page that actually faulted, which eax-page below does NOT
++         * answer: eax often holds a scalar (0x65 in the 14:28 run) while the
++         * bad pointer sits in ecx. State tells the story outright --
++         * MEM_COMMIT on an address that still faults means committed but
++         * unbacked; MEM_FREE means the guest is using memory it already
++         * released; MEM_RESERVE means reserved and never committed. */
++        if (fault)
++        {
++            MEMORY_BASIC_INFORMATION finfo;
++            SIZE_T fq = VirtualQuery( (const void *)fault, &finfo, sizeof(finfo) );
++
++            if (fq)
++                MESSAGE( "PW_EXCEPTION32 fault-page fault=%p query=%lu base=%p alloc=%p size=%lu state=%08lx protect=%08lx type=%08lx\n",
++                         (void *)fault, (ULONG)fq, finfo.BaseAddress, finfo.AllocationBase,
++                         (ULONG)finfo.RegionSize, finfo.State, finfo.Protect, finfo.Type );
++            else
++                MESSAGE( "PW_EXCEPTION32 fault-page query failed fault=%p error=%lu\n",
++                         (void *)fault, GetLastError() );
++        }
++
+         query_size = VirtualQuery( object, &info, sizeof(info) );
+         if (query_size)
+             MESSAGE( "PW_EXCEPTION32 eax-page eax=%08lx fault=%p query=%lu base=%p alloc=%p size=%lu state=%08lx protect=%08lx type=%08lx\n",

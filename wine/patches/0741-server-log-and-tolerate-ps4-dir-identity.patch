@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Subject: [PATCH] server: log PS4 server-directory identity mismatch
+
+On PS4, create_server_dir reaches the requested prefix and successfully
+changes into the new server directory, but Wine's path stat and cwd fstat
+identity check fails. Log both dev/inode pairs and continue on Prospero so the
+next startup stage can be observed. Keep Wine's strict check on other
+platforms; the reason for the PS4 metadata mismatch remains to be determined.
+---
+diff --git a/server/request.c b/server/request.c
+--- a/server/request.c
++++ b/server/request.c
+@@ -1183,7 +1183,20 @@
+     if (fstat( server_dir_fd, &st2 ) == -1)
+         fatal_error( "stat %s: %s\n", server_dir, strerror( errno ));
+     if (st.st_dev != st2.st_dev || st.st_ino != st2.st_ino)
++    {
++#ifdef __PROSPERO__
++        extern int sceKernelDebugOutText( int channel, const char *text );
++        char line[192];
++
++        snprintf( line, sizeof(line),
++                  "wineserver: server-dir identity differs dev=%llx/%llx ino=%llx/%llx\n",
++                  (unsigned long long)st.st_dev, (unsigned long long)st2.st_dev,
++                  (unsigned long long)st.st_ino, (unsigned long long)st2.st_ino );
++        sceKernelDebugOutText( 0, line );
++#else
+         fatal_error( "chdir did not end up in %s\n", server_dir );
++#endif
++    }
+ 
+     free( base_dir );
+     free( config_dir );
+-- 
+2.47.3

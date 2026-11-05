@@ -1,0 +1,42 @@
+From: Codex <codex@localhost>
+Subject: [PATCH] kernelbase: log x86 faulting PC page on PS4
+
+The Oblivion native WoW64 fault reports an address inside the PE's .text range,
+but the trace does not establish whether that page is committed/executable or
+whether Wine restored an inconsistent guest context. Query that page and read
+a bounded byte sample only on the existing unhandled-exception path.
+
+diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
+index 12abc7cb0c..de65267209 100644
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -548,6 +548,29 @@ static void log_exception_context32( const EXCEPTION_POINTERS *ptr )
+         MESSAGE( "PW_EXCEPTION32 stack read failed esp=%08lx error=%lu\n",
+                  ctx->Esp, GetLastError() );
+ 
++    {
++        MEMORY_BASIC_INFORMATION info;
++        DWORD code[2] = {0};
++        SIZE_T query_size, code_size = 0;
++        const void *pc = (const void *)(ULONG_PTR)ctx->Eip;
++
++        query_size = VirtualQuery( pc, &info, sizeof(info) );
++        if (query_size)
++            MESSAGE( "PW_EXCEPTION32 pc-page eip=%08lx query=%lu base=%p alloc=%p size=%lu state=%08lx protect=%08lx type=%08lx\n",
++                     ctx->Eip, (ULONG)query_size, info.BaseAddress, info.AllocationBase,
++                     (ULONG)info.RegionSize, info.State, info.Protect, info.Type );
++        else
++            MESSAGE( "PW_EXCEPTION32 pc-page query failed eip=%08lx error=%lu\n",
++                     ctx->Eip, GetLastError() );
++
++        if (ReadProcessMemory( GetCurrentProcess(), pc, code, sizeof(code), &code_size ))
++            MESSAGE( "PW_EXCEPTION32 pc-bytes eip=%08lx bytes=%lu words=%08lx,%08lx\n",
++                     ctx->Eip, (ULONG)code_size, code[0], code[1] );
++        else
++            MESSAGE( "PW_EXCEPTION32 pc-bytes read failed eip=%08lx error=%lu\n",
++                     ctx->Eip, GetLastError() );
++    }
++
+     {
+         MEMORY_BASIC_INFORMATION info;
+         DWORD object[2] = {0};

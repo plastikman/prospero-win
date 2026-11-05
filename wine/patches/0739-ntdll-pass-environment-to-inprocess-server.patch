@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Subject: [PATCH] ntdll/server: pass the module environment to the in-process server
+
+Each PS4 PRX has its own statically linked libc environment. The launcher
+publishes WINEPREFIX and other variables into ntdll's environ, while the
+in-process wineserver PRX's private environ remains NULL. create_server_dir
+then misses WINEPREFIX and rejects the relative HOME fallback before Wine can
+reach the game. Pass the stable environment vector when connecting and install
+it in the server module before its startup reads environment variables.
+
+Also emit the server's received environment state to klog for this startup
+boundary.
+---
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 4bbe2aeafe..bc8fc6ad1e 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -86,6 +86,10 @@
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ #include "unix_private.h"
++
++#ifdef __PROSPERO__
++extern char **environ;
++#endif
+ #include "ddk/wdm.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(server);
+@@ -1927,7 +1931,7 @@ static int connect_inprocess_server(void)
+     Dl_info info;
+     char *dir = NULL, *module_path, *nls_dir, *p;
+     void *module;
+-    int (*connect_server)( const char * );
++    int (*connect_server)( const char *, char ** );
+     int fd;
+ 
+     if (dladdr( connect_inprocess_server, &info ) && info.dli_fname) dir = strdup( info.dli_fname );
+@@ -1959,7 +1963,7 @@ static int connect_inprocess_server(void)
+     if (!(connect_server = dlsym( module, "pw_wineserver_connect" )))
+         fatal_error( "%s has no pw_wineserver_connect\n", module_path );
+     register_server_thread = dlsym( module, "pw_wine_thread_register" );
+-    if ((fd = connect_server( nls_dir )) == -1)
++    if ((fd = connect_server( nls_dir, environ )) == -1)
+         fatal_error( "the in-process server %s did not start\n", module_path );
+     unregister_server_thread = dlsym( module, "pw_wine_thread_unregister" );
+     /* WINE_PS5_SERVER_DIRECT=0 sends every request through the server thread */
+diff --git a/server/main.c b/server/main.c
+index 6b9dd0b9b0..5d4361a586 100644
+--- a/server/main.c
++++ b/server/main.c
+@@ -282,10 +282,27 @@ static void start_inprocess_server(void)
+ /* Start the server on first use and return a new client connection, which
+  * ntdll uses in place of connecting to the server socket. Initialisation
+  * runs on the caller's thread, so it completes before the first request. */
+-DECLSPEC_EXPORT int pw_wineserver_connect( const char *nls_dir )
++DECLSPEC_EXPORT int pw_wineserver_connect( const char *nls_dir, char **envp )
+ {
+     static pthread_once_t once = PTHREAD_ONCE_INIT;
+ 
++#ifdef __PROSPERO__
++    /* Each PS4 PRX has its own statically linked libc environment. ntdll
++     * populates its environment through pw_ps4_setenv, but this in-process
++     * server PRX has a separate environ pointer. Share the stable ntdll list
++     * before create_server_dir() reads WINEPREFIX/HOME or server options. */
++    extern char **environ;
++    extern int sceKernelDebugOutText( int channel, const char *text );
++    char line[192];
++    unsigned int env_count = 0;
++
++    environ = envp;
++    while (envp && envp[env_count]) env_count++;
++    snprintf( line, sizeof(line), "wineserver: environment handoff entries=%u prefix=%s home=%s\n",
++              env_count, getenv("WINEPREFIX") ? "set" : "missing",
++              getenv("HOME") ? getenv("HOME") : "missing" );
++    sceKernelDebugOutText( 0, line );
++#endif
+     if (!inprocess_nls_dir && nls_dir) inprocess_nls_dir = strdup( nls_dir );
+     pthread_once( &once, start_inprocess_server );
+ #ifdef __PROSPERO__
+diff --git a/server/request.h b/server/request.h
+index 77ed687fb1..a504617d28 100644
+--- a/server/request.h
++++ b/server/request.h
+@@ -62,7 +62,7 @@ extern timeout_t monotonic_counter(void);
+ #include <pthread.h>
+ #include "ps5_sync.h"
+ extern int connect_inprocess_client(void);
+-extern int pw_wineserver_connect( const char *nls_dir );
++extern int pw_wineserver_connect( const char *nls_dir, char **envp );
+ extern const char *inprocess_nls_dir;
+ /* client threads running requests themselves (fd.c, request.c) */
+ extern pthread_mutex_t inprocess_server_mutex;

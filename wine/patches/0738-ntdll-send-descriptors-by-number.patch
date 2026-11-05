@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Thu, 8 Oct 2026 07:40:00 +0000
+Subject: [PATCH] ntdll: send descriptors to the server by number too.
+
+0737 fixed the server-to-client direction and the client got past it, dying one
+step further on:
+
+    server_init_process -> init_thread_pipe -> wine_server_send_fd
+                        -> server_protocol_perror -> abort_thread   (SIGSYS)
+
+init_thread_pipe creates the thread's reply and wait pipes and sends an end of
+each to the server. wine_server_send_fd put the descriptor in an SCM_RIGHTS
+control message, which duplicates it into the receiver -- refused here for every
+kind of descriptor (src/dup-probe) -- so the sendmsg failed and the thread
+aborted.
+
+The message already carries what is needed. struct send_fd holds the thread id
+and the descriptor's number, and the in-process server is a thread of this very
+process, so that number names the same open file on both sides: receive_fd takes
+it from the message instead of from a control message, and the client sends the
+message alone.
+
+As in 0737, the descriptor is handed over rather than copied, so the sender must
+stop closing it: after the init_thread request the client closed its end of the
+reply pipe, which was right when the server held a duplicate and would now shut
+the pipe the server replies through.
+---
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index d3b31a5960..ceb82e7182 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -989,12 +989,15 @@ unsigned int server_queue_process_apc( HANDLE process, const union apc_call *cal
+ void CDECL wine_server_send_fd( int fd )
+ {
+     struct send_fd data;
++#ifndef __PROSPERO__
+     struct msghdr msghdr;
+     struct iovec vec;
+     char cmsg_buffer[256];
+     struct cmsghdr *cmsg;
++#endif
+     int ret;
+ 
++#ifndef __PROSPERO__
+     msghdr.msg_name    = NULL;
+     msghdr.msg_namelen = 0;
+     msghdr.msg_iov     = &vec;
+@@ -1005,10 +1008,31 @@ void CDECL wine_server_send_fd( int fd )
+ 
+     vec.iov_base = (void *)&data;
+     vec.iov_len  = sizeof(data);
++#endif
+ 
+     data.tid = GetCurrentThreadId();
+     data.fd  = fd;
+ 
++#ifdef __PROSPERO__
++    /* ⚠ The message carries the descriptor's number and nothing else. A
++     * descriptor cannot be passed in an SCM_RIGHTS control message here --
++     * that duplicates it into the receiver, which this console refuses for
++     * every kind of descriptor (src/dup-probe) -- and it need not be: the
++     * in-process server is a thread of this process and shares its descriptor
++     * table, so data.fd already names the same open file there. The server
++     * reads it in receive_fd.
++     *
++     * The descriptor is handed over, not copied: this thread must not close it
++     * afterwards. See the callers of init_thread_pipe. */
++    for (;;)
++    {
++        if ((ret = send( fd_socket, &data, sizeof(data), 0 )) == sizeof(data)) return;
++        if (ret >= 0) server_protocol_error( "partial write %d\n", ret );
++        if (errno == EINTR) continue;
++        if (errno == EPIPE) abort_thread(0);
++        server_protocol_perror( "send" );
++    }
++#else
+     cmsg = CMSG_FIRSTHDR( &msghdr );
+     cmsg->cmsg_len   = CMSG_LEN( sizeof(fd) );
+     cmsg->cmsg_level = SOL_SOCKET;
+@@ -1024,6 +1048,7 @@ void CDECL wine_server_send_fd( int fd )
+         if (errno == EPIPE) abort_thread(0);
+         server_protocol_perror( "sendmsg" );
+     }
++#endif
+ }
+ 
+ 
+@@ -1860,7 +1885,12 @@ size_t server_init_process(void)
+         }
+     }
+     SERVER_END_REQ;
++#ifndef __PROSPERO__
++    /* the server holds a duplicate of this pipe. On PS4 it holds this very
++     * descriptor -- wine_server_send_fd hands it over rather than copying it --
++     * and closing it here would shut the pipe the server replies through. */
+     close( reply_pipe );
++#endif
+ 
+     if (ret) server_protocol_error( "init_first_thread failed with status %x\n", ret );
+ 
+@@ -1967,7 +1997,12 @@ void server_init_thread( struct thread_data *data )
+         data->suspend = reply->suspend;
+     }
+     SERVER_END_REQ;
++#ifndef __PROSPERO__
++    /* the server holds a duplicate of this pipe. On PS4 it holds this very
++     * descriptor -- wine_server_send_fd hands it over rather than copying it --
++     * and closing it here would shut the pipe the server replies through. */
+     close( reply_pipe );
++#endif
+ 
+     if (data->teb)
+     {
+diff --git a/server/request.c b/server/request.c
+index 5098849cb3..1544adc178 100644
+--- a/server/request.c
++++ b/server/request.c
+@@ -424,6 +424,11 @@ int receive_fd( struct process *process )
+ 
+     ret = recvmsg( get_unix_fd( process->msg_fd ), &msghdr, 0 );
+ 
++#ifdef __PROSPERO__
++    /* the client sent the descriptor's own number and kept it open for us --
++     * see wine_server_send_fd; this process shares its descriptor table */
++    if (ret > 0) fd = data.fd;
++#else
+     if (ret > 0)
+     {
+         struct cmsghdr *cmsg;
+@@ -433,6 +438,7 @@ int receive_fd( struct process *process )
+             if (cmsg->cmsg_type == SCM_RIGHTS) fd = *(int *)CMSG_DATA(cmsg);
+         }
+     }
++#endif
+ 
+     if (ret == sizeof(data))
+     {

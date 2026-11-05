@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Thu, 8 Oct 2026 06:10:00 +0000
+Subject: [PATCH] server: hand the in-process client descriptor over directly.
+
+The in-process server never started on PS4: pw_wineserver_connect returned -1
+and ntdll stopped at "the in-process server did not start", with nothing said
+about why -- every failure path in connect_inprocess_client returns -1 in
+silence.
+
+connect_inprocess_client creates a socketpair and passes one end to the server
+over a unix socket with SCM_RIGHTS. Passing a descriptor that way duplicates it
+into the receiver, and no descriptor can be duplicated on this console
+(src/dup-probe: dup, dup2, fcntl(F_DUPFD) and sceKernelRdup are all refused,
+for regular files, directories, shm objects, sockets and pipes alike).
+
+In this configuration there is nothing to pass. The server runs as a thread of
+the same process -- start_inprocess_server creates it with pthread_create --
+so it already shares this descriptor table. Put the descriptor in a queue, keep
+the byte on the channel as the wake-up that makes the main loop poll, and take
+it out again on the other side. Unlike the SCM_RIGHTS path, the sender must not
+close its end afterwards: it handed over the descriptor itself, not a copy.
+
+Each remaining way for this to fail now says so through klog: no channel, a
+refused socketpair, a full queue, a lost wake-up, an empty queue behind one,
+and a server thread that never started.
+---
+diff --git a/server/main.c b/server/main.c
+index 301f7b1a33..3f209a5e4e 100644
+--- a/server/main.c
++++ b/server/main.c
+@@ -284,6 +284,14 @@ DECLSPEC_EXPORT int pw_wineserver_connect( const char *nls_dir )
+ 
+     if (!inprocess_nls_dir && nls_dir) inprocess_nls_dir = strdup( nls_dir );
+     pthread_once( &once, start_inprocess_server );
++#ifdef __PROSPERO__
++    if (!inprocess_started)
++    {
++        extern int sceKernelDebugOutText( int channel, const char *text );
++        sceKernelDebugOutText( 0, "wineserver: the server thread did not start\n" );
++        return -1;
++    }
++#endif
+     return inprocess_started ? connect_inprocess_client() : -1;
+ }
+ #endif
+diff --git a/server/request.c b/server/request.c
+index 1fd30a2b6e..0e8980cc88 100644
+--- a/server/request.c
++++ b/server/request.c
+@@ -44,6 +44,9 @@
+ #endif
+ #include <unistd.h>
+ #include <poll.h>
++#ifdef __PROSPERO__
++#include <pthread.h>
++#endif
+ #ifdef __APPLE__
+ # include <mach/mach_time.h>
+ #endif
+@@ -109,6 +112,27 @@ int config_dir_fd = -1;    /* file descriptor for the config dir */
+ static struct master_socket *master_socket;  /* the master socket object */
+ #ifdef WINE_INPROCESS_SERVER
+ static int client_channel = -1;  /* send side of the in-process client channel */
++#ifdef __PROSPERO__
++/* ⚠ The client descriptor is handed over in this queue rather than through
++ * SCM_RIGHTS. Passing a descriptor over a unix socket duplicates it into the
++ * receiver, and no descriptor can be duplicated on this console (src/dup-probe:
++ * dup, dup2, fcntl(F_DUPFD) and sceKernelRdup are all refused, for every kind
++ * of descriptor). The server runs as a thread of this same process -- see
++ * start_inprocess_server -- so it already shares this fd table and there is
++ * nothing to pass: the byte on the channel is only the wake-up that makes the
++ * main loop poll. */
++static pthread_mutex_t pending_client_mutex = PTHREAD_MUTEX_INITIALIZER;
++static int pending_clients[16];
++static unsigned int pending_client_count;
++
++static void pw_server_note( const char *what )
++{
++    extern int sceKernelDebugOutText( int channel, const char *text );
++    char line[256];
++    snprintf( line, sizeof(line), "wineserver: %s (errno %d)\n", what, errno );
++    sceKernelDebugOutText( 0, line );
++}
++#endif
+ #endif
+ static struct timeout_user *master_timeout;
+ 
+@@ -869,6 +893,29 @@ static const struct fd_ops inprocess_wake_fd_ops =
+ /* receive one client socket sent by connect_inprocess_client */
+ static int receive_inprocess_client( int channel )
+ {
++#ifdef __PROSPERO__
++    /* the descriptor is in the queue; the byte is only the wake-up */
++    {
++        char wake;
++        int queued = -1;
++
++        if (read( channel, &wake, 1 ) != 1)
++        {
++            pw_server_note( "in-process client wake-up not received" );
++            return -1;
++        }
++        pthread_mutex_lock( &pending_client_mutex );
++        if (pending_client_count)
++        {
++            queued = pending_clients[0];
++            memmove( pending_clients, pending_clients + 1,
++                     --pending_client_count * sizeof(*pending_clients) );
++        }
++        pthread_mutex_unlock( &pending_client_mutex );
++        if (queued == -1) pw_server_note( "in-process client woke with an empty queue" );
++        return queued;
++    }
++#else
+     char dummy;
+     struct iovec vec = { &dummy, 1 };
+     union { struct cmsghdr header; char buffer[CMSG_SPACE( sizeof(int) )]; } control;
+@@ -889,6 +936,7 @@ static int receive_inprocess_client( int channel )
+         return fd;
+     }
+     return -1;
++#endif
+ }
+ 
+ /* create a connection to the in-process server and return the client end;
+@@ -896,15 +944,67 @@ static int receive_inprocess_client( int channel )
+  * process exactly as it would a connection on the master socket */
+ int connect_inprocess_client(void)
+ {
++    int pair[2];
++
++    if (client_channel == -1)
++    {
++#ifdef __PROSPERO__
++        pw_server_note( "no in-process client channel: the server never opened one" );
++#endif
++        return -1;
++    }
++    if (socketpair( AF_UNIX, SOCK_STREAM, 0, pair ) == -1)
++    {
++#ifdef __PROSPERO__
++        pw_server_note( "socketpair for the in-process client FAILED" );
++#endif
++        return -1;
++    }
++#ifdef __PROSPERO__
++    /* hand the descriptor over directly -- see the queue's comment above */
++    {
++        char wake = 0;
++        int full = 0;
++
++        pthread_mutex_lock( &pending_client_mutex );
++        if (pending_client_count < ARRAY_SIZE(pending_clients))
++            pending_clients[pending_client_count++] = pair[0];
++        else full = 1;
++        pthread_mutex_unlock( &pending_client_mutex );
++        if (full)
++        {
++            pw_server_note( "in-process client queue is full" );
++            close( pair[0] );
++            close( pair[1] );
++            return -1;
++        }
++        if (send( client_channel, &wake, 1, 0 ) != 1)
++        {
++            unsigned int i;
++
++            pw_server_note( "in-process client wake-up FAILED" );
++            pthread_mutex_lock( &pending_client_mutex );
++            for (i = 0; i < pending_client_count; i++)
++                if (pending_clients[i] == pair[0])
++                {
++                    memmove( pending_clients + i, pending_clients + i + 1,
++                             (--pending_client_count - i) * sizeof(*pending_clients) );
++                    break;
++                }
++            pthread_mutex_unlock( &pending_client_mutex );
++            close( pair[0] );
++            close( pair[1] );
++            return -1;
++        }
++        return pair[1];
++    }
++#else
+     char dummy = 0;
+     struct iovec vec = { &dummy, 1 };
+     union { struct cmsghdr header; char buffer[CMSG_SPACE( sizeof(int) )]; } control;
+     struct msghdr msg;
+     struct cmsghdr *cmsg;
+-    int pair[2];
+ 
+-    if (client_channel == -1) return -1;
+-    if (socketpair( AF_UNIX, SOCK_STREAM, 0, pair ) == -1) return -1;
+     memset( &msg, 0, sizeof(msg) );
+     memset( &control, 0, sizeof(control) );
+     msg.msg_iov = &vec;
+@@ -924,6 +1024,7 @@ int connect_inprocess_client(void)
+     }
+     close( pair[0] );
+     return pair[1];
++#endif
+ }
+ #endif
+ 

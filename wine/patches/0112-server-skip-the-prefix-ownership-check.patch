@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Tue, 7 Oct 2026 19:00:00 +0000
+Subject: [PATCH] server: skip the prefix ownership check on PS5/PS4 too.
+
+create_dir() already skips its st_uid test under __PROSPERO__, with the note
+"one user; its file systems do not keep unix owners". create_server_dir() makes
+the same test against the prefix itself and was left unguarded, so it fires
+whenever the prefix was not written by the running user.
+
+This is the previously validated PS4 patch 0112 from ps4-gladius, carried
+forward onto the ABI-v4 base.
+---
+diff --git a/server/request.c b/server/request.c
+--- a/server/request.c
++++ b/server/request.c
+@@ -1154,8 +1154,10 @@ static char *create_server_dir( int force )
+         fatal_error( "open %s: %s\n", config_dir, strerror( errno ));
+     if (fstat( config_dir_fd, &st ) == -1)
+         fatal_error( "stat %s: %s\n", config_dir, strerror( errno ));
++#ifndef __PROSPERO__  /* one user; PS4 filesystems do not preserve Unix owners */
+     if (st.st_uid != getuid())
+         fatal_error( "%s is not owned by you\n", config_dir );
++#endif
+ 
+     /* create the base directory if needed */
+-- 
+2.47.3

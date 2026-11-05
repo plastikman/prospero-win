@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Subject: [PATCH] server: pass the Wine prefix directly to in-process server
+
+The first environment handoff was observable in pw_wineserver_connect, but
+create_server_dir still took its HOME fallback and faulted at the non-absolute
+home check. Pass WINEPREFIX as a separate argument from ntdll and copy it into
+server-owned storage before startup. Use that copy for the server directory;
+this avoids relying on cross-PRX libc getenv/environ aliasing.
+---
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1931,7 +1931,7 @@
+     Dl_info info;
+     char *dir = NULL, *module_path, *nls_dir, *p;
+     void *module;
+-    int (*connect_server)( const char *, char ** );
++    int (*connect_server)( const char *, char **, const char * );
+     int fd;
+ 
+     if (dladdr( connect_inprocess_server, &info ) && info.dli_fname) dir = strdup( info.dli_fname );
+@@ -1963,7 +1963,7 @@
+     if (!(connect_server = dlsym( module, "pw_wineserver_connect" )))
+         fatal_error( "%s has no pw_wineserver_connect\n", module_path );
+     register_server_thread = dlsym( module, "pw_wine_thread_register" );
+-    if ((fd = connect_server( nls_dir, environ )) == -1)
++    if ((fd = connect_server( nls_dir, environ, getenv( "WINEPREFIX" ) )) == -1)
+         fatal_error( "the in-process server %s did not start\n", module_path );
+     unregister_server_thread = dlsym( module, "pw_wine_thread_unregister" );
+     /* WINE_PS5_SERVER_DIRECT=0 sends every request through the server thread */
+diff --git a/server/request.h b/server/request.h
+--- a/server/request.h
++++ b/server/request.h
+@@ -62,7 +62,7 @@
+ #include <pthread.h>
+ #include "ps5_sync.h"
+ extern int connect_inprocess_client(void);
+-extern int pw_wineserver_connect( const char *nls_dir, char **envp );
++extern int pw_wineserver_connect( const char *nls_dir, char **envp, const char *prefix );
+ extern const char *inprocess_nls_dir;
+ /* client threads running requests themselves (fd.c, request.c) */
+ extern pthread_mutex_t inprocess_server_mutex;
+diff --git a/server/request.c b/server/request.c
+--- a/server/request.c
++++ b/server/request.c
+@@ -78,6 +78,11 @@
+ static const char * const server_socket_name = "socket";   /* name of the socket file */
+ static const char * const server_lock_name = "lock";       /* name of the server lock file */
+ 
++#ifdef __PROSPERO__
++/* The server PRX's libc getenv() can see a different environment from ntdll. */
++char pw_wineserver_prefix[4096];
++#endif
++
+ struct master_socket
+ {
+     struct object        obj;        /* object header */
+@@ -1104,10 +1109,16 @@
+ /* create the server directory and chdir to it */
+ static char *create_server_dir( int force )
+ {
+-    const char *prefix = getenv( "WINEPREFIX" );
++    const char *prefix;
+     char *p, *config_dir, *base_dir;
+     struct stat st, st2;
+ 
++#ifdef __PROSPERO__
++    prefix = pw_wineserver_prefix[0] ? pw_wineserver_prefix : getenv( "WINEPREFIX" );
++#else
++    prefix = getenv( "WINEPREFIX" );
++#endif
++
+     /* open the configuration directory */
+ 
+     if (prefix)
+diff --git a/server/main.c b/server/main.c
+--- a/server/main.c
++++ b/server/main.c
+@@ -282,7 +282,7 @@
+ /* Start the server on first use and return a new client connection, which
+  * ntdll uses in place of connecting to the server socket. Initialisation
+  * runs on the caller's thread, so it completes before the first request. */
+-DECLSPEC_EXPORT int pw_wineserver_connect( const char *nls_dir, char **envp )
++DECLSPEC_EXPORT int pw_wineserver_connect( const char *nls_dir, char **envp, const char *prefix )
+ {
+     static pthread_once_t once = PTHREAD_ONCE_INIT;
+ 
+@@ -292,14 +292,20 @@
+      * server PRX has a separate environ pointer. Share the stable ntdll list
+      * before create_server_dir() reads WINEPREFIX/HOME or server options. */
+     extern char **environ;
++    extern char pw_wineserver_prefix[4096];
+     extern int sceKernelDebugOutText( int channel, const char *text );
+     char line[192];
+     unsigned int env_count = 0;
+ 
+     environ = envp;
++    if (prefix && strlen(prefix) < sizeof(pw_wineserver_prefix))
++        strcpy(pw_wineserver_prefix, prefix);
++    else
++        pw_wineserver_prefix[0] = 0;
+     while (envp && envp[env_count]) env_count++;
+-    snprintf( line, sizeof(line), "wineserver: environment handoff entries=%u prefix=%s home=%s\n",
+-              env_count, getenv("WINEPREFIX") ? "set" : "missing",
++    snprintf( line, sizeof(line), "wineserver: environment handoff entries=%u prefix-arg=%s env-prefix=%s home=%s\n",
++              env_count, pw_wineserver_prefix[0] ? pw_wineserver_prefix : "missing",
++              getenv("WINEPREFIX") ? "set" : "missing",
+               getenv("HOME") ? getenv("HOME") : "missing" );
+     sceKernelDebugOutText( 0, line );
+ #endif
+-- 
+2.47.3

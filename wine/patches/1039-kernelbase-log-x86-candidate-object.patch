@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Wed, 21 Oct 2026 00:00:00 -0700
+Subject: [PATCH] kernelbase: log candidate object state on x86 faults
+
+The Fallout NV fault has EAX=0 after loading the vtable from [EDI]. Record
+the candidate object's mapping and first four words to distinguish a valid
+zero-vtable object from stale or unreadable memory.
+---
+ dlls/kernelbase/debug.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
+index 6a77b57a20..c000000000 100644
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -570,6 +570,29 @@
+         else
+             MESSAGE( "PW_EXCEPTION32 object read failed addr=%08lx error=%lu\n",
+                      ctx->Esi, GetLastError() );
+     }
++
++    {
++        MEMORY_BASIC_INFORMATION info;
++        DWORD candidate[4] = {0};
++        SIZE_T query_size, candidate_size = 0;
++
++        query_size = VirtualQuery( (const void *)(ULONG_PTR)ctx->Edi, &info, sizeof(info) );
++        if (query_size)
++            MESSAGE( "PW_EXCEPTION32 candidate addr=%08lx query=%lu base=%p alloc=%p size=%lu state=%08lx protect=%08lx type=%08lx\n",
++                     ctx->Edi, (ULONG)query_size, info.BaseAddress, info.AllocationBase,
++                     (ULONG)info.RegionSize, info.State, info.Protect, info.Type );
++        else
++            MESSAGE( "PW_EXCEPTION32 candidate query failed addr=%08lx error=%lu\n",
++                     ctx->Edi, GetLastError() );
++
++        if (ReadProcessMemory( GetCurrentProcess(), (const void *)(ULONG_PTR)ctx->Edi,
++                               candidate, sizeof(candidate), &candidate_size ))
++            MESSAGE( "PW_EXCEPTION32 candidate bytes=%lu vtable=%08lx word1=%08lx word2=%08lx word3=%08lx\n",
++                     (ULONG)candidate_size, candidate[0], candidate[1], candidate[2], candidate[3] );
++        else
++            MESSAGE( "PW_EXCEPTION32 candidate read failed addr=%08lx error=%lu\n",
++                     ctx->Edi, GetLastError() );
++    }
+ }
+ #endif
+
+-- 
+2.39.5

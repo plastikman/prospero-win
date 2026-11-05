@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Subject: [PATCH] ntdll: Do not close the pipe the server reads requests from.
+
+No thread this process creates has ever worked. Every one reaches
+"thread registered" in server_init_thread, hangs in its first server
+call, and is killed:
+
+    wineserver: protocol error 0028: read: Bad file descriptor
+    wineserver: kill_thread 0028 exit=1 violent=1 from fatal_protocol_error+0xcf
+
+EBADF, on the server's read of the new thread's request pipe. The client
+closed it.
+
+create_server_thread makes the pipe, hands the read end to the server
+with wine_server_send_fd, names it in new_thread, and then closes it --
+which is right where SCM_RIGHTS duplicated it into the receiver, because
+the client's copy is then spent. Here nothing is duplicated: dup is EPERM
+for every kind of descriptor on this console, so wine_server_send_fd
+passes the descriptor's number and the in-process server, sharing this
+descriptor table, reads that very fd. Closing it shuts the pipe the
+server is about to read.
+
+So the server reads EBADF on the first request the thread sends, calls it
+a protocol error, and kills the thread. The thread never finishes
+init_thread, never reaches wow64, never runs one guest instruction -- and
+winmm, waiting on {ready event, thread handle} for a thread the server
+has already executed, waits forever. That is GTA IV's black screen, and
+it is why no second thread has ever appeared in a session log.
+
+The same hazard is guarded twice already, with the reasoning spelled out
+both times: server_init_thread's close of the reply pipe, and the server's
+own close of this pipe's other end in create_thread. This was the third
+and it was missed.
+
+⚠ Closed only when the server refused the thread, where nobody owns the
+descriptor. Otherwise it belongs to the server until the thread dies.
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index e5e20741c4..34421f9e84 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1296,7 +1296,33 @@ static NTSTATUS create_server_thread( HANDLE *handle, struct thread_data **data_
+             *handle = wine_server_ptr_handle( reply->handle );
+             tid = reply->tid;
+         }
++#ifdef __PROSPERO__
++        /* ⚠ Handed over, not duplicated. wine_server_send_fd passes this
++         * descriptor's number and nothing else -- a descriptor cannot be
++         * duplicated into the receiver here, dup is EPERM for every kind of
++         * descriptor on this console -- and the in-process server shares this
++         * descriptor table, so it reads this very fd. Closing it is closing
++         * the pipe the server reads the new thread's requests from, and the
++         * server's first read of it returns EBADF:
++         *
++         *     wineserver: protocol error 0028: read: Bad file descriptor
++         *     wineserver: kill_thread 0028 exit=1 violent=1
++         *                 from fatal_protocol_error+0xcf
++         *
++         * -- so every secondary thread this process has ever created was
++         * killed before it finished init_thread, which is why none has ever
++         * run a guest instruction, why no second thread has appeared in a log,
++         * and why GTA IV hangs forever on the winmm devices thread it is
++         * waiting for. The same hazard is already guarded in
++         * server_init_thread (the reply pipe) and in the server's own
++         * create_thread (the other end of this one); this was the third.
++         *
++         * Only close it when the server refused the thread, where nobody owns
++         * it; otherwise it belongs to the server until the thread dies. */
++        if (status) close( request_pipe[0] );
++#else
+         close( request_pipe[0] );
++#endif
+     }
+     SERVER_END_REQ;
+ 

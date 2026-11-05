@@ -1,0 +1,15 @@
+2026-11-05T12:09:19-08:00 applied archive 0878 (headless surface on PS4) to build/wine-ps5/source and .deps/wine-host/source; recorded as series 1036
+2026-11-05T12:17:06-08:00 applied archive 0962-kernelbase-log-x86-exception-context.patch to .deps/wine-host/source; recorded as series 1037-kernelbase-log-x86-exception-context.patch
+2026-11-05T12:17:06-08:00 applied archive 0963-kernelbase-log-faulting-object-memory.patch to .deps/wine-host/source; recorded as series 1038-kernelbase-log-faulting-object-memory.patch
+2026-11-05T12:17:06-08:00 applied archive 0964-kernelbase-log-x86-candidate-object.patch to .deps/wine-host/source; recorded as series 1039-kernelbase-log-x86-candidate-object.patch
+2026-11-05T12:17:06-08:00 applied archive 0965-kernelbase-log-x86-faulting-pc-page.patch to .deps/wine-host/source; recorded as series 1040-kernelbase-log-x86-faulting-pc-page.patch
+2026-11-05T12:17:06-08:00 applied archive 0973-kernelbase-log-x86-fault-buffer-and-frames.patch to .deps/wine-host/source; recorded as series 1041-kernelbase-log-x86-fault-buffer-and-frames.patch
+2026-11-05T12:17:06-08:00 applied archive 1013-kernelbase-snapshot-early-x86-fault-object.patch to .deps/wine-host/source; recorded as series 1042-kernelbase-snapshot-early-x86-fault-object.patch
+2026-11-05T12:18:07-08:00 added fault-page record (from archive 1007) as series 1043-kernelbase-log-x86-fault-page.patch
+2026-11-05T12:40:14-08:00 applied archive 0866 (keep server request pipe) to both trees; recorded as series 1044
+2026-11-05T12:52:19-08:00 applied archive 0861-win32u-the-display-is-the-surface-not-the-window.patch to both trees; recorded as series 1045-win32u-the-display-is-the-surface-not-the-window.patch
+2026-11-05T12:52:19-08:00 applied archive 0862-win32u-the-scanout-is-1920x1080-not-any-size.patch to both trees; recorded as series 1046-win32u-the-scanout-is-1920x1080-not-any-size.patch
+2026-11-05T12:52:19-08:00 applied archive 0901-win32u-ps5-compose-windows-in-z-order.patch to both trees; recorded as series 1047-win32u-ps5-compose-windows-in-z-order.patch
+2026-11-05T12:52:19-08:00 applied archive 0902-win32u-ps5-keep-the-pixels-a-window-above-owns.patch to both trees; recorded as series 1048-win32u-ps5-keep-the-pixels-a-window-above-owns.patch
+2026-11-05T12:52:19-08:00 applied archive 0740-win32u-ps5-vulkan-hardware-cursor.patch to both trees; recorded as series 1049-win32u-ps5-vulkan-hardware-cursor.patch
+2026-11-05T12:53:03-08:00 reverted 1049 (archive 0740): superseded by upstream ps5drv_vulkan_cursor (redefinition)

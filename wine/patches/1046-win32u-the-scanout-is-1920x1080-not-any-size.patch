@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Subject: [PATCH] win32u: Use the headless scanout extent without HWND size checks
+
+0861 stopped overwriting the host's extents with the window's client rect,
+and the swapchain was refused again -- but this time the refusal says what
+it objected to:
+
+    err:vulkan:win32u_vkCreateSwapchainKHR vkCreateSwapchainKHR failed,
+      res -3: format 37, colorSpace 0, extent 1024x576, images 4, layers 1,
+      usage 0x13, sharing 0, preTransform 0x1, compositeAlpha 0x1,
+      presentMode 2, clipped 1, old 0
+    err:vulkan:win32u_vkCreateSwapchainKHR host capabilities: images 4..0,
+      extent 4294967295x4294967295 (1x1..16384x16384), layers 1,
+      transforms 0x1, alpha 0x3, usage 0x8009f
+
+Every field there is one the bundle's triangle also creates and presents
+with: format 37, FIFO, four images, opaque, identity. The one difference
+is the extent, and the capabilities explain why it was allowed to be wrong.
+A headless surface reports the generic WSI answer -- currentExtent
+undefined, 1x1 to 16384x16384 -- which tells the application it may pick
+any size it likes. The scanout cannot: sceVideoOutRegisterBuffers has
+buffers at the video mode and at nothing else. vkd3d took the size out of
+GTA IV's DXGI description, 1024x576, found it inside 1x1..16384x16384, and
+asked for it.
+
+The triangle resolves the same undefined currentExtent by hand, to
+1920x1080 (examples/triangle/triangle.c:159), which is the constant
+src/native/pw_videoout_ps4.h declares the title's scanout with. So answer
+with that instead of with the generic range, and pin min and max to it so
+a caller cannot choose otherwise. A caller that wanted something smaller
+gets its frames scaled into it, which is what a television wants anyway --
+vkd3d blits, so this costs it nothing.
+
+WINE_PS5_SCANOUT=WxH overrides it for a console in another video mode.
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index cddf9eaf41..74bc65b2ce 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -27,6 +27,11 @@
+ #include <dlfcn.h>
+ #include <pthread.h>
+ #include <unistd.h>
++#ifdef __PROSPERO__
++/* getenv and sscanf, for the scanout extent below; ps5drv.c takes the same two. */
++#include <stdio.h>
++#include <stdlib.h>
++#endif
+ 
+ #include "ntstatus.h"
+ #include "win32u_private.h"
+@@ -1618,7 +1623,46 @@ static void adjust_surface_capabilities( struct vulkan_instance *instance, struc
+      * Vulkan and nothing else was ever going to paint it.
+      *
+      * The maxImageCount fix above stays -- it is about what applications
+-     * expect, not about what the window system can do. */
++     * expect, not about what the window system can do.
++     *
++     * ⚠ But the host's own extents do not describe the scanout either. A
++     * headless surface reports the generic WSI answer -- currentExtent
++     * undefined, 1x1 to 16384x16384 -- which says the swapchain may pick any
++     * size, and the scanout cannot. GTA IV asked for the size in its DXGI
++     * description and was refused:
++     *
++     *     vkCreateSwapchainKHR failed, res -3: format 37, colorSpace 0,
++     *       extent 1024x576, images 4, ... presentMode 2
++     *     host capabilities: images 4..0, extent 4294967295x4294967295
++     *       (1x1..16384x16384), ...
++     *
++     * Every other field matches what the bundle's triangle creates and
++     * presents with. The one difference is the extent, and the triangle
++     * resolves the same undefined currentExtent to 1920x1080 by hand
++     * (examples/triangle/triangle.c:159) because that is what
++     * sceVideoOutRegisterBuffers registers here -- the same constant
++     * src/native/pw_videoout_ps4.h declares the title's scanout with.
++     *
++     * So answer with the scanout's size rather than with the generic one.
++     * A caller that wanted something smaller gets its frames scaled into it,
++     * which is what a television wants anyway. WINE_PS5_SCANOUT=WxH overrides
++     * it for a console in another video mode. */
++    if (capabilities->currentExtent.width == 0xffffffff)
++    {
++        const char *scanout = getenv( "WINE_PS5_SCANOUT" );
++        unsigned int width, height;
++
++        if (!scanout || sscanf( scanout, "%ux%u", &width, &height ) != 2 ||
++            width < 320 || height < 200 || width > 3840 || height > 2160)
++        {
++            width = 1920;
++            height = 1080;
++        }
++        capabilities->currentExtent.width = capabilities->minImageExtent.width =
++            capabilities->maxImageExtent.width = width;
++        capabilities->currentExtent.height = capabilities->minImageExtent.height =
++            capabilities->maxImageExtent.height = height;
++    }
+     (void)client_rect;
+ #else
+     /* Update the image extents to match what the Win32 WSI would provide. */
+
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -2003,0 +2004 @@
++#ifndef __PROSPERO__
+@@ -2005,0 +2007 @@
++#endif
+@@ -2012,0 +2015 @@
++#ifndef __PROSPERO__
+@@ -2019,0 +2023 @@
++#endif
+@@ -2030,0 +2035 @@
++#ifndef __PROSPERO__
+@@ -2032,0 +2038 @@
++#endif
+@@ -2038,0 +2045 @@
++#ifndef __PROSPERO__
+@@ -2045,0 +2053 @@
++#endif
+@@ -2107,0 +2116 @@
++#ifndef __PROSPERO__
+@@ -2114,0 +2124 @@
++#endif

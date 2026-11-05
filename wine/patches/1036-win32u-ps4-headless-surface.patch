@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Subject: [PATCH] win32u: A headless surface on ps4.
+
+This console's RADV offers VK_EXT_headless_surface and not VK_KHR_display.
+win32u enumerates the host's instance extensions and the list has the
+first and not the second, so mapping VK_KHR_win32_surface to display left
+the host instance with no surface extension at all, every surface entry
+point unresolved, and vkCreateInstance refused:
+
+    convert_instance_create_info Enabling 4 host instance extensions
+      VK_KHR_external_fence_capabilities ... get_physical_device_properties2
+    win32u_vkCreateInstance Instance proc vkCreateHeadlessSurfaceEXT not found.
+    win32u_vkCreateInstance Instance proc vkCreateDisplayPlaneSurfaceKHR not found.
+    err:   DxvkInstance::createInstance: Failed to create Vulkan instance
+
+which is where GTA IV stops: DXVK gives up on the instance, the game
+prints to a console with no conhost behind it and calls raise(22).
+
+Map to headless instead, and create the surface with
+vkCreateHeadlessSurfaceEXT -- no display to enumerate and no mode to
+choose. The bundle's own triangle example reaches the screen this way,
+with sceVideoOutSubmitFlip doing the flip, so it is the path this
+hardware has. Wine's own headless driver does the same two things
+(win32u/vulkan.c:2988 and :2998), which is what this arm follows.
+
+The PS5 arm is untouched: ps5vk has VK_KHR_display and waits for the
+swapchain before opening the video output, which the display-plane path
+is written around.
+diff --git a/dlls/win32u/ps5drv.c b/dlls/win32u/ps5drv.c
+index 9c4ab5b247..197e3950d8 100644
+--- a/dlls/win32u/ps5drv.c
++++ b/dlls/win32u/ps5drv.c
+@@ -787,6 +787,24 @@ static int (*release_display)(void);
+ static VkResult ps5_vulkan_surface_create( struct client_surface *client, const struct vulkan_instance *instance,
+                                            VkSurfaceKHR *handle )
+ {
++#ifdef __PROSPERO__
++    /* The headless surface this console's driver has; see
++     * ps5_map_instance_extensions. No display to enumerate and no mode to
++     * choose -- the swapchain's images are what the title flips. */
++    {
++        VkHeadlessSurfaceCreateInfoEXT headless = {.sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT};
++        VkResult res;
++
++        if (release_display && release_display())
++        {
++            ERR( "the title kept the video output\n" );
++            return VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
++        }
++        res = instance->p_vkCreateHeadlessSurfaceEXT( instance->host.instance, &headless, NULL, handle );
++        if (res < VK_SUCCESS) ERR( "headless surface: res %d\n", res );
++        return res;
++    }
++#else
+     VkDisplaySurfaceCreateInfoKHR info = {.sType = VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR};
+     VkDisplayModePropertiesKHR modes[16];
+     VkDisplayPropertiesKHR display;
+@@ -840,6 +858,7 @@ static VkResult ps5_vulkan_surface_create( struct client_surface *client, const
+ failed:
+     ERR( "no host display (%u found), res %d\n", count, res );
+     return res < VK_SUCCESS ? res : VK_ERROR_INITIALIZATION_FAILED;
++#endif
+ }
+ 
+ static VkBool32 ps5_get_physical_device_presentation_support( struct vulkan_physical_device *physical_device,
+@@ -850,8 +869,30 @@ static VkBool32 ps5_get_physical_device_presentation_support( struct vulkan_phys
+ 
+ static void ps5_map_instance_extensions( struct vulkan_instance_extensions *extensions )
+ {
++#ifdef __PROSPERO__
++    /* ⚠ Headless, not display planes. This console's RADV offers
++     * VK_EXT_headless_surface and not VK_KHR_display -- win32u enumerated the
++     * host's instance extensions and the list has the first and not the second
++     * -- so asking for display left the host instance with no surface
++     * extension at all, every surface entry point unresolved, and
++     * vkCreateInstance refused:
++     *
++     *     convert_instance_create_info Enabling 4 host instance extensions
++     *       VK_KHR_external_fence_capabilities ... get_physical_device_properties2
++     *     win32u_vkCreateInstance Instance proc vkCreateHeadlessSurfaceEXT not found.
++     *     win32u_vkCreateInstance Instance proc vkCreateDisplayPlaneSurfaceKHR not found.
++     *     err: DxvkInstance::createInstance: Failed to create Vulkan instance
++     *
++     * The bundle's own triangle example reaches the screen this way --
++     * vkCreateHeadlessSurfaceEXT, a swapchain, vkQueuePresentKHR, and
++     * sceVideoOutSubmitFlip for the flip -- so it is the path this hardware
++     * actually has. */
++    if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_EXT_headless_surface = 1;
++    if (extensions->has_VK_EXT_headless_surface) extensions->has_VK_KHR_win32_surface = 1;
++#else
+     if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_KHR_display = 1;
+     if (extensions->has_VK_KHR_display) extensions->has_VK_KHR_win32_surface = 1;
++#endif
+ }
+ 
+ static void ps5_map_device_extensions( struct vulkan_device_extensions *extensions )

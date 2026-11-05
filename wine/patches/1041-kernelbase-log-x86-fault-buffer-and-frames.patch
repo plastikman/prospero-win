@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 22 Oct 2026 00:00:00 -0700
+Subject: [PATCH] kernelbase: log x86 fault buffer and frame chain on PS4
+
+The Titan Quest fault occurs while Engine.dll reads fields from a pointer
+returned by malloc during GetAdaptersAddresses enumeration. Record that
+pointer's virtual-memory state and expected structure fields, plus a bounded
+EBP chain, at Wine's unhandled-exception path.
+---
+diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
+index de65267209..0faa21b82b 100644
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -571,6 +571,55 @@ static void log_exception_context32( const EXCEPTION_POINTERS *ptr )
+                      ctx->Eip, GetLastError() );
+     }
+ 
++    {
++        MEMORY_BASIC_INFORMATION info;
++        DWORD data[18] = {0};
++        SIZE_T query_size, data_size = 0;
++        const void *object = (const void *)(ULONG_PTR)ctx->Eax;
++        ULONG_PTR fault = ptr->ExceptionRecord->NumberParameters > 1 ?
++                          ptr->ExceptionRecord->ExceptionInformation[1] : 0;
++
++        query_size = VirtualQuery( object, &info, sizeof(info) );
++        if (query_size)
++            MESSAGE( "PW_EXCEPTION32 eax-page eax=%08lx fault=%p query=%lu base=%p alloc=%p size=%lu state=%08lx protect=%08lx type=%08lx\n",
++                     ctx->Eax, (void *)fault, (ULONG)query_size, info.BaseAddress,
++                     info.AllocationBase, (ULONG)info.RegionSize, info.State,
++                     info.Protect, info.Type );
++        else
++            MESSAGE( "PW_EXCEPTION32 eax-page query failed eax=%08lx fault=%p error=%lu\n",
++                     ctx->Eax, (void *)fault, GetLastError() );
++
++        if (ReadProcessMemory( GetCurrentProcess(), object, data, sizeof(data), &data_size ))
++            MESSAGE( "PW_EXCEPTION32 eax-data eax=%08lx bytes=%lu field10=%08lx field40=%08lx field44=%08lx\n",
++                     ctx->Eax, (ULONG)data_size, data[4], data[16], data[17] );
++        else
++            MESSAGE( "PW_EXCEPTION32 eax-data read failed eax=%08lx error=%lu\n",
++                     ctx->Eax, GetLastError() );
++    }
++
++    {
++        DWORD frame[2];
++        DWORD frame_pointer = ctx->Ebp;
++        unsigned int depth;
++
++        for (depth = 0; depth < 8; ++depth)
++        {
++            SIZE_T frame_size = 0;
++            if (frame_pointer < ctx->Esp || frame_pointer - ctx->Esp > 0x10000) break;
++            if (!ReadProcessMemory( GetCurrentProcess(), (const void *)(ULONG_PTR)frame_pointer,
++                                    frame, sizeof(frame), &frame_size ) || frame_size != sizeof(frame))
++            {
++                MESSAGE( "PW_EXCEPTION32 frame read failed depth=%u ebp=%08lx error=%lu\n",
++                         depth, frame_pointer, GetLastError() );
++                break;
++            }
++            MESSAGE( "PW_EXCEPTION32 frame depth=%u ebp=%08lx saved=%08lx return=%08lx\n",
++                     depth, frame_pointer, frame[0], frame[1] );
++            if (frame[0] <= frame_pointer || frame[0] - frame_pointer > 0x10000) break;
++            frame_pointer = frame[0];
++        }
++    }
++
+     {
+         MEMORY_BASIC_INFORMATION info;
+         DWORD object[2] = {0};

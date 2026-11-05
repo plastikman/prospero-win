@@ -1122,6 +1122,7 @@ int main(int argc, char **argv)
     (void)pw_wine_launch_parse(argc, argv, catalog, catalog_count, &launch);
     (void)pw_diagnostics_open(library_root, PW_BUILD_ID,
                               launch.app ? launch.app->id : "launcher", launch.cycle);
+    PS5LOG_LOG("PW_WINE64 build_marker=20261105-native-frame-state app_prx=resolver-diagnostic-0204");
     PS5LOG_LOG("PW_WINE64 args argc=%d mode=%s profile=%s cycle=%u refused=%u", argc,
                launch.mode == PW_WINE_LAUNCH_GAME ? "game" : "launcher",
                launch.app ? launch.app->id : "-", (unsigned)launch.cycle, launch.refused);
