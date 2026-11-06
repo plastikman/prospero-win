@@ -1,0 +1,32 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] ws2_32: route PS4 gethostbyname through the native resolver shim (archive 0988).
+
+Archive 0988 unchanged. It was on the network port list beside 0979 and 0989 but was
+not carried over. Titan Quest asks for its own host name at start; without it the
+game shows a network warning.
+diff --git a/dlls/ws2_32/unixlib.c b/dlls/ws2_32/unixlib.c
+--- a/dlls/ws2_32/unixlib.c
++++ b/dlls/ws2_32/unixlib.c
+@@ -64,6 +64,10 @@
+ #endif
+ #include <poll.h>
+ 
++#ifdef PW_PS4_DNS
++extern struct hostent *pw_ps4_gethostbyname( const char *name );
++#endif
++
+ #ifdef HAVE_NETIPX_IPX_H
+ # include <netipx/ipx.h>
+ # define HAS_IPX
+@@ -1023,7 +1027,11 @@ static NTSTATUS unix_gethostbyname( void *args )
+ 
+     pthread_mutex_lock( &host_mutex );
+ 
++#ifdef PW_PS4_DNS
++    if (!(unix_host = pw_ps4_gethostbyname( params->name )))
++#else
+     if (!(unix_host = gethostbyname( params->name )))
++#endif
+     {
+         ret = (h_errno < 0 ? errno_from_unix( errno ) : host_errno_from_unix( h_errno ));
+         pthread_mutex_unlock( &host_mutex );

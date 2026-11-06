@@ -1,0 +1,61 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] server: PS4 sockets take non-blocking mode through SO_NBIO.
+
+FIONBIO and fcntl(O_NONBLOCK) are refused on this console, so server sockets
+stayed blocking and a connect() to an unreachable host held the in-process
+server for the 75 s TCP timeout: Titan Quest froze every Wine thread at start
+(2026-11-06, 01.26). Try Sony's SO_NBIO socket option (0x1200 at SOL_SOCKET)
+and report once which method worked for a socket. wine-ps5 tree only: the
+wine-host server has no PS4 non-blocking code. New code, LGPL-2.1-or-later.
+---
+diff --git a/server/fd.c b/server/fd.c
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -27,6 +27,7 @@
+ #include <fcntl.h>
+ #ifdef __PROSPERO__
+ #include <sys/ioctl.h>
++#include <sys/socket.h>
+ #endif
+ #include <limits.h>
+ #include <signal.h>
+@@ -2502,11 +2503,37 @@
+ int pw_set_nonblocking( int fd )
+ {
+ #ifdef __PROSPERO__
+-    static int reported;
+-    int on = 1;
++    static int reported, socket_reported;
++    int on = 1, ioctl_errno, fcntl_errno, type;
++    socklen_t type_len = sizeof(type);
+ 
+     if (!ioctl( fd, FIONBIO, &on )) return 0;
++    ioctl_errno = errno;
+     if (!fcntl( fd, F_SETFL, O_NONBLOCK )) return 0;
++    fcntl_errno = errno;
++    /* ⚠ A socket left blocking stalls the whole in-process server: Titan Quest's
++     * non-blocking connect to an unreachable host ran connect() on the server
++     * thread for the 75 s TCP timeout, and every Wine thread, audio included,
++     * waited with it (2026-11-06, 01.26). Sony's sockets take non-blocking mode
++     * as a socket option, SO_NBIO (0x1200 at SOL_SOCKET), which is how
++     * sceNetSetsockopt does it. Say once which way worked for a socket. */
++    if (!getsockopt( fd, SOL_SOCKET, SO_TYPE, &type, &type_len ))
++    {
++        int rc = setsockopt( fd, SOL_SOCKET, 0x1200 /* SO_NBIO */, &on, sizeof(on) );
++        int nbio_errno = rc ? errno : 0;
++        if (!socket_reported++)
++        {
++            extern int sceKernelDebugOutText( int channel, const char *text );
++            char line[192];
++            snprintf( line, sizeof(line),
++                      "wineserver: socket non-blocking: FIONBIO errno %d, fcntl errno %d, "
++                      "SO_NBIO %s (errno %d)\n", ioctl_errno, fcntl_errno,
++                      rc ? "failed" : "ok", nbio_errno );
++            sceKernelDebugOutText( 0, line );
++        }
++        if (!rc) return 0;
++    }
++    errno = fcntl_errno;
+     if (!reported++)
+     {
+         extern int sceKernelDebugOutText( int channel, const char *text );

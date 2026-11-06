@@ -73,6 +73,29 @@ static struct timeval to_timeval(const struct timespec *t)
 {
     struct timeval v={t->tv_sec,(long)(t->tv_nsec/1000)};return v;
 }
+#ifdef __PS4__
+/* ⚠ PS4: NOT libc's futimes. The SDK's static libc implements futimes() on top
+ * of futimens(), and futimens() is this file's pw_compat_futimens(), which
+ * calls futimes(): every call with explicit times recursed until the stack
+ * ran out. Titan Quest set its new character files' times on Create and its
+ * main thread ran down through its own thread data (rsp 0xfffffff40) and
+ * wedged -- a black screen since ABI-v3 (2026-11-06; frame chain of repeated
+ * futimes returns, series 1071). libkernel's futimes is the real system call
+ * wrapper; 0x2001 is libkernel's module handle. */
+extern int sceKernelDlsym(int handle,const char *symbol,void **address);
+static int pw_kernel_futimes(int fd,const struct timeval values[2])
+{
+    static int (*kernel_futimes)(int,const struct timeval *);
+    if(!kernel_futimes) {
+        void *address=NULL;
+        if(sceKernelDlsym(0x2001,"futimes",&address) || !address){errno=ENOSYS;return -1;}
+        kernel_futimes=(int (*)(int,const struct timeval *))address;
+    }
+    return kernel_futimes(fd,values);
+}
+#define futimes pw_kernel_futimes
+#endif
+
 int pw_compat_futimens(int fd,const struct timespec times[2])
 {
     if(!times)return futimes(fd,NULL);

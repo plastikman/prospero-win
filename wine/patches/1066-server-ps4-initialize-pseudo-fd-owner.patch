@@ -1,0 +1,22 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] server: initialize the owner of pseudo fds (archive 0972).
+
+Archive 0972 unchanged. Missed in the ABI-v4 port: the content audit matched its one
+added line against the identical one in alloc_fd_object(). Without it fd_destroy()
+releases the 0x55 poison as a borrowed owner: Titan Quest crashed the in-process
+wineserver at release_object+0x13 (SIGBUS) from async_destroy on 01.23 (2026-11-06).
+---
+diff --git a/server/fd.c b/server/fd.c
+index 0000000000..0000000000 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -1842,6 +1842,7 @@ struct fd *alloc_pseudo_fd( const struct fd_ops *fd_user_ops, struct object *user, unsigned int options )
+     fd->nt_name    = NULL;
+     fd->nt_namelen = 0;
+     fd->unix_fd    = -1;
++    fd->fd_owner   = NULL;
+     fd->cacheable  = 0;
+     fd->fs_locks   = 0;
+     fd->poll_index = -1;
+-- 
+2.43.0
