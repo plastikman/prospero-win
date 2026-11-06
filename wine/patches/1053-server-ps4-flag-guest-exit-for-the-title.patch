@@ -1,0 +1,41 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] server: let the PS4 title return to its launcher when the last guest process exits.
+
+Replaces archive 1030 / ABI-v3 0112, which reported through stderr; fd 2
+capture fails on PS4, so that report never reached the title.
+---
+--- a/server/request.c	2026-11-05 14:10:47.588150782 -0800
++++ b/server/request.c	2026-11-05 14:10:47.600150900 -0800
+@@ -1538,12 +1538,32 @@
+     close( fd );
+ }
+ 
++#ifdef WINE_INPROCESS_SERVER
++/* ⚠ The in-process server cannot exit when its last guest process ends: it is
++ * a thread of the PS4 title, and exit() would end the title. Without a signal
++ * the title keeps showing Wine's empty desktop after a game's own Quit, and the
++ * player has to close the whole app from the PS button. Raise a flag instead;
++ * the title polls it (pw_wineserver_guest_exit_pending, exported in the
++ * wineserver PRX descriptor) and restarts into its launcher.
++ *
++ * Not through stderr (archive 1030 / ABI-v3 0112): fd 1/2 capture fails on
++ * this console (dup2 onto 1 or 2 is EPERM), so a message on fd 2 never
++ * reaches the title. */
++static int guest_exit_pending;
++
++__attribute__((visibility("default"))) int pw_wineserver_guest_exit_pending( void )
++{
++    return __atomic_exchange_n( &guest_exit_pending, 0, __ATOMIC_ACQ_REL );
++}
++#endif
++
+ /* master socket timer expiration handler */
+ static void close_socket_timeout( void *arg )
+ {
+     master_timeout = NULL;
+     flush_registry();
+ #ifdef WINE_INPROCESS_SERVER
++    __atomic_store_n( &guest_exit_pending, 1, __ATOMIC_RELEASE );
+     return;  /* exiting would end the process that hosts the server */
+ #endif
+     if (debug_level) fprintf( stderr, "wineserver: exiting (pid=%ld)\n", (long) getpid() );

@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Subject: [PATCH] win32u: ps5: A surface is its window's size again.
+
+1045 answered every surface's capabilities with the scan-out's size
+(1920x1080), because RADV's wsi_orbis could only register buffers of
+that size and refused any other swapchain. That kept DXVK titles on
+screen, but a GL title that draws at its window's size -- WON Half-Life
+under Zink, a 640x480 window -- rendered into one corner of a 1920x1080
+image while the display showed the whole image (2026-11-05, 01.11).
+
+Mesa 0039 lets wsi_orbis take a swapchain of any size and fit it to the
+screen (aspect kept, centred, black bars). So answer as upstream does: the
+window's client rect, clamped to the scan-out. A window with no usable
+size still gets the scan-out's. WINE_PS5_SURFACE_EXTENT=scanout restores
+the forced extent for an A/B.
+
+The SUBOPTIMAL-on-resize checks stay compiled out on PROSPERO.
+---
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -1650,6 +1650,7 @@
+     if (capabilities->currentExtent.width == 0xffffffff)
+     {
+         const char *scanout = getenv( "WINE_PS5_SCANOUT" );
++        const char *mode = getenv( "WINE_PS5_SURFACE_EXTENT" );
+         unsigned int width, height;
+ 
+         if (!scanout || sscanf( scanout, "%ux%u", &width, &height ) != 2 ||
+@@ -1658,12 +1659,24 @@
+             width = 1920;
+             height = 1080;
+         }
++        /* ⚠ THE WINDOW'S OWN SIZE, NOT THE SCREEN'S (2026-11-05, 1054). Forcing every surface to the
++         * scan-out made a GL title that draws at its window size (WON Half-Life, 640x480 under Zink)
++         * render into one corner of a 1920x1080 image. RADV's wsi_orbis now fits a swapchain of any
++         * size to the screen (Mesa 0039), so this answers as upstream does: the client rect, clamped
++         * to the scan-out. A window with no usable size still gets the scan-out.
++         * WINE_PS5_SURFACE_EXTENT=scanout restores the forced extent for an A/B. */
++        if (!(mode && !strcmp( mode, "scanout" )) &&
++            get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ) &&
++            client_rect.right > 0 && client_rect.bottom > 0)
++        {
++            width = min( width, (unsigned int)client_rect.right );
++            height = min( height, (unsigned int)client_rect.bottom );
++        }
+         capabilities->currentExtent.width = capabilities->minImageExtent.width =
+             capabilities->maxImageExtent.width = width;
+         capabilities->currentExtent.height = capabilities->minImageExtent.height =
+             capabilities->maxImageExtent.height = height;
+     }
+-    (void)client_rect;
+ #else
+     /* Update the image extents to match what the Win32 WSI would provide. */
+     /* FIXME: handle DPI scaling, somehow */

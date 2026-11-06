@@ -17,3 +17,5 @@
 2026-11-05T13:59:23-08:00 applied archive 0749 (debug output from a non-Wine thread) to both trees; series 1050
 2026-11-05T13:59:49-08:00 applied archive 0860-dxgi-a-swapchain-without-a-window.patch to wine-host tree; series 1051-dxgi-a-swapchain-without-a-window.patch
 2026-11-05T13:59:49-08:00 applied archive 0879-dcomp-a-device-that-exists.patch to wine-host tree; series 1052-dcomp-a-device-that-exists.patch
+2026-11-05T15:04:10-08:00 applied 1054 (win32u: surface extent = client rect clamped to scan-out; pairs with Mesa 0039) to both trees; series 1054-win32u-ps5-a-surface-is-its-windows-size.patch
+2026-11-05T15:13:45-08:00 applied 1053 (server: flag guest exit for the title; replaces archive 1030 / ABI-v3 0112) to both trees; launcher polls it in native/wine64_main.c; wineserver export added in ps4-gladius scripts/prx-ps4.sh

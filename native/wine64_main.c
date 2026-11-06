@@ -1874,6 +1874,27 @@ int main(int argc, char **argv)
         }
         if (!presented) usleep(PW_WINE64_TICK_US);
 
+        /* A game's own Quit / Exit to Desktop: the in-process wineserver
+         * flags when its last guest process has exited (Wine series 1053).
+         * Return to the launcher instead of leaving Wine's empty desktop up
+         * until the player closes the app from the PS button. The server is
+         * loaded after the game starts, so resolve it lazily, about once a
+         * second, through ntdll's module registry. */
+        {
+            static int (*guest_exit_pending)(void);
+            static void *(*dl_sym)(void *, const char *);
+            if (!guest_exit_pending && tick % PW_WINE64_TICKS_PER_S == 0) {
+                if (!dl_sym) dl_sym = (void *(*)(void *, const char *))(uintptr_t)
+                                      pw_prx_lookup(start.descriptor, "pw_wine_dl_sym");
+                if (dl_sym) guest_exit_pending = (int (*)(void))(uintptr_t)
+                                      dl_sym(NULL, "pw_wineserver_guest_exit_pending");
+            }
+            if (guest_exit_pending && guest_exit_pending()) {
+                PS5LOG_LOG("PW_WINE64 guest processes ended: returning to launcher");
+                restart_title(NULL, launch.cycle + 1u, "guest-exit");
+            }
+        }
+
         /* Closing: Options+Create held for PW_WINE64_CLOSE_HOLD_S, or the
          * deadline, asks the game to close with Alt+F4; Wine's exit then
          * restarts the title (on_exit_report). A game that does not close
