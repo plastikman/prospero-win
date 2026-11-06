@@ -3,3 +3,70 @@ Subject: [PATCH] iphlpapi: loopback fallback when NSI is unavailable (archive 09
 
 Archive 0979 unchanged.
 ---
+--- a/dlls/iphlpapi/iphlpapi_main.c
++++ b/dlls/iphlpapi/iphlpapi_main.c
+@@ -1246,6 +1246,52 @@
+     return ERROR_SUCCESS;
+ }
+ 
++/* The PS4 Wine environment may not expose the NSI device even though the
++ * console itself has networking. Keep callers that enumerate adapters from
++ * receiving ERROR_FILE_NOT_FOUND by reporting the Windows loopback adapter.
++ * This does not claim that an external network interface is available. */
++static DWORD adapters_addresses_loopback( IP_ADAPTER_ADDRESSES **info, ULONG *count )
++{
++    static const char name[] = "orbis-loopback";
++    static const WCHAR description[] = L"Orbis Loopback";
++    static const WCHAR friendly[] = L"Orbis Loopback";
++    const SIZE_T name_size = sizeof(name);
++    const SIZE_T description_offset = (sizeof(name) + 1) & ~(SIZE_T)1;
++    const SIZE_T description_size = sizeof(description);
++    const SIZE_T friendly_size = sizeof(friendly);
++    IP_ADAPTER_ADDRESSES *aa;
++    char *ptr;
++
++    aa = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY,
++                    sizeof(*aa) + description_offset + description_size + friendly_size );
++    if (!aa) return ERROR_NOT_ENOUGH_MEMORY;
++
++    aa->Length = sizeof(*aa);
++    aa->IfIndex = 1;
++    aa->Ipv6IfIndex = 1;
++    aa->Mtu = 65536;
++    aa->IfType = IF_TYPE_SOFTWARE_LOOPBACK;
++    aa->OperStatus = IfOperStatusUp;
++    aa->AdapterName = ptr = (char *)(aa + 1);
++    memcpy( ptr, name, name_size );
++    ptr += description_offset;
++    aa->Description = (WCHAR *)ptr;
++    memcpy( ptr, description, description_size );
++    ptr += description_size;
++    aa->FriendlyName = (WCHAR *)ptr;
++    memcpy( ptr, friendly, friendly_size );
++    aa->DnsSuffix = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(WCHAR) );
++    if (!aa->DnsSuffix)
++    {
++        HeapFree( GetProcessHeap(), 0, aa );
++        return ERROR_NOT_ENOUGH_MEMORY;
++    }
++
++    *info = aa;
++    *count = 1;
++    return ERROR_SUCCESS;
++}
++
+ static DWORD adapters_addresses_alloc( ULONG family, ULONG flags, IP_ADAPTER_ADDRESSES **info, ULONG *count )
+ {
+     IP_ADAPTER_ADDRESSES *aa = NULL;
+@@ -1260,6 +1306,11 @@
+     err = NsiAllocateAndGetTable( 1, &NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE, (void **)&luids, sizeof(*luids),
+                                   (void **)&rw, sizeof(*rw), (void **)&dyn, sizeof(*dyn),
+                                   (void **)&stat, sizeof(*stat), count, 0 );
++    if (err == ERROR_FILE_NOT_FOUND)
++    {
++        MESSAGE( "GetAdaptersAddresses: PS4 NSI unavailable, returning loopback adapter\n" );
++        return adapters_addresses_loopback( info, count );
++    }
+     if (err) return err;
+ 
+     if (!*count)
