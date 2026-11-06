@@ -1,0 +1,76 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] ntdll: repair a PS4 exec page the kernel left R-- (archive 0966, with a cache bypass).
+
+Archive 0966 plus one line: ABI-v4's counted_mprotect skips an mprotect
+that matches its host_prot cache, and the cache says RX here, so the
+repair forgets the page's record first. Without it the repair is a no-op
+that logs ps4-rx-fault-unrepaired.
+---
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index b3f47069c1..4fe6d5bef0 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -5388,6 +5407,63 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+     vprot = get_host_page_vprot( page );
+     vm_stat_add( VM_STAT_FAULTS, 1 );
+ 
++#ifdef __PROSPERO__
++    /* Recover only when Wine already considers the faulting instruction page
++     * executable. A PS4 kernel mapping can remain R-- after an RX request;
++     * reapply Wine's page protection once and retry only after kernel verify. */
++    if ((uintptr_t)rec->ExceptionAddress == (uintptr_t)addr && (vprot & VPROT_EXEC))
++    {
++        struct ps4_virtual_query_info
++        {
++            void *start, *end;
++            int64_t offset;
++            int32_t protection, memory_type;
++            uint8_t flags;
++            char name[32];
++        } info;
++        extern int sceKernelVirtualQuery( const void *, int, void *, size_t );
++        extern int sceKernelDebugOutText( int, const char * );
++        static unsigned int rx_fault_count;
++        unsigned int attempt = __atomic_add_fetch( &rx_fault_count, 1, __ATOMIC_RELAXED );
++        int query_rc, protect_rc = -1, verify_rc = -1, effective = -1;
++
++        memset( &info, 0, sizeof(info) );
++        query_rc = sceKernelVirtualQuery( addr, 1, &info, sizeof(info) );
++        if (!query_rc && (info.protection & PROT_READ) && !(info.protection & PROT_EXEC))
++        {
++            /* ABI-v4 caches each host page's last protection and skips an
++             * mprotect that would not change it (counted_mprotect). Wine's
++             * record says RX here while the kernel says R--, so forget the
++             * record or this repair is skipped as a no-op. */
++            host_prot_record( page, host_page_size, 0 );
++            protect_rc = mprotect_range( page, host_page_size, 0, 0 );
++            memset( &info, 0, sizeof(info) );
++            verify_rc = sceKernelVirtualQuery( addr, 1, &info, sizeof(info) );
++            if (!verify_rc) effective = info.protection;
++            if (!verify_rc && (effective & PROT_EXEC))
++            {
++                if (attempt <= 32)
++                {
++                    char line[256];
++                    snprintf( line, sizeof(line),
++                              "ntdll ps4-rx-fault-recovered n=%u addr=%p page=%p wine-vprot=%#x protect=%d effective=%#x\n",
++                              attempt, addr, page, vprot, protect_rc, effective );
++                    sceKernelDebugOutText( 0, line );
++                }
++                ret = STATUS_SUCCESS;
++            }
++            else if (attempt <= 32)
++            {
++                char line[256];
++                snprintf( line, sizeof(line),
++                          "ntdll ps4-rx-fault-unrepaired n=%u addr=%p page=%p wine-vprot=%#x query=%d protect=%d verify=%d effective=%#x\n",
++                          attempt, addr, page, vprot, query_rc, protect_rc, verify_rc, effective );
++                sceKernelDebugOutText( 0, line );
++            }
++        }
++    }
++#endif
++
+ #ifdef __APPLE__
+     /* Rosetta on Apple Silicon misreports certain write faults as read faults. */
+     if (err == EXCEPTION_READ_FAULT && (get_unix_prot( vprot ) & PROT_READ))
