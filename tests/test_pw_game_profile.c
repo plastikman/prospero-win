@@ -382,6 +382,14 @@ static void test_presets(void)
         pw_game_input_init(&touch);
         assert(preset("[input]\nmode = xinput\nmouse = touchpad\ntouchpad = mouse_left\n", &touch) == PW_OK);
         assert(touch.mouse == PW_GAME_STICK_TOUCHPAD && touch.mode == PW_GAME_INPUT_XINPUT);
+        /* Without its own mouse_speed a touchpad pointer gets the touchpad default ... */
+        pw_game_input_default_mode(&touch);
+        assert(touch.mouse_speed == PW_GAME_TOUCH_SPEED_DEFAULT);
+        /* ... and with one, keeps it. */
+        pw_game_input_init(&touch);
+        assert(preset("[input]\nmouse = touchpad\nmouse_speed = 900\n", &touch) == PW_OK);
+        pw_game_input_default_mode(&touch);
+        assert(touch.mouse_speed == 900);
     }
 
     /* The profile's own lines override the preset, the rest stays. */

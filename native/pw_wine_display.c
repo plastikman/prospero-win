@@ -225,14 +225,19 @@ int pw_wine_touch_pointer_step(PwWinePointer *pointer, int down, uint16_t x, uin
     pointer->touch_down = down;
     if (!down) return 0;
     if (!was_down) {                      /* a new touch: no jump to it */
-        pointer->touch_x = x;
-        pointer->touch_y = y;
+        pointer->touch_x = (int32_t)x * 256;
+        pointer->touch_y = (int32_t)y * 256;
         return 0;
     }
-    pointer->x += ((int64_t)x - pointer->touch_x) * 65536 * speed / 1200;
-    pointer->y += ((int64_t)y - pointer->touch_y) * 65536 * speed / 1200;
-    pointer->touch_x = x;
-    pointer->touch_y = y;
+    {
+        /* Half way to the new sample: sample jitter made the pointer dart. */
+        int32_t sx = pointer->touch_x + ((int32_t)x * 256 - pointer->touch_x) / 2;
+        int32_t sy = pointer->touch_y + ((int32_t)y * 256 - pointer->touch_y) / 2;
+        pointer->x += ((int64_t)sx - pointer->touch_x) * 256 * speed / 1200;
+        pointer->y += ((int64_t)sy - pointer->touch_y) * 256 * speed / 1200;
+        pointer->touch_x = sx;
+        pointer->touch_y = sy;
+    }
     dx = pointer->x / 65536;
     dy = pointer->y / 65536;
     if (!dx && !dy) return 0;

@@ -637,7 +637,12 @@ void pw_game_input_overlay(PwGameInput *base, const PwGameInput *overrides)
 
 void pw_game_input_default_mode(PwGameInput *input)
 {
-    if (!input || (input->set & SET_MODE) || input->mouse != PW_GAME_STICK_NONE) return;
+    if (!input) return;
+    /* A touchpad pointer at the stick's speed crossed the screen in one swipe;
+     * 400 was "about right" in Half-Life 2's menus (2026-11-06). */
+    if (input->mouse == PW_GAME_STICK_TOUCHPAD && !(input->set & SET_SPEED))
+        input->mouse_speed = PW_GAME_TOUCH_SPEED_DEFAULT;
+    if ((input->set & SET_MODE) || input->mouse != PW_GAME_STICK_NONE) return;
     for (size_t i = 0; i < PW_GAME_BUTTON_COUNT; i++)
         if (input->bindings[i].kind != PW_GAME_BIND_UNSET) return;
     input->mode = PW_GAME_INPUT_XINPUT;

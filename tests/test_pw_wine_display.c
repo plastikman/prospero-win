@@ -115,26 +115,45 @@ static void test_inputs(void)
     assert(pw_wine_game_inputs(NULL, L1, 0, events, 8) == 0 && pw_wine_game_inputs(&input, L1, 0, NULL, 8) == 0);
 }
 
+static int touch_travel(PwWinePointer *pointer, uint16_t x, uint16_t y, uint32_t speed,
+                        int steps, int *total_y)
+{
+    PwWineInput move;
+    int total_x = 0;
+
+    *total_y = 0;
+    for (int i = 0; i < steps; i++)
+        if (pw_wine_touch_pointer_step(pointer, 1, x, y, speed, &move)) {
+            assert(move.type == PW_WINE_INPUT_MOUSE_MOVE && !move.code && !move.down);
+            total_x += move.x;
+            *total_y += move.y;
+        }
+    return total_x;
+}
+
 static void test_touch_pointer(void)
 {
     PwWinePointer pointer = { 0 };
     PwWineInput move;
+    int dy, dx;
 
     /* No finger, or a finger just put down: no motion, and no jump to it. */
     assert(!pw_wine_touch_pointer_step(&pointer, 0, 500, 500, 1200, &move));
     assert(!pw_wine_touch_pointer_step(&pointer, 1, 900, 300, 1200, &move));
-    /* Travel moves the pointer one pixel per unit at speed 1200 ... */
-    assert(pw_wine_touch_pointer_step(&pointer, 1, 910, 295, 1200, &move) == 1);
-    assert(move.type == PW_WINE_INPUT_MOUSE_MOVE && move.x == 10 && move.y == -5);
-    /* ... and scales linearly with the speed. */
-    assert(pw_wine_touch_pointer_step(&pointer, 1, 920, 295, 2400, &move) == 1);
-    assert(move.x == 20 && move.y == 0);
-    /* A finger held still moves nothing. */
-    assert(!pw_wine_touch_pointer_step(&pointer, 1, 920, 295, 1200, &move));
-    /* Lifted and put down elsewhere: again no jump. */
+    /* Smoothed: the first step goes half way, and holding there the pointer
+     * settles on the whole travel, one pixel per unit at speed 1200. */
+    assert(pw_wine_touch_pointer_step(&pointer, 1, 910, 296, 1200, &move) == 1);
+    assert(move.x == 5 && move.y == -2);
+    dx = 5 + touch_travel(&pointer, 910, 296, 1200, 20, &dy);
+    assert(dx >= 9 && dx <= 10 && dy - 2 >= -4 && dy - 2 <= -3);
+    /* The speed scales the travel linearly. */
+    dx = touch_travel(&pointer, 930, 296, 2400, 30, &dy);
+    assert(dx >= 39 && dx <= 40 && dy == 0);
+    /* Lifted and put down elsewhere: no jump. */
     assert(!pw_wine_touch_pointer_step(&pointer, 0, 0, 0, 1200, &move));
     assert(!pw_wine_touch_pointer_step(&pointer, 1, 100, 100, 1200, &move));
-    assert(pw_wine_touch_pointer_step(&pointer, 1, 101, 100, 1200, &move) == 1 && move.x == 1);
+    dx = touch_travel(&pointer, 100, 100, 1200, 5, &dy);
+    assert(dx == 0 && dy == 0);
 }
 
 static void test_pointer(void)
