@@ -115,9 +115,31 @@ static void test_inputs(void)
     assert(pw_wine_game_inputs(NULL, L1, 0, events, 8) == 0 && pw_wine_game_inputs(&input, L1, 0, NULL, 8) == 0);
 }
 
+static void test_touch_pointer(void)
+{
+    PwWinePointer pointer = { 0 };
+    PwWineInput move;
+
+    /* No finger, or a finger just put down: no motion, and no jump to it. */
+    assert(!pw_wine_touch_pointer_step(&pointer, 0, 500, 500, 1200, &move));
+    assert(!pw_wine_touch_pointer_step(&pointer, 1, 900, 300, 1200, &move));
+    /* Travel moves the pointer one pixel per unit at speed 1200 ... */
+    assert(pw_wine_touch_pointer_step(&pointer, 1, 910, 295, 1200, &move) == 1);
+    assert(move.type == PW_WINE_INPUT_MOUSE_MOVE && move.x == 10 && move.y == -5);
+    /* ... and scales linearly with the speed. */
+    assert(pw_wine_touch_pointer_step(&pointer, 1, 920, 295, 2400, &move) == 1);
+    assert(move.x == 20 && move.y == 0);
+    /* A finger held still moves nothing. */
+    assert(!pw_wine_touch_pointer_step(&pointer, 1, 920, 295, 1200, &move));
+    /* Lifted and put down elsewhere: again no jump. */
+    assert(!pw_wine_touch_pointer_step(&pointer, 0, 0, 0, 1200, &move));
+    assert(!pw_wine_touch_pointer_step(&pointer, 1, 100, 100, 1200, &move));
+    assert(pw_wine_touch_pointer_step(&pointer, 1, 101, 100, 1200, &move) == 1 && move.x == 1);
+}
+
 static void test_pointer(void)
 {
-    PwWinePointer pointer = { 0, 0 };
+    PwWinePointer pointer = { 0 };
     PwWineInput move;
 
     /* At rest and inside the dead zone nothing moves. */
@@ -143,7 +165,7 @@ static void test_pointer(void)
 
 static void test_pointer_fraction(void)
 {
-    PwWinePointer pointer = { 0, 0 };
+    PwWinePointer pointer = { 0 };
     PwWineInput move;
     int32_t right = 0, left = 0;
     int moves = 0;
@@ -159,7 +181,7 @@ static void test_pointer_fraction(void)
         }
     assert(right == 95 && moves == 95 && pointer.x > 0 && pointer.x < 65536);
     /* Left is the mirror image: the fraction rounds towards zero both ways. */
-    pointer = (PwWinePointer){ 0, 0 };
+    pointer = (PwWinePointer){ 0 };
     for (int i = 0; i < 100; i++)
         if (pw_wine_pointer_step(&pointer, 0x01, 0x80, 60, 16000, &move)) left += move.x;
     assert(left == -95 && pointer.x < 0 && pointer.x > -65536);
@@ -381,6 +403,7 @@ int main(void)
     test_threads();
     test_inputs();
     test_pointer();
+    test_touch_pointer();
     test_pointer_fraction();
     test_keyboard_stick();
     test_pad();

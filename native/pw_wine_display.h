@@ -89,7 +89,14 @@ int pw_wine_script_pad(PwWinePad *pad, int connected, const PwScriptPad *script,
  * against an edge still reaches it. */
 typedef struct PwWinePointer {
     int64_t x, y;
+    int touch_down;            /* a finger was on the touchpad last step */
+    int32_t touch_x, touch_y;  /* where, in touchpad units */
 } PwWinePointer;
+
+/* Move by a finger's travel on the touchpad since the last step (down=0: no
+ * finger). One touchpad unit is one pixel at speed 1200, scaled linearly. */
+int pw_wine_touch_pointer_step(PwWinePointer *pointer, int down, uint16_t x, uint16_t y,
+                               uint32_t speed, PwWineInput *out);
 
 enum { PW_WINE_POINTER_DEADZONE = 20 };   /* of 128, stick noise at rest */
 

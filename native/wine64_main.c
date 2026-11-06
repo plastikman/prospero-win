@@ -781,6 +781,28 @@ static int open_library(void)
 
     status = pw_data_mount_request(&mount);
     if (status == 0) library_root = PW_WINE64_ROOT_DATA;
+#ifdef __PS4__
+    /* ⚠ THE LOG SWITCH FOR PACKAGES WITHOUT /app0/dev.conf. ps5log reads its
+     * destination at the top of main(), before this grant, when only the
+     * package's own dev.conf is readable. A release package ships none, so it
+     * logs nowhere -- unless a dev.conf has been put on the console: copy one
+     * to /data/prospero-win/dev.conf to turn the app log on, delete it to turn
+     * it off. Only the lines before this point are missed (2026-11-06). */
+    if (status == 0 && !ps5log_enabled()) {
+        static const char *const late_paths[] = {
+            "/data/prospero-win/dev.conf",
+            "/data/homebrew/dev.conf",
+        };
+        ps5log_config late_config;
+        const char *used = NULL;
+
+        ps5log_config_defaults(&late_config);
+        if (ps5log_load_config(late_paths, sizeof(late_paths) / sizeof(late_paths[0]),
+                               &late_config, &used) == 0 &&
+            ps5log_init(&late_config, PW_TITLE_ID, PW_APP_NAME, now_ns()) == 0)
+            PS5LOG_LOG("PW_WINE64 log enabled by %s after the /data grant", used ? used : "?");
+    }
+#endif
     PS5LOG_LOG("PW_WINE64 data_mount data_before=%d elevated_before=%d helper_completed=%d "
                "helper_errno=%d data_after=%d elevated_after=%d waited_ms=%d settled_ms=%d root=%s",
                mount.data_before, mount.elevated_before, mount.helper_completed,
@@ -1093,7 +1115,7 @@ int main(int argc, char **argv)
     uint64_t pad2_seen = 0;   /* the tick pad 2 last reported a controller */
     const PwGameProfile *game = NULL;
     int scaling = PW_PRESENT_SCALE_FIT;
-    PwWinePointer pointer = { 0, 0 };
+    PwWinePointer pointer = { 0 };
     PwWineKeyboardStick keyboard_stick_state = { 0 };
     int (*post_input)(const PwWineInput *) = NULL;
     void (*set_pad)(const PwWinePad *) = NULL;
@@ -1761,7 +1783,11 @@ int main(int argc, char **argv)
                                (unsigned)(count - before_stick));
                 }
             }
-            if (game_input.mouse != PW_GAME_STICK_NONE) {
+            if (game_input.mouse == PW_GAME_STICK_TOUCHPAD) {
+                count += (size_t)pw_wine_touch_pointer_step(&pointer, pad.finger_down != 0,
+                                                            pad.finger_x, pad.finger_y,
+                                                            game_input.mouse_speed, &events[count]);
+            } else if (game_input.mouse != PW_GAME_STICK_NONE) {
                 const PwPadPs5Stick *stick = game_input.mouse == PW_GAME_STICK_LEFT ?
                                              &seen->left_stick : &seen->right_stick;
                 count += (size_t)pw_wine_pointer_step(&pointer, stick->x, stick->y,

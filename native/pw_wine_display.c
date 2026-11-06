@@ -214,6 +214,34 @@ static int64_t travel(uint8_t stick, uint32_t speed, uint32_t elapsed_us)
     return axis < 0 ? -v : v;
 }
 
+int pw_wine_touch_pointer_step(PwWinePointer *pointer, int down, uint16_t x, uint16_t y,
+                               uint32_t speed, PwWineInput *out)
+{
+    int64_t dx, dy;
+    int was_down;
+
+    if (!pointer || !out) return 0;
+    was_down = pointer->touch_down;
+    pointer->touch_down = down;
+    if (!down) return 0;
+    if (!was_down) {                      /* a new touch: no jump to it */
+        pointer->touch_x = x;
+        pointer->touch_y = y;
+        return 0;
+    }
+    pointer->x += ((int64_t)x - pointer->touch_x) * 65536 * speed / 1200;
+    pointer->y += ((int64_t)y - pointer->touch_y) * 65536 * speed / 1200;
+    pointer->touch_x = x;
+    pointer->touch_y = y;
+    dx = pointer->x / 65536;
+    dy = pointer->y / 65536;
+    if (!dx && !dy) return 0;
+    pointer->x -= dx * 65536;
+    pointer->y -= dy * 65536;
+    *out = (PwWineInput){ PW_WINE_INPUT_MOUSE_MOVE, 0, (int32_t)dx, (int32_t)dy, 0 };
+    return 1;
+}
+
 int pw_wine_pointer_step(PwWinePointer *pointer, uint8_t stick_x, uint8_t stick_y,
                          uint32_t speed, uint32_t elapsed_us, PwWineInput *out)
 {

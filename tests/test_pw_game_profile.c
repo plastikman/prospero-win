@@ -376,6 +376,13 @@ static void test_presets(void)
                   "mouse = right_stick\n", &input) == PW_OK);
     assert(input.bindings[L1].code == 'Z' && input.mouse == PW_GAME_STICK_RIGHT);
     assert(input.mouse_speed == PW_GAME_MOUSE_SPEED_DEFAULT);
+    /* The touchpad can drive the pointer too (2026-11-06). */
+    {
+        PwGameInput touch;
+        pw_game_input_init(&touch);
+        assert(preset("[input]\nmode = xinput\nmouse = touchpad\ntouchpad = mouse_left\n", &touch) == PW_OK);
+        assert(touch.mouse == PW_GAME_STICK_TOUCHPAD && touch.mode == PW_GAME_INPUT_XINPUT);
+    }
 
     /* The profile's own lines override the preset, the rest stays. */
     assert(parse(APP "[input]\npreset = pinball\ncross = enter\nmouse_speed = 400\n", &p) == PW_OK);

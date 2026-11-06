@@ -101,7 +101,10 @@ typedef enum PwGameScaling { PW_GAME_SCALING_FIT = 0, PW_GAME_SCALING_INTEGER,
                              PW_GAME_SCALING_STRETCH } PwGameScaling;
 typedef enum PwGameView { PW_GAME_VIEW_WINDOW = 0, PW_GAME_VIEW_DESKTOP } PwGameView;
 typedef enum PwGameInputMode { PW_GAME_INPUT_KEYBOARD = 0, PW_GAME_INPUT_XINPUT } PwGameInputMode;
-typedef enum PwGameStick { PW_GAME_STICK_NONE = 0, PW_GAME_STICK_LEFT, PW_GAME_STICK_RIGHT } PwGameStick;
+/* PW_GAME_STICK_TOUCHPAD is valid for [input] mouse only: finger travel on the
+ * touchpad moves the pointer, as a laptop trackpad does (2026-11-06). */
+typedef enum PwGameStick { PW_GAME_STICK_NONE = 0, PW_GAME_STICK_LEFT, PW_GAME_STICK_RIGHT,
+                           PW_GAME_STICK_TOUCHPAD } PwGameStick;
 typedef enum PwGameBindKind { PW_GAME_BIND_UNSET = 0, PW_GAME_BIND_NONE, PW_GAME_BIND_KEY,
                               PW_GAME_BIND_MOUSE } PwGameBindKind;
 
