@@ -1,0 +1,164 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] iphlpapi: the PS4 NetCtl IPv4 adapter from WINE_PS4_NETCFG (archive 0989).
+
+Archive 0989 unchanged. native/wine64_main.c publishes WINE_PS4_NETCFG on PS4 (pw_ps4_netctl_config).
+---
+diff --git a/dlls/iphlpapi/iphlpapi_main.c b/dlls/iphlpapi/iphlpapi_main.c
+index 0981f380ee..a4a5c9464b 100644
+--- a/dlls/iphlpapi/iphlpapi_main.c
++++ b/dlls/iphlpapi/iphlpapi_main.c
+@@ -1292,6 +1292,143 @@ static DWORD adapters_addresses_loopback( IP_ADAPTER_ADDRESSES **info, ULONG *co
+     return ERROR_SUCCESS;
+ }
+ 
++/* The PS4 has working sockets and DNS, but its network interface is not
++ * exposed through Wine's NSI device. The title publishes the console's NetCtl
++ * IPv4 configuration before Wine starts. Use it to describe a real Ethernet
++ * adapter to Windows applications instead of claiming the console is offline. */
++static BOOL ps4_parse_ipv4( const char *text, IN_ADDR *addr )
++{
++    return text && text[0] && !RtlIpv4StringToAddressA( text, TRUE, NULL, addr );
++}
++
++static IP_ADAPTER_DNS_SERVER_ADDRESS *ps4_address_alloc( const char *text )
++{
++    IP_ADAPTER_DNS_SERVER_ADDRESS *entry;
++    SOCKADDR_IN *sin;
++    IN_ADDR addr;
++
++    if (!ps4_parse_ipv4( text, &addr )) return NULL;
++    entry = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*entry) + sizeof(*sin) );
++    if (!entry) return NULL;
++    entry->Length = sizeof(*entry);
++    entry->Address.lpSockaddr = (SOCKADDR *)(entry + 1);
++    entry->Address.iSockaddrLength = sizeof(*sin);
++    sin = (SOCKADDR_IN *)entry->Address.lpSockaddr;
++    sin->sin_family = AF_INET;
++    sin->sin_addr = addr;
++    return entry;
++}
++
++static IP_ADAPTER_UNICAST_ADDRESS *ps4_unicast_alloc( const char *text, const char *mask )
++{
++    IP_ADAPTER_UNICAST_ADDRESS *entry;
++    SOCKADDR_IN *sin;
++    IN_ADDR addr, mask_addr;
++    ULONG bits;
++
++    if (!ps4_parse_ipv4( text, &addr )) return NULL;
++    entry = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*entry) + sizeof(*sin) );
++    if (!entry) return NULL;
++    entry->Length = sizeof(*entry);
++    entry->Address.lpSockaddr = (SOCKADDR *)(entry + 1);
++    entry->Address.iSockaddrLength = sizeof(*sin);
++    entry->PrefixOrigin = IpPrefixOriginDhcp;
++    entry->SuffixOrigin = IpSuffixOriginDhcp;
++    entry->DadState = IpDadStatePreferred;
++    sin = (SOCKADDR_IN *)entry->Address.lpSockaddr;
++    sin->sin_family = AF_INET;
++    sin->sin_addr = addr;
++    if (ps4_parse_ipv4( mask, &mask_addr ))
++    {
++        bits = ntohl( mask_addr.s_addr );
++        while (bits & 0x80000000) ++entry->OnLinkPrefixLength, bits <<= 1;
++    }
++    return entry;
++}
++
++static IP_ADAPTER_GATEWAY_ADDRESS *ps4_gateway_alloc( const char *text )
++{
++    IP_ADAPTER_DNS_SERVER_ADDRESS *entry = ps4_address_alloc( text );
++    return (IP_ADAPTER_GATEWAY_ADDRESS *)entry;
++}
++
++static DWORD adapters_addresses_ps4( IP_ADAPTER_ADDRESSES **info, ULONG *count )
++{
++    static const char name[] = "orbis-ethernet";
++    static const WCHAR description[] = L"Orbis Ethernet";
++    static const WCHAR friendly[] = L"Orbis Ethernet";
++    char config[160], *field[6], *cursor, *comma;
++    DWORD length;
++    ULONG mtu = 1500;
++    ULONG i;
++    SIZE_T desc_offset = (sizeof(name) + 1) & ~(SIZE_T)1;
++    SIZE_T alloc_size = sizeof(IP_ADAPTER_ADDRESSES) + desc_offset + sizeof(description) + sizeof(friendly);
++    IP_ADAPTER_ADDRESSES *aa;
++    IP_ADAPTER_UNICAST_ADDRESS *unicast;
++    IP_ADAPTER_GATEWAY_ADDRESS *gateway;
++    IP_ADAPTER_DNS_SERVER_ADDRESS *dns1, *dns2;
++    char *ptr;
++
++    length = GetEnvironmentVariableA( "WINE_PS4_NETCFG", config, sizeof(config) );
++    if (!length || length >= sizeof(config)) return adapters_addresses_loopback( info, count );
++    cursor = config;
++    for (i = 0; i < ARRAY_SIZE(field); ++i)
++    {
++        field[i] = cursor;
++        comma = strchr( cursor, ',' );
++        if (i < ARRAY_SIZE(field) - 1 && !comma) return adapters_addresses_loopback( info, count );
++        if (comma) *comma = 0, cursor = comma + 1;
++    }
++    if (field[5][0]) mtu = strtoul( field[5], NULL, 10 );
++    if (!mtu || mtu > 65535) mtu = 1500;
++
++    aa = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, alloc_size );
++    if (!aa) return ERROR_NOT_ENOUGH_MEMORY;
++    aa->Length = sizeof(*aa);
++    aa->IfIndex = 2; /* reserve 1 for the loopback adapter */
++    aa->Ipv6IfIndex = 2;
++    aa->Luid.Value = 2;
++    aa->Mtu = mtu;
++    aa->IfType = IF_TYPE_ETHERNET_CSMACD;
++    aa->OperStatus = IfOperStatusUp;
++    aa->AdapterName = ptr = (char *)(aa + 1);
++    memcpy( ptr, name, sizeof(name) );
++    ptr += desc_offset;
++    aa->Description = (WCHAR *)ptr;
++    memcpy( ptr, description, sizeof(description) );
++    ptr += sizeof(description);
++    aa->FriendlyName = (WCHAR *)ptr;
++    memcpy( ptr, friendly, sizeof(friendly) );
++    aa->DnsSuffix = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(WCHAR) );
++    if (!aa->DnsSuffix)
++    {
++        HeapFree( GetProcessHeap(), 0, aa );
++        return ERROR_NOT_ENOUGH_MEMORY;
++    }
++
++    unicast = ps4_unicast_alloc( field[0], field[1] );
++    gateway = ps4_gateway_alloc( field[2] );
++    dns1 = ps4_address_alloc( field[3] );
++    dns2 = ps4_address_alloc( field[4] );
++    if (!unicast || (field[2][0] && !gateway) || (field[3][0] && !dns1) || (field[4][0] && !dns2))
++    {
++        if (unicast) HeapFree( GetProcessHeap(), 0, unicast );
++        if (gateway) HeapFree( GetProcessHeap(), 0, gateway );
++        if (dns1) HeapFree( GetProcessHeap(), 0, dns1 );
++        if (dns2) HeapFree( GetProcessHeap(), 0, dns2 );
++        HeapFree( GetProcessHeap(), 0, aa->DnsSuffix );
++        HeapFree( GetProcessHeap(), 0, aa );
++        return ERROR_NOT_ENOUGH_MEMORY;
++    }
++    aa->FirstUnicastAddress = unicast;
++    aa->FirstGatewayAddress = gateway;
++    aa->FirstDnsServerAddress = dns1;
++    if (dns1) dns1->Next = dns2;
++    *info = aa;
++    *count = 1;
++    return ERROR_SUCCESS;
++}
++
+ static DWORD adapters_addresses_alloc( ULONG family, ULONG flags, IP_ADAPTER_ADDRESSES **info, ULONG *count )
+ {
+     IP_ADAPTER_ADDRESSES *aa = NULL;
+@@ -1308,8 +1445,8 @@ static DWORD adapters_addresses_alloc( ULONG family, ULONG flags, IP_ADAPTER_ADD
+                                   (void **)&stat, sizeof(*stat), count, 0 );
+     if (err == ERROR_FILE_NOT_FOUND)
+     {
+-        MESSAGE( "GetAdaptersAddresses: PS4 NSI unavailable, returning loopback adapter\n" );
+-        return adapters_addresses_loopback( info, count );
++        MESSAGE( "GetAdaptersAddresses: PS4 NSI unavailable, using NetCtl adapter config\n" );
++        return adapters_addresses_ps4( info, count );
+     }
+     if (err) return err;
+ 

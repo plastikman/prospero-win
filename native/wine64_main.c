@@ -1039,9 +1039,10 @@ int main(int argc, char **argv)
     static char radv_cache[PW_WINE_LIBRARY_PATH + 16];
     enum { WINE64_FIXED_ENV_COUNT = 7,
            /* desktop, overrides, SDL_JOYSTICK_RAWINPUT and the PS4
-            * mprotect marker, plus the three launcher A/B switches. (The
-            * synced 3 + ... undercounted the PS4 mprotect marker by one.) */
-           WINE64_PROFILE_ENV_CAPACITY = 7 + PW_GAME_GRAPHICS_ENV_MAX + PW_GAME_RUNTIME_ENV_MAX + PW_GAME_CPU_ENV_MAX +
+            * mprotect marker, plus the three launcher A/B switches and the
+            * PS4 NetCtl snapshot. (The synced 3 + ... undercounted the PS4
+            * mprotect marker by one.) */
+           WINE64_PROFILE_ENV_CAPACITY = 8 + PW_GAME_GRAPHICS_ENV_MAX + PW_GAME_RUNTIME_ENV_MAX + PW_GAME_CPU_ENV_MAX +
                                          PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX };
     static PwWineStartEnv extra[WINE64_FIXED_ENV_COUNT + WINE64_PROFILE_ENV_CAPACITY] = {
         { "WINEDEBUG", PW_WINE64_DEBUG },
@@ -1343,6 +1344,21 @@ int main(int argc, char **argv)
             extra[config.extra_env_count++] = (PwWineStartEnv){ "WINE_PS5_SERVER_DIRECT", "0" };
             PS5LOG_LOG("PW_WINE64 server_direct=0 (regular server thread)");
         }
+#ifdef __PS4__
+        {
+            /* Wine's NSI device does not exist here, so iphlpapi (series
+             * 1064, archive 0989) builds its Ethernet adapter from this
+             * snapshot of the console's IPv4 configuration:
+             * address,netmask,gateway,dns1,dns2,mtu. Without it iphlpapi
+             * falls back to loopback only (archive 0979). */
+            extern int pw_ps4_netctl_config(char *buffer, size_t size);
+            static char netcfg[160];
+            int net = pw_ps4_netctl_config(netcfg, sizeof(netcfg));
+            if (net == 0)
+                extra[config.extra_env_count++] = (PwWineStartEnv){ "WINE_PS4_NETCFG", netcfg };
+            PS5LOG_LOG("PW_WINE64 netcfg status=%d config=%s", net, net == 0 ? netcfg : "-");
+        }
+#endif
         /* [application] arguments follow the executable in Wine's argv. */
         int words = pw_wine_launch_split(game->app.arguments, argument_words,
                                          sizeof(argument_words), wine_argv + 2,

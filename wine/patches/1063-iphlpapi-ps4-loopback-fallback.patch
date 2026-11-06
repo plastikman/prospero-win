@@ -1,0 +1,5 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] iphlpapi: loopback fallback when NSI is unavailable (archive 0979).
+
+Archive 0979 unchanged.
+---

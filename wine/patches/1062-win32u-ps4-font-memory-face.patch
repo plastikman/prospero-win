@@ -1,0 +1,47 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] win32u: load PS4 font files as memory faces (archive 0821).
+
+Archive 0821 unchanged: FT_New_Face's fopen path fails through emulated dosdevices links (FT error 1 on every .fon).
+---
+diff --git a/dlls/win32u/freetype.c b/dlls/win32u/freetype.c
+--- a/dlls/win32u/freetype.c
++++ b/dlls/win32u/freetype.c
+@@ -732,7 +732,11 @@
+     TT_OS2 *pOS2;
+     FT_Face ft_face;
+ 
+-    if (file)
++    if (file
++#ifdef __PROSPERO__
++        && !font_data_ptr
++#endif
++       )
+     {
+         TRACE("Loading font file %s index %ld\n", debugstr_a(file), face_index);
+         err = pFT_New_Face(library, file, face_index, &ft_face);
+@@ -1002,6 +1006,15 @@
+     }
+ 
+ done:
++#ifdef __PROSPERO__
++    /* Metadata has been copied into This. Dispose of the memory face while
++     * its mapped bytes are still valid, before returning those mappings. */
++    if (This && This->ft_face)
++    {
++        pFT_Done_Face( This->ft_face );
++        This->ft_face = NULL;
++    }
++#endif
+     if (unix_name) munmap( data_ptr, data_size );
+     return This;
+ }
+@@ -1079,7 +1092,8 @@
+     int ret = 0;
+     char *unixname = NULL;
+ 
+-    ntdll_get_unix_file_name( file, &unixname, FILE_OPEN_IF );
++    NTSTATUS status = ntdll_get_unix_file_name( file, &unixname, FILE_OPEN_IF );
++    TRACE( "resolve font %s -> %s status=%#x\n", debugstr_w(file), debugstr_a(unixname), status );
+     if (unixname)
+     {
+         ret = AddFontToList( file, unixname, NULL, 0, flags );
