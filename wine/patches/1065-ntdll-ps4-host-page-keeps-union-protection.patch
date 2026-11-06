@@ -1,0 +1,36 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] ntdll: PS4 host pages keep the union of their pages' protections.
+
+Upstream 0974/0986 narrow a 16 KiB host page to its strictest 4 KiB page
+outside images and single-step each access beside a protected page. On the
+PS4 a step costs about 0.2 s, and after SUBPAGE_HOT_STEPS (256) a write
+beside a read-only page is reported there. Vampire: The Masquerade -
+Bloodlines stepped a syscall's copy into 0x28f2000 for 45 s, beside read-only
+0x28f1000, until the report failed the call and LoadLibrary of its launcher
+DLL returned ERROR_NOACCESS ("No access to memory location", 2026-11-06).
+ABI-v3 had no subpage scheme and ran it, and every control title, with the
+union. New code, LGPL-2.1-or-later.
+---
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2434,6 +2434,19 @@
+ 
+     prot = get_unix_prot( (get_host_page_vprot( addr ) & ~clear) | set );
+     if (host_page_size == page_size || !(prot & (PROT_READ | PROT_WRITE))) return prot;
++#ifdef __PS4__
++    /* ⚠ PS4: every host page keeps the union of its pages' protections, as
++     * before upstream 0974/0986 and as every ABI-v3 build did. Narrowing it
++     * makes each access beside a protected page fault and single-step, about
++     * 0.2 s apiece on this console, and after SUBPAGE_HOT_STEPS a write beside
++     * a read-only page is reported there. When the writer is a syscall that
++     * report fails the call: Vampire: The Masquerade - Bloodlines stepped
++     * 45 s on 0x28f2000, beside read-only 0x28f1000, then LoadLibrary of its
++     * launcher DLL failed with ERROR_NOACCESS (2026-11-06). The cost is the
++     * one Windows-on-16 KiB has always had: a page that shares a host page
++     * with a writable one is writable too. */
++    return prot;
++#endif
+     if (!(view = find_view( addr, 0 )) || (view->protect & SEC_IMAGE)) return prot;
+     if (subpage_whole( page )) return prot;
+     for (i = 0; i < host_page_size; i += page_size)
