@@ -1,0 +1,32 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] server: release_object(NULL) reports and returns on PS4 (archive 0732).
+---
+diff --git a/server/object.c b/server/object.c
+index e977b89480..0c5b58972a 100644
+--- a/server/object.c
++++ b/server/object.c
+@@ -562,6 +562,24 @@ struct object *grab_object( void *ptr )
+ /* release an object (i.e. decrement its refcount) */
+ void release_object( void *ptr )
+ {
++#ifdef __PROSPERO__
++    /* ⚠ DIAGNOSTIC. init_directories() passes the result of each create_*()
++     * straight to release_object(), assuming none can fail. On this console
++     * some do, and the null dereference here is the first anyone hears of it --
++     * naming neither the creation that failed nor any after it, because the
++     * server is dead. Report it with the caller's return address, which
++     * identifies the creation, and carry on. */
++    if (!ptr)
++    {
++        extern int sceKernelDebugOutText( int channel, const char *text );
++        char line[160];
++        snprintf( line, sizeof(line),
++                  "wineserver: release_object(NULL) from %p (anchor %p) -- create_* failed, status 0x%08x\n",
++                  __builtin_return_address(0), (void *)(uintptr_t)&release_object, get_error() );
++        sceKernelDebugOutText( 0, line );
++        return;
++    }
++#endif
+     struct object *obj = (struct object *)ptr;
+     assert( obj->refcount );
+     if (!--obj->refcount)

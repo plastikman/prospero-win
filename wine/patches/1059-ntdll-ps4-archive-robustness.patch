@@ -1,0 +1,96 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] ntdll: PS4 robustness from the archive (0877, 0882 hunk, 0612).
+
+- 0877: FSCTL_GET_OBJECT_ID from st_ino only; st_dev drifts between opens
+  on this console, so the loader's find_fileid_module never matched.
+- 0882 hunk: pthread_exit_wrapper tolerates a thread with no Wine data
+  (series 1057 now ends every game exit through it).
+- 0612: one klog line for a fault on a thread without Wine data, such as
+  the in-process server's, whose first fault was otherwise hidden.
+---
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 46bf0d69bc..076ec48e91 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -6938,8 +6938,28 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
+             fstat( fd, &st );
+             if (needs_close) close( fd );
+             memset( info, 0, sizeof(*info) );
++#ifdef __PROSPERO__
++            /* ⚠ st_ino only. st_dev is not stable on this console: the same
++             * directory answers with a different one from call to call.
++             * docs/FINDINGS.md measured it on wineserver's own prefix
++             * directory -- server-290bff49-7e78bd one run,
++             * server-290bff65-7e78bd the next, st_ino identical both times --
++             * and said what to do: drop it from the comparison, a prefix
++             * cannot span devices here anyway.
++             *
++             * This is the comparison it breaks. The loader asks for a file's
++             * object id and hands it to find_fileid_module() to decide whether
++             * that file is already loaded; built from a drifting st_dev the
++             * answer is always no. GTA IV stops at the same point every run --
++             * t=1.34, after wow64win's PROCESS_ATTACH and before its own image
++             * loads -- with the server serving 2728 REQ_select where every
++             * working run served six, and the file trace ending on
++             * FSCTL_GET_OBJECT_ID over C:\windows and C:\windows\system32. */
++            memcpy( info->ObjectId + 8, &st.st_ino, sizeof(st.st_ino) );
++#else
+             memcpy( info->ObjectId, &st.st_dev, sizeof(st.st_dev) );
+             memcpy( info->ObjectId + 8, &st.st_ino, sizeof(st.st_ino) );
++#endif
+             size = sizeof(*info);
+         }
+         else status = STATUS_BUFFER_TOO_SMALL;
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1120,11 +1120,16 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
+     extern void unregister_inprocess_thread(void);
+     unregister_inprocess_thread();
+ #endif
+-    close( data->alert_fd );
+-    close( data->wait_fd[0] );
+-    close( data->wait_fd[1] );
+-    close( data->reply_fd );
+-    close( data->request_fd );
++    /* A thread that was never a Wine client (the in-process server thread,
++     * a native libkernel thread) has no thread data. */
++    if (data)
++    {
++        close( data->alert_fd );
++        close( data->wait_fd[0] );
++        close( data->wait_fd[1] );
++        close( data->reply_fd );
++        close( data->request_fd );
++    }
+     pthread_exit( UIntToPtr(status) );
+ }
+ 
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 3c4a3e300c..46afb457da 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2371,6 +2371,23 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ 
+ #ifdef __PROSPERO__
+     if (segv_hook && segv_hook( siginfo, _sigcontext )) return;
++    /* ⚠ DIAGNOSTIC. Everything past this point belongs to a Wine thread: the
++     * fault is raised as an exception, which walks setup_raise_exception,
++     * send_debug_event, NtTerminateProcess and wine_server_call, and the last
++     * of those reads data->tid. The in-process server runs on a thread the
++     * server creates itself, which has no Wine data, so a fault in a request
++     * handler is answered by a second fault inside the machinery reporting the
++     * first -- and the first has never been seen. Say what it was, from the
++     * registers, before any of that runs. */
++    if (!get_thread_data())
++    {
++        extern int sceKernelDebugOutText( int channel, const char *text );
++        char line[176];
++        snprintf( line, sizeof(line),
++                  "wineserver: FAULT on a thread without Wine data: sig %d addr %p rip %p\n",
++                  signal, siginfo ? siginfo->si_addr : NULL, (void *)RIP_sig(sigcontext) );
++        sceKernelDebugOutText( 0, line );
++    }
+ #endif
+     data = init_handler( sigcontext );
+     save_context( data, &context, sigcontext );
