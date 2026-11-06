@@ -1,0 +1,41 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] ntdll: on PS4, end the process as a thread so the title returns to its launcher.
+
+exit() from ntdll cannot end a PS4 title. Half-Life's Quit on GLDS10043
+01.16 (2026-11-05) went ExitProcess -> NtTerminateProcess -> exit_process
+-> process_exit_wrapper -> exit() and died with SIGSYS in libkernel; the
+title's on_exit_report never ran. _exit() is no better (it falls into ud2).
+FNV and Oblivion only reached the launcher because their exit faulted
+before exit() and they ended as threads.
+
+On Prospero, exit_process now ends the calling thread instead. Closing its
+request fd tells the in-process server the last thread is gone, the server
+flags the guest exit (series 1053), and the title's frame loop restarts into
+the launcher.
+---
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 0477c558ca..d0ba7d6918 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1574,7 +1574,20 @@ static DECLSPEC_NORETURN void exit_thread( int status )
+ void exit_process( int status )
+ {
+     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
++#ifdef __PROSPERO__
++    /* ⚠ A PS4 title cannot end itself: exit() from ntdll dies with SIGSYS in
++     * libkernel (Half-Life's Quit, GLDS10043 01.16, 2026-11-05) and _exit()
++     * falls through into the compiler's ud2 (HANDOFF-2026-10-26). The
++     * title's own exit handler (on_exit_report, which would restart into
++     * the launcher) did not run either: Half-Life logged no `PW_WINE64 exit`.
++     * Leave as a thread instead. Closing this thread's request fd tells the
++     * in-process server it is gone; the server already holds the process as
++     * terminated, so it sees its last user process end and flags it
++     * (series 1053), and the title's frame loop restarts into the launcher. */
++    pthread_exit_wrapper( status );
++#else
+     process_exit_wrapper( get_unix_exit_code( status ));
++#endif
+ }
+ 
+ 
+
