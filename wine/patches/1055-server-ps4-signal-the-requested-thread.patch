@@ -1,0 +1,43 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] server: signal the requested thread on PS4, not the process.
+
+Archive 0930, with the thr_kill2 prototype corrected to the shim's
+(pid_t, long, int). Without it tkill() returns ENOSYS on Prospero and
+send_thread_signal() falls back to kill(pid, sig), so SuspendThread, APC
+interrupts and thread kills reach an arbitrary thread. In GLDS10043 01.15
+(2026-11-05) Half-Life's Quit and FNV's Exit to Desktop both crashed: the
+server thread took the SIGUSR1 meant for a game thread, and its handler
+faulted at NULL+0x1c in server_call_unlocked (stop_thread ->
+send_thread_signal -> usr1 -> server_select).
+---
+diff --git a/server/ptrace.c b/server/ptrace.c
+index 2e6d93b721..46fa1372a5 100644
+--- a/server/ptrace.c
++++ b/server/ptrace.c
+@@ -217,6 +217,17 @@ static int waitpid_thread( struct thread *thread, int signal )
+     return (thread->unix_pid != -1);
+ }
+ 
++#ifdef __PROSPERO__
++/* The console has no thr_kill2: the PS4 platform shim in the wineserver PRX
++ * (wine/ps5/pw_wine_threads.c) maps the id ntdll registered for each thread
++ * to its pthread_t and calls pthread_kill. Without this branch tkill() fails
++ * with ENOSYS and send_thread_signal() falls back to kill(pid), which lets the
++ * kernel pick any thread: on 2026-11-05 a game's SuspendThread at exit
++ * delivered SIGUSR1 to the server thread itself, whose handler then faulted
++ * at NULL+0x1c in server_call_unlocked (Half-Life and FNV quit crashes). */
++extern int thr_kill2( pid_t pid, long id, int sig );
++#endif
++
+ /* send a signal to a specific thread */
+ static inline int tkill( int tgid, int pid, int sig )
+ {
+@@ -224,6 +235,8 @@ static inline int tkill( int tgid, int pid, int sig )
+     int ret = syscall( __NR_tgkill, tgid, pid, sig );
+     if (ret < 0 && errno == ENOSYS) ret = syscall( __NR_tkill, pid, sig );
+     return ret;
++#elif defined(__PROSPERO__)
++    return thr_kill2( tgid, pid, sig );
+ #elif (defined(__FreeBSD__) || defined (__FreeBSD_kernel__)) && defined(HAVE_THR_KILL2)
+     return thr_kill2( tgid, pid, sig );
+ #else
