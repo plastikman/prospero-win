@@ -1,0 +1,37 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] ntdll: retry a native guest fault during PS4 exec migration (archive 1011 + 1015).
+
+Archive 1011 and 1015 as one change, applied with git apply --recount.
+ABI-v4 ntdll still migrates exec pages from direct to flexible memory
+(src/native/pw_wine_dmem_glue_ps4.c), but nothing called the fault-side
+half, __wine_ps5_wait_for_exec_migration, and upstream's S/1000 retry runs
+only under wowprospero's hook, so native WoW64 had no guest-fault retry.
+1015 passes the page-fault error code as the glue's third argument.
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index a281233..8e814c2 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2827,6 +2827,22 @@ static void __attribute__((used)) segv_handler( int signal, siginfo_t *siginfo,
+             unsigned int n = __atomic_add_fetch( &trace_count, 1, __ATOMIC_RELAXED );
+             BOOL handled, invalid_gs;
+ 
++            /* A PS4 direct-memory RX migration can briefly leave a guest
++             * page unmapped while it is replaced with flexible memory. If a
++             * guest thread faults on that exact page during the replacement,
++             * wait for the mapping operation and retry the instruction only
++             * when its requested access is valid in the settled mapping. */
++            extern int __wine_ps5_wait_for_exec_migration( const void *, unsigned int,
++                                                            unsigned int ) __attribute__((weak));
++            if (__wine_ps5_wait_for_exec_migration &&
++                __wine_ps5_wait_for_exec_migration( siginfo->si_addr,
++                                                     (unsigned int)rec.ExceptionInformation[0],
++                                                     (unsigned int)ERROR_sig(sigcontext) ))
++            {
++                leave_handler( data, sigcontext );
++                return;
++            }
++
+             if (n <= 12)
+             {
+                 extern int sceKernelDebugOutText( int channel, const char *text );
