@@ -557,6 +557,11 @@ static void test_debug_env(void)
     assert(p.debug_env_count == 2 && !strcmp(p.debug_env[0].name, "VKD3D_FEATURE_LEVEL") &&
            !strcmp(p.debug_env[0].value, "12_0") && !strcmp(p.debug_env[1].value, "nodxr"));
     assert(parse(APP "[debug]\nenv = VKD3DX=1\n", &p) == PW_ERR_UNSUPPORTED);
+    /* The PS4 RADV winsys's own options, the size of its GPU arena among them. */
+    assert(parse(APP "[debug]\nenv = ORBIS_ARENA_MIB=1280\n", &p) == PW_OK);
+    assert(p.debug_env_count == 1 && !strcmp(p.debug_env[0].name, "ORBIS_ARENA_MIB") &&
+           !strcmp(p.debug_env[0].value, "1280"));
+    assert(parse(APP "[debug]\nenv = ORBISX=1\n", &p) == PW_ERR_UNSUPPORTED);
     /* A value may itself hold '=': only the first one splits. */
     assert(parse(APP "[debug]\nenv = DXVK_CONFIG=d3d9.maxFrameRate=60\n", &p) == PW_OK);
     assert(!strcmp(p.debug_env[0].name, "DXVK_CONFIG") && !strcmp(p.debug_env[0].value, "d3d9.maxFrameRate=60"));

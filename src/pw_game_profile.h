@@ -51,8 +51,9 @@
  *                               ; the title's, err+all,+loaddll,+process)
  *   env = PW_NATIVE_PROFILE=1   ; one more variable for Wine's environment,
  *                               ; up to 5 env lines: names start with PW_,
- *                               ; DXVK_, VKD3D_, MESA_, GALLIUM_, ZINK_, RADV_
- *                               ; or VK_,
+ *                               ; DXVK_, VKD3D_, MESA_, GALLIUM_, ZINK_, RADV_,
+ *                               ; VK_ or ORBIS_ (the PS4 RADV winsys's own,
+ *                               ; such as ORBIS_ARENA_MIB=1280),
  *                               ; and may not be one the title sets itself
  *                               ; (PW_VK_BATCH, PW_INPUT_SHARED_FAST,
  *                               ; PW_QPC_TSC_*, GALLIUM_DRIVER, DXVK_HUD

@@ -1141,7 +1141,8 @@ The title runs one game per process (`src/pw_wine_launch.h`):
     `env = PW_NATIVE_PROFILE=1` or `env = PW_VK_BATCH_STATS=1`. Names start
     with `PW_`, `DXVK_`, `VKD3D_` (vkd3d-proton's, such as
     `VKD3D_FEATURE_LEVEL=12_0`), `MESA_`, `GALLIUM_`, `ZINK_` (Zink's own
-    options, such as `ZINK_DESCRIPTORS=lazy`), `RADV_` or `VK_`; values take
+    options, such as `ZINK_DESCRIPTORS=lazy`), `RADV_`, `VK_` or `ORBIS_` (the
+    PS4 RADV winsys's own, such as `ORBIS_ARENA_MIB=1280`); values take
     letters, digits and `_ + - , . = : /`. A name the title sets itself is
     refused, so these only add: `PW_VK_BATCH`, `PW_INPUT_SHARED_FAST`,
     `PW_QPC_TSC_*`, `GALLIUM_DRIVER`, `DXVK_HUD` or `GALLIUM_HUD` while
