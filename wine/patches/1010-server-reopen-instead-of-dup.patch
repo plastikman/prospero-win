@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Tue, 7 Oct 2026 20:30:00 +0000
+Subject: [PATCH] server: reopen a file by name where dup is refused.
+
+This console will not duplicate a descriptor by any means: dup, dup2,
+fcntl(F_DUPFD) and sceKernelRdup all fail, for regular files, directories, shm
+objects, sockets and pipes alike (src/dup-probe).
+
+A file-backed fd does not need duplicating: reopening orig->unix_name gives
+what dup would have, an independent descriptor with its own offset and close.
+Report the failure with the name it had, so a run says whether there was a path
+to reopen at all.
+---
+diff --git a/server/fd.c b/server/fd.c
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -2004,8 +2004,37 @@ struct fd *dup_fd_object( struct fd *orig, unsigned int access, unsigned int sha
+     {
+         struct closed_fd *closed = mem_alloc( sizeof(*closed) );
+         if (!closed) goto failed;
+-        if ((fd->unix_fd = dup( orig->unix_fd )) == -1)
++        fd->unix_fd = dup( orig->unix_fd );
++#ifdef __PROSPERO__
++        /* ⚠ THIS CONSOLE REFUSES TO DUPLICATE A DESCRIPTOR, BY ANY MEANS.
++         * Measured with src/dup-probe: dup, dup2, fcntl(F_DUPFD) and
++         * sceKernelRdup all fail, for regular files, directories, shm objects,
++         * sockets and pipes alike.
++         *
++         * A file-backed fd does not need duplicating: reopening its name gives
++         * what dup would have -- an independent descriptor with its own offset
++         * and its own close -- and shares nothing. A socket or pipe has no name
++         * and still cannot be duplicated. */
++        if (fd->unix_fd == -1 && orig->unix_name)
++        {
++            int flags = (orig->access & FILE_WRITE_DATA) ? O_RDWR : O_RDONLY;
++
++            if ((fd->unix_fd = open( orig->unix_name, flags )) == -1 && flags != O_RDONLY)
++                fd->unix_fd = open( orig->unix_name, O_RDONLY );
++        }
++#endif
++        if (fd->unix_fd == -1)
+         {
++#ifdef __PROSPERO__
++            {
++                extern int sceKernelDebugOutText( int channel, const char *text );
++                char note[320];
++                snprintf( note, sizeof(note),
++                          "wineserver: dup_fd_object failed, errno %d, unix_name %s\n",
++                          errno, orig->unix_name ? orig->unix_name : "(none -- cannot reopen)" );
++                sceKernelDebugOutText( 0, note );
++            }
++#endif
+             file_set_error();
+             free( closed );
+             goto failed;
+-- 
+2.47.3

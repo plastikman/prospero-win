@@ -1,0 +1,93 @@
+From: Zak Peirce <zak@orbis-win>
+Subject: ntdll: log the PS4 native signal action and delivery state
+
+The native frame probe currently reports successful action, mask and send calls
+but zero handler hits. Read the installed action back and record mask/pending
+state immediately after self-send. Use SIGWINCH for the ordinary user-signal
+probe; SIGUSR2 aliases the PS4 reserved SIGTHR signal. This is diagnostic and
+keeps the native backend fail-closed.
+
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -27,6 +27,7 @@
+ #include "config.h"
+ 
+ #include <assert.h>
++#include <errno.h>
+ #include <pthread.h>
+ #include <signal.h>
+ #include <dlfcn.h>
+@@ -1112,31 +1113,59 @@ static void pw_native_frame_handler( int signal, siginfo_t *siginfo, void *sigco
+ 
+ static BOOL pw_native_frame_verified(void)
+ {
+-    struct sigaction probe = {0}, previous = {0};
+-    sigset_t unblock, mask;
++    struct sigaction probe = {0}, previous = {0}, installed = {0};
++    sigset_t unblock, mask, current_mask, pending;
+     UINT64 fsbase = 0;
+     UINT mxcsr, marked;
++    int action_rc, action_errno, query_rc, unblock_rc, send_rc, mask_query_rc, pending_rc;
++    int restore_mask_rc, restore_action_rc, restore_errno;
+     BOOL ok;
+ 
+     if (amd64_get_fsbase( &fsbase ) || !fsbase) return FALSE;
+     probe.sa_sigaction = pw_native_frame_handler;
+     probe.sa_flags = SA_SIGINFO;
+     sigemptyset( &probe.sa_mask );
+-    if (pw_native_sigaction( SIGUSR2, &probe, &previous ) == -1) return FALSE;
++    /* SIGUSR2 is signal 31 in this PS4 ABI; the kernel also uses that number
++     * for SIGTHR. pthread_kill(self, SIGUSR2) enters the reserved thread-signal
++     * path instead of the ordinary user signal frame and terminates startup.
++     * SIGWINCH is an ordinary, otherwise-unused signal here and exercises the
++     * same signal frame without colliding with Wine's SIGUSR1 suspend signal. */
++    errno = 0;
++    action_rc = pw_native_sigaction( SIGWINCH, &probe, &previous );
++    action_errno = errno;
++    if (action_rc == -1)
++    {
++        ERR_(seh)( "PW_NATIVE_FRAME setup sig=%d sigaction_rc=%d errno=%d\n",
++                   SIGWINCH, action_rc, action_errno );
++        return FALSE;
++    }
++    query_rc = pw_native_sigaction( SIGWINCH, NULL, &installed );
+     sigemptyset( &unblock );
+-    sigaddset( &unblock, SIGUSR2 );
+-    pthread_sigmask( SIG_UNBLOCK, &unblock, &mask );
++    sigaddset( &unblock, SIGWINCH );
++    unblock_rc = pthread_sigmask( SIG_UNBLOCK, &unblock, &mask );
++    mask_query_rc = pthread_sigmask( SIG_SETMASK, NULL, &current_mask );
++    pw_frame_hits = 0;
+     __asm__ volatile( "stmxcsr %0" : "=m"(mxcsr) );
+     marked = (mxcsr & ~0x6000) | 0x2000;  /* round down: visible and harmless */
+     __asm__ volatile( "ldmxcsr %0" :: "m"(marked) );
+-    pthread_kill( pthread_self(), SIGUSR2 );
++    send_rc = pthread_kill( pthread_self(), SIGWINCH );
++    pending_rc = sigpending( &pending );
+     __asm__ volatile( "ldmxcsr %0" :: "m"(mxcsr) );
+-    pthread_sigmask( SIG_SETMASK, &mask, NULL );
+-    pw_native_sigaction( SIGUSR2, &previous, NULL );
++    restore_mask_rc = pthread_sigmask( SIG_SETMASK, &mask, NULL );
++    errno = 0;
++    restore_action_rc = pw_native_sigaction( SIGWINCH, &previous, NULL );
++    restore_errno = errno;
+     ok = pw_frame_hits == 1 && pw_frame_mxcsr == marked && pw_frame_fsbase == fsbase;
+     if (!ok)
+-        ERR_(seh)( "PW_NATIVE_FRAME unverified hits=%d mxcsr=%#x/%#x fsbase=%#llx/%#llx\n", pw_frame_hits,
+-                   pw_frame_mxcsr, marked, (unsigned long long)pw_frame_fsbase, (unsigned long long)fsbase );
++        ERR_(seh)( "PW_NATIVE_FRAME unverified sig=%d action_rc=%d action_errno=%d query_rc=%d handler=%p/%p flags=%#x/%#x unblock_rc=%d old_blocked=%d mask_query_rc=%d now_blocked=%d send_rc=%d pending_rc=%d pending=%d restore_mask_rc=%d restore_action_rc=%d restore_errno=%d hits=%d mxcsr=%#x/%#x fsbase=%#llx/%#llx\n",
++                   SIGWINCH, action_rc, action_errno, query_rc,
++                   (void *)installed.sa_sigaction, (void *)pw_native_frame_handler,
++                   installed.sa_flags, probe.sa_flags, unblock_rc,
++                   sigismember( &mask, SIGWINCH ), mask_query_rc,
++                   mask_query_rc ? -1 : sigismember( &current_mask, SIGWINCH ),
++                   send_rc, pending_rc, pending_rc ? -1 : sigismember( &pending, SIGWINCH ), restore_mask_rc,
++                   restore_action_rc, restore_errno, pw_frame_hits, pw_frame_mxcsr, marked,
++                   (unsigned long long)pw_frame_fsbase, (unsigned long long)fsbase );
+     return ok;
+ }
+ 
+-- 
+2.47.3

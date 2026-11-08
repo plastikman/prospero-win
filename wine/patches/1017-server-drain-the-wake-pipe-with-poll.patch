@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Thu, 8 Oct 2026 09:20:00 +0000
+Subject: [PATCH] server: drain the in-process wake pipe with poll.
+
+The main loop empties its wake pipe with
+
+    while (read( get_unix_fd( fd ), buffer, sizeof(buffer) ) > 0);
+
+which needs a non-blocking descriptor to end. This console has none: it refuses
+both fcntl( F_SETFL, O_NONBLOCK ) and ioctl FIONBIO (see 0742), so that loop
+reads what the wake-up left and then waits, inside the server thread, for a byte
+nobody will send. The first timeout to arrive would have hung the server for
+good -- it has not bitten yet only because nothing has run long enough to need
+a timer.
+
+Ask poll what is there instead. Every other caller treats non-blocking mode as
+an optimisation; this is the one that depended on it for correctness.
+---
+diff --git a/server/request.c b/server/request.c
+--- a/server/request.c
++++ b/server/request.c
+@@ -915,7 +915,20 @@ static void inprocess_wake_poll_event( struct fd *fd, int event )
+ {
+     char buffer[64];
+ 
++#ifdef __PROSPERO__
++    /* ⚠ This descriptor is blocking and cannot be made otherwise (see
++     * pw_set_nonblocking), so the loop below would not end: it reads what the
++     * wake-up left, then waits inside the server thread for a byte nobody will
++     * send. Read only what poll reports. */
++    {
++        struct pollfd wake = { get_unix_fd( fd ), POLLIN, 0 };
++
++        while (poll( &wake, 1, 0 ) > 0 && (wake.revents & POLLIN))
++            if (read( wake.fd, buffer, sizeof(buffer) ) <= 0) break;
++    }
++#else
+     while (read( get_unix_fd( fd ), buffer, sizeof(buffer) ) > 0);
++#endif
+ }
+ 
+ static const struct fd_ops inprocess_wake_fd_ops =
+-- 
+2.47.3

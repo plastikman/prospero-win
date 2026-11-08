@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Thu, 8 Oct 2026 11:50:00 +0000
+Subject: [PATCH] ntdll: report no image address; there is no auxiliary vector.
+
+With the mapping fixed, load_main_exe maps Oblivion and start_main_thread
+carries on to get_image_address, which faults at address 0:
+
+    PW_WINE64 fault signal=0xb addr=0x0 rip=0x8008ef49a
+                                        ntdll+0xbf49a = __getauxval
+
+A title has no auxiliary vector, and this console's getauxval does not answer
+that with 0 -- it dereferences and faults. Report no image address instead,
+which is what every platform without an auxv does here; the value only reaches
+peb->CloudFileFlags.
+
+Only this caller is affected. The auxv is read in three other places and none
+is reachable: one is behind __linux__ and this is FreeBSD, and the other two
+are on the ARM feature paths.
+---
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1839,7 +1839,18 @@ static void load_wow64_ntdll( USHORT machine )
+  */
+ static ULONG_PTR get_image_address(void)
+ {
+-#ifdef HAVE_GETAUXVAL
++#ifdef __PROSPERO__
++    /* ⚠ A title has no auxiliary vector, and this console's getauxval does
++     * not answer that with 0 -- it faults:
++     *
++     *     fault signal=0xb addr=0x0 rip=0x8008ef49a  (__getauxval)
++     *
++     * Report no image address, which is what every platform without an auxv
++     * does here. Only this caller is affected: the auxv is read in three other
++     * places and all of them are out of reach -- one behind __linux__, two on
++     * the ARM feature paths. */
++    return 0;
++#elif defined(HAVE_GETAUXVAL)
+     ULONG_PTR size, num, phdr_addr = getauxval( AT_PHDR );
+     ElfW(Phdr) *phdr;
+ 
+-- 
+2.47.3

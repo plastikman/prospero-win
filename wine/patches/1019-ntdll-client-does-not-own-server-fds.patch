@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Thu, 8 Oct 2026 10:55:00 +0000
+Subject: [PATCH] ntdll: the client does not own the descriptors the server sends.
+
+0744 added errno to the failure and it answered a different question than the
+one asked:
+
+    failed to remap the process USD: 0 errno 9 size 1848 host_page 16384
+
+errno 9 is EBADF. The length was never the problem -- the descriptor was.
+
+server_get_unix_fd hands the caller a descriptor and a needs_close telling it to
+close it afterwards, which is right when the server sent a duplicate. Nothing
+can be duplicated on this console, so send_client_fd hands over the descriptor
+itself (0737, 0738), and closing it closes the server's. The user shared data
+shows it plainly: virtual_map_user_shared_data maps the section, closes the
+descriptor on its way out, and the next caller asks the server for the same
+object and gets a number that is no longer open.
+
+The server owns these and closes them with the object, so the client closes
+none of them: not on needs_close, and not when a cache entry is evicted.
+
+The 16 KiB rounding 0744 added stays -- the section is a host page wide (0102)
+and mapping it whole is correct either way.
+---
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1660,6 +1660,16 @@ int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
+                     *needs_close = (!reply->cacheable ||
+                                     !add_fd_to_cache( handle, fd, reply->type,
+                                                       reply->access, reply->options ));
++#ifdef __PROSPERO__
++                    /* ⚠ This descriptor is the server's own, not a copy of it:
++                     * nothing can be duplicated on this console, so the server
++                     * hands the descriptor itself over (see wine_server_send_fd
++                     * and send_client_fd). Closing it here closes the server's,
++                     * and the next request for the same object answers with a
++                     * number that is no longer open. The server owns these and
++                     * closes them with the object. */
++                    *needs_close = 0;
++#endif
+                 }
+                 else ret = STATUS_TOO_MANY_OPENED_FILES;
+             }
+@@ -2566,7 +2576,13 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE
+ 
+     server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+ 
++#ifndef __PROSPERO__
++    /* the cache held a copy of the server's descriptor; here it holds the
++     * server's own -- see server_get_unix_fd */
+     if (fd != -1) close( fd );
++#else
++    (void)fd;
++#endif
+     return ret;
+ }
+ 
+@@ -2633,7 +2649,13 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
+ 
+     server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+ 
++#ifndef __PROSPERO__
++    /* as above: evicting the cache entry does not close the server's own
++     * descriptor, which it closes with the object */
+     if (fd != -1) close( fd );
++#else
++    (void)fd;
++#endif
+ 
+     if (ret != STATUS_INVALID_HANDLE || !handle) return ret;
+     if (!peb->BeingDebugged) return ret;
+-- 
+2.47.3

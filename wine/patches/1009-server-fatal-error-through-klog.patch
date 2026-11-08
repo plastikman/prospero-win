@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Tue, 7 Oct 2026 19:10:00 +0000
+Subject: [PATCH] server: report a fatal error through klog as well.
+
+fatal_error writes to stderr and exits. On this console stderr goes nowhere, so
+every message it has produced was discarded -- including the ones saying why
+the server would not start. Worse, on PS4 the write itself took the title down
+with an uncatchable SIGSYS, so a diagnosable failure became a bare address.
+
+Finding the first of these messages meant symbolising klog's backtrace against
+the module bases and then reading the format string out of the binary by
+following the leaq operand. That is not a repeatable way to read an error.
+
+sceKernelDebugOutText needs no descriptor, no configuration and no network, and
+is synchronous -- which matters because the next statement is exit(). Send the
+message there too, keeping the stderr write for every other platform.
+---
+diff --git a/server/request.c b/server/request.c
+--- a/server/request.c
++++ b/server/request.c
+@@ -149,12 +149,33 @@ void fatal_protocol_error( struct thread *thread, const char *err, ... )
+     kill_thread( thread, 1 );
+ }
+ 
++#ifdef __PROSPERO__
++extern int sceKernelDebugOutText( int channel, const char *text );
++#endif
++
+ /* die on a fatal error */
+ void fatal_error( const char *err, ... )
+ {
+     va_list args;
+ 
+     va_start( args, err );
++#ifdef __PROSPERO__
++    /* stderr goes nowhere on this console, so every message this function has
++     * ever produced was discarded -- including the ones explaining why the
++     * server would not start. sceKernelDebugOutText needs no descriptor, no
++     * configuration and no network, and is synchronous, which matters because
++     * the next statement is exit(). */
++    {
++        char line[512];
++        int n = snprintf( line, sizeof(line), "wineserver: " );
++        if (n < 0) n = 0;
++        if ((size_t)n < sizeof(line))
++            vsnprintf( line + n, sizeof(line) - (size_t)n, err, args );
++        sceKernelDebugOutText( 0, line );
++    }
++    va_end( args );
++    va_start( args, err );
++#endif
+     fprintf( stderr, "wineserver: " );
+     vfprintf( stderr, err, args );
+     va_end( args );
+-- 
+2.47.3

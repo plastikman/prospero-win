@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Subject: [PATCH] ntdll: Use FreeBSD SA_* values for the PS4 raw sigaction call.
+
+The PS4 SDK headers give this translation unit Linux SA_* constants, but the
+raw sigaction system call (416) that the native signal path makes is parsed
+by the console's FreeBSD-derived kernel, which reads the FreeBSD values.
+Redefine SA_ONSTACK, SA_RESTART, SA_RESETHAND, SA_NODEFER and SA_SIGINFO for
+__PROSPERO__ in signal_x86_64.c only, matching the measured correction that
+orbis-compat/include/signal.h carries for ordinary applications. The host
+build and other signal users are unchanged.
+
+This change shipped in the console tree from 01.06 onward (GLDS10043 01.41 =
+v0.0.1, 01.43 = v0.0.2) but was never in the patch series; it is recovered
+here verbatim from that tree.
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -65,6 +65,23 @@
+ #ifdef HAVE_SYS_UCONTEXT_H
+ # include <sys/ucontext.h>
+ #endif
++#ifdef __PROSPERO__
++/* The PS4 SDK exposes Linux SA_* constants to this FreeBSD-derived kernel.
++ * Raw sigaction syscall 416 parses the FreeBSD values; orbis-compat/include/
++ * signal.h carries the same measured correction for regular applications.
++ * Keep this translation unit's direct syscall ABI correct without changing
++ * the host Wine build or other signal users. */
++# undef SA_ONSTACK
++# define SA_ONSTACK   0x0001
++# undef SA_RESTART
++# define SA_RESTART   0x0002
++# undef SA_RESETHAND
++# define SA_RESETHAND 0x0004
++# undef SA_NODEFER
++# define SA_NODEFER   0x0010
++# undef SA_SIGINFO
++# define SA_SIGINFO   0x0040
++#endif
+ #ifdef __APPLE__
+ # include <mach/mach.h>
+ /* _thread_set_tsd_base is private API for setting GSBASE, added in macOS 10.12.
+-- 
+2.47.3

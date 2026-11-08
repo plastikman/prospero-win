@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Tue, 7 Oct 2026 20:50:00 +0000
+Subject: [PATCH] server: share the descriptor for a mapping when dup is refused.
+
+No descriptor can be duplicated on this console -- dup, dup2, fcntl(F_DUPFD)
+and sceKernelRdup all fail, for regular files, directories, shm objects,
+sockets and pipes alike (src/dup-probe). An fd with a name can be reopened
+instead (0734); one without, which is the branch a mapping takes, cannot.
+
+Sharing is already how this path prefers to work: get_fd_object_for_mapping
+returns grab_object() whenever an fd with matching access and sharing exists,
+and only falls through to dup_fd_object when none matches exactly. A mapping
+never seeks -- it mmaps and nothing else -- so the file offset a duplicate
+would have owned is never used. Take the original when duplication is refused.
+
+Two things come with sharing rather than duplicating, and both took a run on
+the console to find:
+
+Leave the descriptor to its owner, as the sharing path above does. set_fd_user
+asserts that an fd has no user yet, and one opened for another object already
+has one; calling it aborted the server the first time a mapping of a real file
+took this path. The earlier ones had no owner, so it stayed hidden.
+
+Clear the error. dup_fd_object turns its errno into an NTSTATUS before it
+returns -- EPERM becomes STATUS_ACCESS_DENIED -- so recovering the descriptor
+without clearing it fails the request with the error of a call that no longer
+matters. That is what refused to start the game, long after the mapping itself
+had succeeded:
+
+    wine: cannot run "C:\Games\Oblivion\Oblivion.exe" in this process:
+          status c0000022
+---
+diff --git a/server/mapping.c b/server/mapping.c
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -1135,7 +1135,34 @@ static bool mapping_init( struct object *obj, const void *init_data )
+         if (!(mapping->fd = get_fd_object_for_mapping( data->fd, mapping_access, sharing )))
+         {
+             mapping->fd = dup_fd_object( data->fd, mapping_access, sharing, FILE_SYNCHRONOUS_IO_NONALERT );
++#ifdef __PROSPERO__
++            /* ⚠ No descriptor can be duplicated on this console (src/dup-probe:
++             * dup, dup2, fcntl(F_DUPFD) and sceKernelRdup all refused, for every
++             * kind of descriptor), and the fd that fails here -- the NLS file,
++             * opened by the server itself -- has no unix_name to reopen.
++             *
++             * Sharing is already how this path prefers to work:
++             * get_fd_object_for_mapping returns grab_object() whenever it finds
++             * an fd with matching access and sharing, and only falls here when
++             * none matches exactly. A mapping never seeks -- it mmaps and
++             * nothing else -- so the file offset a duplicate would have owned is
++             * never used. Take the original rather than fail. */
++#endif
+             if (mapping->fd) set_fd_user( mapping->fd, &mapping_fd_ops, NULL );
++#ifdef __PROSPERO__
++            /* Take the original, and leave it to its owner exactly as the
++             * sharing path above does: set_fd_user asserts that an fd has no
++             * user yet, and this one belongs to the object it was opened for.
++             *
++             * dup_fd_object has already turned its errno into an NTSTATUS on
++             * the way out -- EPERM becomes STATUS_ACCESS_DENIED -- so clear it,
++             * or the request fails with the error of a call we just recovered
++             * from. That is what refused to start the game:
++             *
++             *     wine: cannot run "C:\Games\Oblivion\Oblivion.exe" in this
++             *           process: status c0000022 */
++            else if ((mapping->fd = (struct fd *)grab_object( data->fd ))) clear_error();
++#endif
+         }
+         if (!mapping->fd) return false;
+ 
+-- 
+2.47.3

@@ -1,0 +1,159 @@
+From: Zak Peirce <zak@orbis-win>
+Subject: ntdll: report why the PS4 native libkernel resolver declines
+
+The ABI-v4 runs show successful signal registration and delivery calls but no
+handler entry, followed by a native provider with caps=0 and syscall=0. The
+resolver currently collapses every validation failure to zero, hiding whether
+module lookup, module layout, syscall-stub validation, or sigaction probing
+failed. Preserve its fail-closed behavior and add a compact reason code plus
+module lookup result to the existing Wine trace. This is diagnostic only; it
+does not relax signal-frame checks or enable the native backend.
+
+---
+diff --git a/dlls/ntdll/unix/native_libkernel_resolver.c b/dlls/ntdll/unix/native_libkernel_resolver.c
+--- a/dlls/ntdll/unix/native_libkernel_resolver.c
++++ b/dlls/ntdll/unix/native_libkernel_resolver.c
+@@ -26,12 +26,28 @@ int native_libkernel_resolve(const void *record, size_t length, uintptr_t getppi
+     uint32_t count;
+     if(!entries) return 0;
+     memset(entries,0,sizeof(*entries));
+-    if(!info || length!=0x160 || !ops || !ops->syscall_at || !getppid_import || !sysarch_import) return 0;
+-    if(read64(info)!=0 && read64(info)!=0x160) return 0;
++    if(!info || length!=0x160 || !ops || !ops->syscall_at || !getppid_import || !sysarch_import)
++    {
++        entries->reason=NATIVE_LIBKERNEL_RESOLVE_BAD_ARGUMENT;
++        return 0;
++    }
++    if(read64(info)!=0 && read64(info)!=0x160)
++    {
++        entries->reason=NATIVE_LIBKERNEL_RESOLVE_BAD_INFO_SIZE;
++        return 0;
++    }
+     /* the ELF loader's libkernel is a different module and is not supported */
+-    if(memcmp(info+8,"libkernel.sprx",sizeof("libkernel.sprx"))) return 0;
++    if(memcmp(info+8,"libkernel.sprx",sizeof("libkernel.sprx")))
++    {
++        entries->reason=NATIVE_LIBKERNEL_RESOLVE_WRONG_MODULE;
++        return 0;
++    }
+     count=read32(info+0x148);
+-    if(!count || count>4) return 0;
++    if(!count || count>4)
++    {
++        entries->reason=NATIVE_LIBKERNEL_RESOLVE_BAD_SEGMENT_COUNT;
++        return 0;
++    }
+     entry=getppid_import+NATIVE_LIBKERNEL_STUB_SYSCALL;
+     for(unsigned i=0;i<count;i++)
+     {
+@@ -40,18 +56,43 @@ int native_libkernel_resolve(const void *record, size_t length, uintptr_t getppi
+         if(!(read32(s+12)&4) || start>UINTPTR_MAX-size) continue;
+         if(getppid_import>=start && entry+2<=start+size) { text=start; text_end=start+size; }
+     }
+-    if(!text) return 0;
++    if(!text)
++    {
++        entries->reason=NATIVE_LIBKERNEL_RESOLVE_NO_GETPPID_STUB;
++        return 0;
++    }
+     /* the instruction runs whichever call is in %rax: getpid and getppid
+      * swapped, which only a real syscall instruction can answer */
+-    if(ops->pid<=0 || ops->ppid<0 || ops->pid==ops->ppid) return 0;
+-    if(ops->syscall_at(entry,NATIVE_LIBKERNEL_SYS_GETPID,0,0,0)!=ops->pid ||
+-       ops->syscall_at(entry,NATIVE_LIBKERNEL_SYS_GETPPID,0,0,0)!=ops->ppid) return 0;
++    if(ops->pid<=0 || ops->ppid<0 || ops->pid==ops->ppid)
++    {
++        entries->reason=NATIVE_LIBKERNEL_RESOLVE_BAD_PROCESS_IDS;
++        return 0;
++    }
++    if(ops->syscall_at(entry,NATIVE_LIBKERNEL_SYS_GETPID,0,0,0)!=ops->pid)
++    {
++        entries->reason=NATIVE_LIBKERNEL_RESOLVE_GETPID_MISMATCH;
++        return 0;
++    }
++    if(ops->syscall_at(entry,NATIVE_LIBKERNEL_SYS_GETPPID,0,0,0)!=ops->ppid)
++    {
++        entries->reason=NATIVE_LIBKERNEL_RESOLVE_GETPPID_MISMATCH;
++        return 0;
++    }
+     /* a raw sigaction query sees the kernel's registration: none, or
+      * libkernel's own entry when its wrapper installed a handler */
+     memset(&action,0,sizeof(action));
+-    if(ops->syscall_at(entry,NATIVE_LIBKERNEL_SYS_SIGACTION,11 /* SIGSEGV */,0,(long)(uintptr_t)&action)) return 0;
+-    if(action.handler>1 && (action.handler<text || action.handler>=text_end)) return 0;
++    if(ops->syscall_at(entry,NATIVE_LIBKERNEL_SYS_SIGACTION,11 /* SIGSEGV */,0,(long)(uintptr_t)&action))
++    {
++        entries->reason=NATIVE_LIBKERNEL_RESOLVE_SIGACTION_QUERY;
++        return 0;
++    }
++    if(action.handler>1 && (action.handler<text || action.handler>=text_end))
++    {
++        entries->reason=NATIVE_LIBKERNEL_RESOLVE_HANDLER_OUTSIDE_TEXT;
++        return 0;
++    }
+     entries->syscall=entry;
+     entries->sysarch=sysarch_import;
++    entries->reason=NATIVE_LIBKERNEL_RESOLVE_OK;
+     return 1;
+ }
+diff --git a/dlls/ntdll/unix/native_libkernel_resolver.h b/dlls/ntdll/unix/native_libkernel_resolver.h
+--- a/dlls/ntdll/unix/native_libkernel_resolver.h
++++ b/dlls/ntdll/unix/native_libkernel_resolver.h
+@@ -9,9 +9,23 @@
+ #define NATIVE_LIBKERNEL_SYS_GETPID 20
+ #define NATIVE_LIBKERNEL_SYS_GETPPID 39
+ #define NATIVE_LIBKERNEL_SYS_SIGACTION 416
++enum native_libkernel_resolve_reason {
++    NATIVE_LIBKERNEL_RESOLVE_OK,
++    NATIVE_LIBKERNEL_RESOLVE_BAD_ARGUMENT,
++    NATIVE_LIBKERNEL_RESOLVE_BAD_INFO_SIZE,
++    NATIVE_LIBKERNEL_RESOLVE_WRONG_MODULE,
++    NATIVE_LIBKERNEL_RESOLVE_BAD_SEGMENT_COUNT,
++    NATIVE_LIBKERNEL_RESOLVE_NO_GETPPID_STUB,
++    NATIVE_LIBKERNEL_RESOLVE_BAD_PROCESS_IDS,
++    NATIVE_LIBKERNEL_RESOLVE_GETPID_MISMATCH,
++    NATIVE_LIBKERNEL_RESOLVE_GETPPID_MISMATCH,
++    NATIVE_LIBKERNEL_RESOLVE_SIGACTION_QUERY,
++    NATIVE_LIBKERNEL_RESOLVE_HANDLER_OUTSIDE_TEXT
++};
+ struct native_libkernel_entries {
+     uintptr_t syscall;  /* a syscall instruction inside libkernel's code */
+     uintptr_t sysarch;
++    unsigned int reason;
+ };
+ struct native_libkernel_ops {
+     /* runs the system call NUMBER through the instruction at ENTRY */
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -132,12 +132,27 @@ unsigned int __wine_prospero_native_wow64_caps( unsigned int version )
+ static void pw_native_resolve_kernel(void)
+ {
+     unsigned char info[0x160] = {0};
++    char module_name[33];
+     uint64_t size = sizeof(info);
++    uint32_t segment_count;
+     struct native_libkernel_ops ops = { pw_native_syscall_at, getpid(), getppid() };
++    int info_status;
+     memcpy( info, &size, sizeof(size) );
+-    if (sceKernelGetModuleInfo( 0x2001, info )) return;
++    info_status = sceKernelGetModuleInfo( 0x2001, info );
++    if (info_status)
++    {
++        ERR_(seh)( "PW_NATIVE_RESOLVE module_info handle=0x2001 rc=%d\n", info_status );
++        return;
++    }
++    memcpy( module_name, info + 8, 32 );
++    module_name[32] = 0;
++    memcpy( &segment_count, info + 0x148, sizeof(segment_count) );
+     native_libkernel_resolve( info, sizeof(info), (uintptr_t)getppid,
+                               (uintptr_t)sysarch, &ops, &pw_native_kernel );
++    ERR_(seh)( "PW_NATIVE_RESOLVE module=%s segments=%u getppid=%p sysarch=%p pid=%ld ppid=%ld result=%u reason=%u syscall=%p\n",
++               module_name, segment_count, (void *)getppid,
++               (void *)sysarch, ops.pid, ops.ppid, !!pw_native_kernel.syscall,
++               pw_native_kernel.reason, (void *)pw_native_kernel.syscall );
+ }
+ static int pw_native_sigaction( int signal, const struct sigaction *action,
+                                 struct sigaction *previous )
+-- 
+2.47.3

@@ -1,3 +1,12 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Subject: [PATCH] kernelbase: Log the x86 fault context when no debugger is attached.
+
+UnhandledExceptionFilter ends a process with no debugger after printing a
+one-line message, which does not say where a 32-bit guest faulted. On i386
+call log_exception_context32() first, so the PW_EXCEPTION32 register, stack
+and code-page records reach the log before the process ends.
+---
 diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
 index 579b70d542..916c4d6d6a 100644
 --- a/dlls/kernelbase/debug.c

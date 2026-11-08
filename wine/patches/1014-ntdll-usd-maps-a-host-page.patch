@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Thu, 8 Oct 2026 10:40:00 +0000
+Subject: [PATCH] ntdll: map the user shared data a whole host page at a time.
+
+With the environment reaching Wine, it finds its prefix, decides the prefix
+needs wineboot, and stops there:
+
+    err:virtual:virtual_init_user_shared_data failed to remap the process USD: 0
+
+res is 0, so server_get_unix_fd worked and it is the mmap that failed -- which
+the message could not say, because it only ever prints res.
+
+The length is the likely reason: it asks for sizeof(KUSER_SHARED_DATA), and this
+console's pages are 16 KiB, so that is not a whole page. The section is exactly
+one host page wide (patch 0102), so map it that way. virtual_map_user_shared_data
+already passes a page-sized length and is reached first, without complaint.
+
+Both messages now print errno as well, so if the length was not the reason the
+next run says what was.
+---
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -5130,7 +5130,11 @@ void virtual_map_user_shared_data(void)
+     if ((res = server_get_unix_fd( section, 0, &fd, &needs_close, NULL, NULL )) ||
+         (user_shared_data != mmap( user_shared_data, page_size, PROT_READ, MAP_SHARED|MAP_FIXED, fd, 0 )))
+     {
++#ifdef __PROSPERO__
++        ERR( "failed to remap the process USD: %d errno %d\n", res, errno );
++#else
+         ERR( "failed to remap the process USD: %d\n", res );
++#endif
+         exit(1);
+     }
+     if (needs_close) close( fd );
+@@ -5158,12 +5162,27 @@ void virtual_init_user_shared_data(void)
+         ERR( "failed to open the USD section: %08x\n", status );
+         exit(1);
+     }
++#ifdef __PROSPERO__
++    /* ⚠ Map a whole host page. This console's pages are 16 KiB, and the
++     * section is exactly one of them (patch 0102); mmap refuses a length that
++     * is not a multiple of a page. The error below prints errno too, because
++     * res is 0 whenever it is the mmap rather than the fd that failed. */
++    if ((res = server_get_unix_fd( section, 0, &fd, &needs_close, NULL, NULL )) ||
++        (data = mmap( NULL, (sizeof(*data) + host_page_size - 1) & ~(host_page_size - 1),
++                      PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED)
++    {
++        ERR( "failed to remap the process USD: %d errno %d size %u host_page %u\n",
++             res, errno, (unsigned int)sizeof(*data), (unsigned int)host_page_size );
++        exit(1);
++    }
++#else
+     if ((res = server_get_unix_fd( section, 0, &fd, &needs_close, NULL, NULL )) ||
+         (data = mmap( NULL, sizeof(*data), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED)
+     {
+         ERR( "failed to remap the process USD: %d\n", res );
+         exit(1);
+     }
++#endif
+     if (needs_close) close( fd );
+     NtClose( section );
+ 
+-- 
+2.47.3

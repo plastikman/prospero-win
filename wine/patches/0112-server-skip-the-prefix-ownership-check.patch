@@ -14,7 +14,7 @@ forward onto the ABI-v4 base.
 diff --git a/server/request.c b/server/request.c
 --- a/server/request.c
 +++ b/server/request.c
-@@ -1154,8 +1154,10 @@ static char *create_server_dir( int force )
+@@ -1154,7 +1154,9 @@ static char *create_server_dir( int force )
          fatal_error( "open %s: %s\n", config_dir, strerror( errno ));
      if (fstat( config_dir_fd, &st ) == -1)
          fatal_error( "stat %s: %s\n", config_dir, strerror( errno ));

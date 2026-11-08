@@ -11,11 +11,13 @@ because upstream already uses 0865 for a different patch.
 diff --git a/server/request.c b/server/request.c
 --- a/server/request.c
 +++ b/server/request.c
-@@ -145,6 +145,25 @@ void fatal_protocol_error( struct thread *thread, const char *err, ... )
+@@ -145,6 +145,24 @@ void fatal_protocol_error( struct thread *thread, const char *err, ... )
      fprintf( stderr, "Protocol error:%04x: ", thread->id );
      vfprintf( stderr, err, args );
      va_end( args );
 +#ifdef __PROSPERO__
++    /* This PRX's stderr is not captured on the console. Preserve the protocol
++     * failure reason in klog before kill_thread tears down its request path. */
 +    {
 +        extern int sceKernelDebugOutText( int channel, const char *text );
 +        char line[256];

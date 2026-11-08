@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] ntdll: skip active stack during legacy force-exec walk
+
+The Orbis kernel can fault while sceKernelMprotect changes permissions on
+the direct-memory view containing the stack used by the current syscall.
+Leave that one view unchanged during Wine's startup ProcessExecuteFlags walk.
+This is a one-time startup check, with no per-frame cost, and is PS4-only.
+
+---
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -5867,6 +5867,9 @@ void virtual_set_force_exec( BOOL enable )
+ {
+     struct file_view *view;
+     sigset_t sigset;
++#ifdef __PS4__
++    ULONG_PTR stack_addr = (ULONG_PTR)&sigset;
++#endif
+ #ifdef __PS4__
+     if (enable && ps4_keep_no_exec())
+     {
+@@ -5887,6 +5890,13 @@ void virtual_set_force_exec( BOOL enable )
+             /* file mappings are always accessible */
+             BYTE commit = is_view_valloc( view ) ? 0 : VPROT_COMMITTED;
+ 
++#ifdef __PS4__
++            /* Changing the direct-memory view that contains this syscall's
++             * active stack can unmap the return stack during mprotect. */
++            if (stack_addr >= (ULONG_PTR)view->base &&
++                stack_addr - (ULONG_PTR)view->base < view->size)
++                continue;
++#endif
+             mprotect_range( view->base, view->size, commit, 0 );
+         }
+     }
+-- 
+2.47.3

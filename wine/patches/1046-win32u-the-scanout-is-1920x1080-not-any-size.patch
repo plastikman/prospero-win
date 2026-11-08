@@ -33,8 +33,8 @@ gets its frames scaled into it, which is what a television wants anyway --
 vkd3d blits, so this costs it nothing.
 
 WINE_PS5_SCANOUT=WxH overrides it for a console in another video mode.
+---
 diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
-index cddf9eaf41..74bc65b2ce 100644
 --- a/dlls/win32u/vulkan.c
 +++ b/dlls/win32u/vulkan.c
 @@ -27,6 +27,11 @@
@@ -97,27 +97,74 @@ index cddf9eaf41..74bc65b2ce 100644
      (void)client_rect;
  #else
      /* Update the image extents to match what the Win32 WSI would provide. */
-
-diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
---- a/dlls/win32u/vulkan.c
-+++ b/dlls/win32u/vulkan.c
-@@ -2003,0 +2004 @@
+@@ -1957,8 +2001,10 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
+     struct swapchain *swapchain = swapchain_from_handle( acquire_info->swapchain );
+     struct vulkan_device *device = vulkan_device_from_handle( client_device );
+     VkAcquireNextImageInfoKHR acquire_info_host = *acquire_info;
 +#ifndef __PROSPERO__
-@@ -2005,0 +2007 @@
+     struct surface *surface = swapchain->surface;
+     RECT client_rect;
 +#endif
-@@ -2012,0 +2015 @@
+     VkResult res;
+ 
+     acquire_info_host.swapchain = swapchain->obj.host.swapchain;
+@@ -1966,6 +2012,7 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
+     acquire_info_host.fence = fence ? fence->host.fence : 0;
+     res = device->p_vkAcquireNextImage2KHR( device->host.device, &acquire_info_host, image_index );
+ 
 +#ifndef __PROSPERO__
-@@ -2019,0 +2023 @@
+     if (!res && get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ) &&
+         !extents_equals( &swapchain->extents, &client_rect ))
+     {
+@@ -1973,6 +2020,7 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
+               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
+         return VK_SUBOPTIMAL_KHR;
+     }
 +#endif
-@@ -2030,0 +2035 @@
+ 
+     return res;
+ }
+@@ -1984,14 +2032,17 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
+     struct vulkan_fence *fence = client_fence ? vulkan_fence_from_handle( client_fence ) : NULL;
+     struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
+     struct vulkan_device *device = vulkan_device_from_handle( client_device );
 +#ifndef __PROSPERO__
-@@ -2032,0 +2038 @@
+     struct surface *surface = swapchain->surface;
+     RECT client_rect;
 +#endif
-@@ -2038,0 +2045 @@
+     VkResult res;
+ 
+     res = device->p_vkAcquireNextImageKHR( device->host.device, swapchain->obj.host.swapchain, timeout,
+                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
+                                               image_index );
+ 
 +#ifndef __PROSPERO__
-@@ -2045,0 +2053 @@
+     if (!res && get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ) &&
+         !extents_equals( &swapchain->extents, &client_rect ))
+     {
+@@ -1999,6 +2050,7 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
+               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
+         return VK_SUBOPTIMAL_KHR;
+     }
 +#endif
-@@ -2107,0 +2116 @@
+ 
+     return res;
+ }
+@@ -2061,6 +2113,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+         }
+         else if (swapchain_res)
+             WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
 +#ifndef __PROSPERO__
-@@ -2114,0 +2124 @@
+         else if (!extents_equals( &swapchain->extents, &client_rect ))
+         {
+             WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
+@@ -2068,6 +2121,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+             if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
+             if (!res) res = VK_SUBOPTIMAL_KHR;
+         }
 +#endif
+     }
+ 
+     if (swapchains != swapchains_buffer) free( swapchains );
+-- 
+2.47.3

@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Thu, 8 Oct 2026 11:20:00 +0000
+Subject: [PATCH] ntdll: the prefix arrives booted, so do not run wineboot.
+
+With the user shared data mapped (0744, 0745), Wine reaches the end of its
+process initialisation and stops at the one thing a title cannot do:
+
+    trace:process:NtCreateUserProcess process creation is not supported on PS5
+    err:environ:run_wineboot failed to start wineboot c00000bb
+
+c00000bb is STATUS_NOT_SUPPORTED. wineboot is a separate executable, and
+NtCreateUserProcess has never been available here.
+
+It also has nothing to do. The prefix is built by Wine on a host and copied to
+the console whole -- registry, system32 and all -- so it arrives in the state
+wineboot would leave it in. Signal the event the rest of the process waits on
+and return.
+
+Falling through instead would wait the full five minutes for a process that
+cannot start, report a timeout, and carry on anyway.
+
+virtual_init_user_shared_data still runs: it fills in the shared data the
+process needs regardless of who booted the prefix.
+---
+diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -1582,6 +1582,22 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
+     }
+ 
+     virtual_init_user_shared_data();
++
++#ifdef __PROSPERO__
++    /* ⚠ A title cannot create a process -- NtCreateUserProcess answers
++     * STATUS_NOT_SUPPORTED -- so wineboot cannot run here:
++     *
++     *     trace:process:NtCreateUserProcess process creation is not supported
++     *     err:environ:run_wineboot failed to start wineboot c00000bb
++     *
++     * It has nothing to do either. The prefix is built by Wine on a host and
++     * copied to the console whole, registry and all, so it arrives booted.
++     * Signal the event the rest of the process waits on and carry on; falling
++     * through would wait five minutes for a process that cannot start. */
++    NtSetEvent( handles[0], NULL );
++    goto wait;
++#endif
++
+     env[size] = 0;
+     params.Flags           = PROCESS_PARAMS_FLAG_NORMALIZED;
+     params.Environment     = env;
+-- 
+2.47.3

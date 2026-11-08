@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps4-gladius <ps4-gladius@invalid>
+Date: Thu, 8 Oct 2026 10:10:00 +0000
+Subject: [PATCH] ntdll: survive a NULL environ.
+
+The client and the in-process server now complete their handshake --
+
+    WINE wine startup: server connected
+
+-- and start_main_thread carries on to get_initial_environment, which faults at
+address 0:
+
+    PW_WINE64 fault signal=0xb addr=0x0 rip=0x800884612   (env.c:877)
+
+    for (e = environ; *e; e++) *size += strlen(*e) + 6;
+
+environ is NULL. A title inherits no environment, and this module's libc leaves
+the list NULL until something writes to it -- pw_ps4_setenv, which the title
+calls through the module's descriptor, because each module otherwise carries a
+private one. Wine takes POSIX at its word and dereferences it unguarded.
+
+Carry on with an empty environment instead of dying, and say so once through
+klog. This is not the whole story: an empty environment means no WINEPREFIX and
+no HOME, so Wine will go looking for its prefix somewhere else. The title's own
+"environment status=0" covers only its setenv and never the module's, so
+pw_prx_env_ps4.c now reports what reached this environ -- "never called" and
+"called and did not take" have looked identical until now.
+---
+diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -872,14 +872,28 @@ static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
+     char **e;
+     WCHAR *env, *ptr, *end;
+ 
++#ifdef __PROSPERO__
++    /* ⚠ A title has no environment to inherit, and this module's libc leaves
++     * environ NULL until something writes to it (pw_ps4_setenv, which the title
++     * calls through the module's descriptor). Wine assumes POSIX gives it a
++     * list and walked straight into the NULL here, faulting at address 0 with
++     * the whole client/server handshake already behind it. Say so and carry on
++     * with an empty environment rather than die. */
++    if (!environ)
++    {
++        extern int sceKernelDebugOutText( int channel, const char *text );
++        sceKernelDebugOutText( 0, "wine: environ is NULL; starting with an empty environment\n" );
++    }
++#endif
++
+     /* estimate needed size */
+     *size = 1;
+-    for (e = environ; *e; e++) *size += strlen(*e) + 6;
++    for (e = environ; e && *e; e++) *size += strlen(*e) + 6;
+ 
+     env = malloc( *size * sizeof(WCHAR) );
+     ptr = env;
+     end = env + *size - 1;
+-    for (e = environ; *e && ptr < end; e++)
++    for (e = environ; e && *e && ptr < end; e++)
+     {
+         char *str = *e;
+ 
+-- 
+2.47.3
