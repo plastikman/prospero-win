@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Subject: [PATCH] server: Send the PS4 in-process server's stderr to the title's log.
+
+The in-process wineserver is a PRX with a libc of its own, and nothing reads
+that libc's stderr on the console, so everything the server printed was
+lost: the wait watchdog (PW_WAIT_WATCHDOG, patches 0680/0980) ran on
+2026-11-08 for Bloodlines' quit hang and left nothing at all.
+
+ntdll now hands the server the output sink the title already logs Wine's
+stderr through (pw_wineserver_set_output_sink, called before
+pw_wineserver_connect), and on __PROSPERO__ object.h routes the server's
+fprintf/vfprintf to stderr through it. Other streams (registry files) and
+output before a sink is set are unchanged. The watchdog also says once that
+it is on. Nothing changes unless something is printed, and the watchdog
+stays off unless a profile sets PW_WAIT_WATCHDOG=1.
+---
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1936,6 +1936,13 @@ static void share_name_changes( void *module )
+  * Load the server module beside ntdll (server/ in a build tree), start it
+  * on first use and get a new client connection from it.
+  */
++#ifdef __PROSPERO__
++static void server_output_to_stderr( const char *str, size_t len )
++{
++    wine_write_stderr( str, len );
++}
++#endif
++
+ static int connect_inprocess_server(void)
+ {
+     Dl_info info;
+@@ -1973,6 +1980,15 @@ static int connect_inprocess_server(void)
+     if (!(connect_server = dlsym( module, "pw_wineserver_connect" )))
+         fatal_error( "%s has no pw_wineserver_connect\n", module_path );
+     register_server_thread = dlsym( module, "pw_wine_thread_register" );
++#ifdef __PROSPERO__
++    /* The server's stderr reaches nothing on the console; give it ours (see
++     * server/object.h), before it starts and has anything to say. */
++    {
++        void (*set_server_sink)( void (*)( const char *, size_t ) ) =
++            dlsym( module, "pw_wineserver_set_output_sink" );
++        if (set_server_sink) set_server_sink( server_output_to_stderr );
++    }
++#endif
+     if ((fd = connect_server( nls_dir, environ, getenv( "WINEPREFIX" ) )) == -1)
+         fatal_error( "the in-process server %s did not start\n", module_path );
+     unregister_server_thread = dlsym( module, "pw_wine_thread_unregister" );
+diff --git a/server/main.c b/server/main.c
+--- a/server/main.c
++++ b/server/main.c
+@@ -351,3 +351,40 @@ int main( int argc, char *argv[] )
+     main_loop();
+     return 0;
+ }
++
++#ifdef __PROSPERO__
++/* The stderr redirection object.h declares. Last in the file, after the last
++ * fprintf of main.c's own, because the real stdio calls are needed here. */
++#undef fprintf
++#undef vfprintf
++
++static void (*server_output_sink)( const char *str, size_t len );
++
++DECLSPEC_EXPORT void pw_wineserver_set_output_sink( void (*sink)( const char *str, size_t len ) )
++{
++    server_output_sink = sink;
++}
++
++int ps5_server_vfprintf( FILE *file, const char *format, va_list args )
++{
++    char buffer[1024];
++    int len;
++
++    if (file != stderr || !server_output_sink) return vfprintf( file, format, args );
++    if ((len = vsnprintf( buffer, sizeof(buffer), format, args )) < 0) return len;
++    if ((size_t)len >= sizeof(buffer)) len = sizeof(buffer) - 1;
++    server_output_sink( buffer, (size_t)len );
++    return len;
++}
++
++int ps5_server_fprintf( FILE *file, const char *format, ... )
++{
++    va_list args;
++    int ret;
++
++    va_start( args, format );
++    ret = ps5_server_vfprintf( file, format, args );
++    va_end( args );
++    return ret;
++}
++#endif
+diff --git a/server/object.h b/server/object.h
+--- a/server/object.h
++++ b/server/object.h
+@@ -392,4 +392,22 @@ extern struct type_descr alpc_port_type;
+ #define KEYEDEVENT_WAKE       0x0002
+ #define KEYEDEVENT_ALL_ACCESS (STANDARD_RIGHTS_REQUIRED | 0x0003)
+ 
++#ifdef __PROSPERO__
++/* ⚠ THE SERVER'S STDERR GOES NOWHERE ON THE CONSOLE. It is a PRX with a libc
++ * of its own, and nothing reads that libc's file descriptor 2, so every
++ * fprintf( stderr ) the server makes -- the wait watchdog's snapshots
++ * (PW_WAIT_WATCHDOG), fatal_protocol_error, the slow-operation and trace
++ * output -- was lost. ntdll hands the server its own output sink
++ * (pw_wineserver_set_output_sink, before pw_wineserver_connect), the one the
++ * title already logs Wine's stderr through, and these two route stderr to it.
++ * Anything not written to stderr, or written before a sink is set, goes where
++ * it always did. */
++#include <stdarg.h>
++#include <stdio.h>
++extern int ps5_server_fprintf( FILE *file, const char *format, ... ) __attribute__((format(printf, 2, 3)));
++extern int ps5_server_vfprintf( FILE *file, const char *format, va_list args );
++#define fprintf ps5_server_fprintf
++#define vfprintf ps5_server_vfprintf
++#endif
++
+ #endif  /* __WINE_SERVER_OBJECT_H */
+diff --git a/server/thread.c b/server/thread.c
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -1251,7 +1251,11 @@ static void start_wait_watchdog(void)
+ 
+     if (started) return;
+     started = 1;
+-    if (getenv( "WINE_PS5_WAIT_WATCHDOG" ) || getenv( "PW_WAIT_WATCHDOG" )) add_timeout_user( -2 * TICKS_PER_SEC, wait_watchdog, NULL );
++    if (getenv( "WINE_PS5_WAIT_WATCHDOG" ) || getenv( "PW_WAIT_WATCHDOG" ))
++    {
++        fprintf( stderr, "wine-ps5: wait watchdog on: a snapshot every 2 s, a thread's stack after 3 s in one wait\n" );
++        add_timeout_user( -2 * TICKS_PER_SEC, wait_watchdog, NULL );
++    }
+ }
+ 
+ static int wait_on( const union select_op *select_op, unsigned int count, struct object *objects[],
+-- 
+2.47.3
