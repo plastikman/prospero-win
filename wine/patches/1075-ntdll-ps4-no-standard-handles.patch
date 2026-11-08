@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Subject: [PATCH] ntdll: Give a PS4 title's Windows side no standard handles.
+
+Descriptors 0-2 of a PS4 title are not standard streams: nothing reads them,
+so whatever a game wrote there was lost. Worse, once one stops taking data a
+write to it never ends: it goes async, and the in-process server, which holds
+no copy of the descriptor on this console, never sees it become writable.
+Bloodlines hung on every Quit that way (2026-11-08, found with the wait
+watchdog through 1074): its main thread sat in WriteFile on its stderr handle
+with the engine's shutdown warnings.
+
+On __PROSPERO__ get_initial_console now leaves hStdInput, hStdOutput and
+hStdError NULL, so writes to them fail at once (C runtimes treat that as no
+console), and logs once what descriptors 0-2 are (PW_STD_HANDLES).
+---
+diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -1356,6 +1356,34 @@ static void get_initial_console( RTL_USER_PROCESS_PARAMETERS *params )
+ {
+     int output_fd = -1;
+ 
++#ifdef __PROSPERO__
++    /* ⚠ A TITLE'S DESCRIPTORS 0-2 ARE NOT STANDARD STREAMS. Nothing on the
++     * console reads them, so what a game writes there was lost anyway, and
++     * once one stops taking data the write never ends: it goes async, and the
++     * server, which holds no copy of the descriptor on this console (it cannot
++     * duplicate one), never sees it become writable. Vampire: The Masquerade
++     * - Bloodlines hung on every Quit that way (2026-11-08): its main thread
++     * sat in WriteFile on its stderr handle with the engine's shutdown
++     * warnings ("Reference Count for Material ... != 0").
++     *
++     * So give Windows no standard handles at all: writing to them fails at
++     * once, which C runtimes treat as no console. Say once what 0-2 are. */
++    {
++        struct stat st;
++        int fd;
++
++        for (fd = 0; fd <= 2; fd++)
++        {
++            if (fstat( fd, &st ))
++                ERR( "PW_STD_HANDLES fd=%d is not open (errno %d)\n", fd, errno );
++            else
++                ERR( "PW_STD_HANDLES fd=%d mode=%o tty=%d: not given to Windows\n",
++                     fd, (unsigned int)st.st_mode, isatty( fd ) );
++        }
++        return;
++    }
++#endif
++
+     wine_server_fd_to_handle( 0, GENERIC_READ|SYNCHRONIZE,  OBJ_INHERIT, &params->hStdInput );
+     wine_server_fd_to_handle( 1, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdOutput );
+     wine_server_fd_to_handle( 2, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdError );
+-- 
+2.47.3
