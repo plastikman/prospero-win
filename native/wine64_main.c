@@ -40,6 +40,7 @@
 #include "pw_audio_ps5.h"
 #include "pw_pad_ps5.h"
 #include "pw_hid_ps5.h"
+#include "pw_update_ps4.h"
 #include "pw_osk_ps5.h"
 #include "pw_videoout_ps5.h"
 #include "pw_wine_library.h"
@@ -846,6 +847,11 @@ static void hid_log(const char *line)
     PS5LOG_LOG("PW_WINE64 hid %s", line);
 }
 
+static void update_log(const char *line)
+{
+    PS5LOG_LOG("PW_WINE64 %s", line);
+}
+
 /* The console's on-screen keyboard's. */
 static void osk_log(const char *line)
 {
@@ -877,7 +883,7 @@ static void run_launcher(void)
     PwLauncherScene scene = { items, 0, PW_LAUNCHER_RENDER_NONE,
         launch.refused ? "THAT GAME IS NOT IN THE LIBRARY" :
         !catalog_count ? "ADD PROFILES TO /DATA/PROSPERO-WIN/PROFILES" :
-        launch.cycle ? "WELCOME BACK" : "CHOOSE A GAME" };
+        launch.cycle ? "WELCOME BACK" : "CHOOSE A GAME", NULL };
     static PwHidPs5 hid;
     int video_status = pw_videoout_ps5_open(&video), pad_status = pw_pad_ps5_platform_ops(&pad_ops);
     int hid_status, dirty = 1, chosen = -1;
@@ -911,6 +917,9 @@ static void run_launcher(void)
     int report_help = 0;
     pw_diagnostics_status(log_status, sizeof(log_status));
     scene.status = log_status;
+    /* A newer stable release on GitHub, shown in the title bar once known;
+     * the check runs on its own thread and never holds the launcher up. */
+    pw_update_ps4_start(library_root, update_log);
     for (uint64_t tick = 1; chosen < 0; tick++) {
         pw_diagnostics_tick(now_ns());
         if (tick % PW_WINE64_TICKS_PER_S == 0 && !report_help) {
@@ -947,6 +956,7 @@ static void run_launcher(void)
                     chosen = (int)scene.selected;
         }
         dirty |= scene.selected != before;
+        if (!scene.notice && (scene.notice = pw_update_ps4_notice())) dirty = 1;
         if (PW_WINE64_SCRIPT && tick == 3 * PW_WINE64_TICKS_PER_S) {
             if (launch.cycle >= PW_WINE64_SCRIPT_CYCLES) {
                 PS5LOG_LOG("PW_WINE64 launcher script done cycles=%u", (unsigned)launch.cycle);

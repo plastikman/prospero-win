@@ -21,6 +21,7 @@ typedef struct PwLauncherScene {
     const PwLauncherItem *items;
     uint32_t count,selected;     /* selected==PW_LAUNCHER_RENDER_NONE: no highlight */
     const char *status;          /* optional taskbar status text */
+    const char *notice;          /* optional title-bar notice (e.g. an update) */
 } PwLauncherScene;
 
 /* What a pad button or a key does in the launcher. */

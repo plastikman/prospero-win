@@ -215,13 +215,26 @@ static void background(const Canvas *c)
         }
     }
 }
-static void title_bar(const Canvas *c)
+static void title_bar(const Canvas *c,const char *notice)
 {
     ramp(c,0,0,W,BAR,rgb(0x3a,0x86,0xf2),rgb(0x0a,0x44,0xc0));
     fill(c,0,0,W,3,rgb(0x8c,0xbc,0xff));
     fill(c,0,BAR-3,W,3,rgb(0x06,0x2e,0x8a));
+    int32_t left=48+text_width("Prospero Win",6);
     text(c,48,27,"Prospero Win",6,rgb(0xff,0xff,0xff),W);
-    text(c,W-48-text_width("Library",5),31,"Library",5,rgb(0xdc,0xea,0xff),W);
+    int32_t right=W-48-text_width("Library",5);
+    text(c,right,31,"Library",5,rgb(0xdc,0xea,0xff),W);
+    /* A notice (a newer release) sits between the two as an amber pill, in
+     * the middle of what is free, cut to fit. */
+    if(notice && *notice) {
+        int32_t room=right-left-96,width=text_width(notice,3);
+        if(width>room-48)width=room-48;
+        if(width>0) {
+            int32_t x=left+48+(room-width-48)/2;
+            rounded(c,x,(BAR-52)/2,width+48,52,26,rgb(0xff,0xd2,0x5a),rgb(0xf0,0xa8,0x1e));
+            text(c,x+24,(BAR-52)/2+16,notice,3,rgb(0x3a,0x22,0x00),width);
+        }
+    }
 }
 static void tile(const Canvas *c,int32_t x,int32_t y,const PwLauncherItem *item,int selected)
 {
@@ -279,7 +292,7 @@ int pw_launcher_render(const PwLauncherScene *scene,const PwPresentTarget *targe
         return PW_ERR_PRECONDITION;
     for(uint32_t i=0;i<scene->count;i++)if(!scene->items[i].title)return PW_ERR_PRECONDITION;
     const Canvas canvas={target->pixels,target->stride};
-    background(&canvas);title_bar(&canvas);
+    background(&canvas);title_bar(&canvas,scene->notice);
     if(!scene->count) {
         const char *empty="No application profiles found";
         text(&canvas,(W-text_width(empty,5))/2,480,empty,5,rgb(0xff,0xff,0xff),W);

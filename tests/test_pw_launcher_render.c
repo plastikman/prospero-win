@@ -31,7 +31,7 @@ static uint32_t render(const PwLauncherScene *scene)
 static void test_navigation(void)
 {
     const PwLauncherItem items[8]={{"a",0,1},{"b",0,1},{"c",0,1},{"d",0,1},{"e",0,1},{"f",0,1},{"g",0,1},{"h",0,0}};
-    PwLauncherScene scene={items,8,0,NULL};
+    PwLauncherScene scene={items,8,0,NULL,NULL};
 
     /* Keys: the arrows move, Enter and Space choose, others do nothing. */
     assert(pw_launcher_key_action(0x25)==PW_LAUNCHER_ACTION_LEFT);
@@ -63,7 +63,7 @@ static void test_navigation(void)
     assert(pw_launcher_navigate(&scene,PW_LAUNCHER_ACTION_CHOOSE,7)==1 && scene.selected==4);
     assert(!pw_launcher_navigate(&scene,PW_LAUNCHER_ACTION_NONE,7) && scene.selected==4);
     /* No tiles, no selection, or none of it: nothing happens. */
-    PwLauncherScene empty={items,0,PW_LAUNCHER_RENDER_NONE,NULL};
+    PwLauncherScene empty={items,0,PW_LAUNCHER_RENDER_NONE,NULL,NULL};
     assert(!pw_launcher_navigate(&empty,PW_LAUNCHER_ACTION_CHOOSE,0) && empty.selected==PW_LAUNCHER_RENDER_NONE);
     assert(!pw_launcher_navigate(NULL,PW_LAUNCHER_ACTION_CHOOSE,1));
 }
@@ -76,9 +76,9 @@ int main(void)
         {"Paint","pe32  gdi  wine-wow64",0},
         {"Minesweeper",NULL,1},
     };
-    const PwLauncherScene library={items,3,0,"Ready"};
-    const PwLauncherScene unavailable={items,3,1,"Pinball closed normally"};
-    const PwLauncherScene empty={NULL,0,PW_LAUNCHER_RENDER_NONE,NULL};
+    const PwLauncherScene library={items,3,0,"Ready",NULL};
+    const PwLauncherScene unavailable={items,3,1,"Pinball closed normally",NULL};
+    const PwLauncherScene empty={NULL,0,PW_LAUNCHER_RENDER_NONE,NULL,NULL};
     uint32_t hashes[3]={render(&library),render(&unavailable),render(&empty)};
     /* Golden frames: a visual change must update these deliberately, after
      * looking at the new rendering. */
@@ -119,19 +119,40 @@ int main(void)
     /* A second page is shown for a selection past the first six tiles. */
     PwLauncherItem many[8];
     for(unsigned i=0;i<8;i++)many[i]=(PwLauncherItem){i<6?"First":"Second",NULL,1};
-    const PwLauncherScene first={many,8,5,NULL},second={many,8,6,NULL};
+    const PwLauncherScene first={many,8,5,NULL,NULL},second={many,8,6,NULL,NULL};
     assert(render(&first)!=render(&second));
     render(&second);assert(at(135,300)==selected_edge);
+
+    /* An update notice is an amber pill in the middle of the title bar; the
+     * rest of the frame is the frame without it. */
+    PwLauncherScene noticed=library;
+    noticed.notice="v0.0.3 available: github.com/plastikman/orbis-win";
+    uint32_t plain_hash=render(&library),plain_mid=at(960,30),plain_tiles=at(620,420);
+    assert((plain_mid&0xff)>(plain_mid>>16&0xff));               /* blue without one */
+    assert(render(&noticed)!=plain_hash);
+    uint32_t pill=at(960,30);
+    assert((pill>>16&0xff)>0xe0 && (pill>>8&0xff)>0x90 && (pill&0xff)<0x60);   /* amber */
+    assert(at(620,420)==plain_tiles && at(10,60)==(render(&library),at(10,60)));
+    /* However long, it stays between the title and "Library". */
+    char long_notice[400];
+    memset(long_notice,'W',sizeof(long_notice)-1);long_notice[sizeof(long_notice)-1]=0;
+    noticed.notice=long_notice;
+    render(&library);
+    uint32_t library_label=at(1800,48),title_text=at(60,48);
+    render(&noticed);
+    assert(at(1800,48)==library_label && at(60,48)==title_text);
+    noticed.notice="";
+    assert(render(&noticed)==plain_hash);
 
     const PwPresentTarget target={pixels,W,H,STRIDE,sizeof(pixels)};
     PwPresentTarget small=target;small.width=1280;
     assert(pw_launcher_render(&library,&small)==PW_ERR_MALFORMED);
     small=target;small.bytes=(uint64_t)STRIDE*H-1;
     assert(pw_launcher_render(&library,&small)==PW_ERR_MALFORMED);
-    const PwLauncherScene bad_selection={items,3,3,NULL};
+    const PwLauncherScene bad_selection={items,3,3,NULL,NULL};
     assert(pw_launcher_render(&bad_selection,&target)==PW_ERR_PRECONDITION);
     const PwLauncherItem untitled[]={{NULL,NULL,1}};
-    const PwLauncherScene bad_item={untitled,1,0,NULL};
+    const PwLauncherScene bad_item={untitled,1,0,NULL,NULL};
     assert(pw_launcher_render(&bad_item,&target)==PW_ERR_PRECONDITION);
     assert(pw_launcher_render(NULL,&target)==PW_ERR_PRECONDITION);
     return 0;

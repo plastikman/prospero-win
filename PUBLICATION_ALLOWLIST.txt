@@ -64,6 +64,8 @@ src/pw_x87.c
 src/pw_x87.h
 src/pw_launcher_render.c
 src/pw_launcher_render.h
+src/pw_update_check.c
+src/pw_update_check.h
 src/pw_profile_catalog.c
 src/pw_profile_catalog.h
 src/pw_present.c
@@ -111,6 +113,7 @@ tests/test_pw_x86_lazyflags.c
 tests/test_pw_x87.c
 tests/test_pw_x87_native.c
 tests/test_pw_launcher_render.c
+tests/test_pw_update_check.c
 tests/test_pw_profile_catalog.c
 tests/test_pw_present.c
 tests/test_pw_x86_reference.S
@@ -314,6 +317,8 @@ src/pw_hid.h
 tests/test_pw_hid.c
 native/pw_hid_ps5.c
 native/pw_hid_ps5.h
+native/pw_update_ps4.c
+native/pw_update_ps4.h
 tests/test_pw_hid_ps5.c
 native/pw_osk_ps5.c
 native/pw_osk_ps5.h
