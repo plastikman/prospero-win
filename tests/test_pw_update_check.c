@@ -12,8 +12,51 @@ static int notice(const char *current, const char *json, char *out, size_t capac
     return pw_update_notice(current, json, strlen(json), SITE, out, capacity);
 }
 
+
+static void test_release_asset(void)
+{
+    /* GitHub's answer, trimmed: the uploader object inside an asset has
+     * names of its own, and "body" comes after the assets. */
+    const char json[] =
+        "{\"url\":\"https://api.github.com/x\",\"tag_name\":\"v0.0.3\",\"draft\":false,\"prerelease\":false,"
+        "\"name\":\"v0.0.3\",\"assets\":["
+        "{\"url\":\"https://api.github.com/a/1\",\"name\":\"BUILD-MANIFEST-01.49.txt\","
+        "\"uploader\":{\"login\":\"someone\",\"name\":\"IV0000-GLDS10043_00-GLDS100430000000.pkg\"},"
+        "\"size\":1483,\"digest\":\"sha256:35d2c628db6ca05a62c1ef17e7cfd7462f3058113935b8f64504b0f94b026efb\","
+        "\"browser_download_url\":\"https://github.com/o/r/releases/download/v0.0.3/BUILD-MANIFEST-01.49.txt\"},"
+        "{\"url\":\"https://api.github.com/a/2\",\"name\":\"IV0000-GLDS10043_00-GLDS100430000000.pkg\","
+        "\"label\":\"\",\"uploader\":{\"login\":\"someone\",\"id\":1},\"content_type\":\"application/octet-stream\","
+        "\"size\": 505741312, \"digest\": \"sha256:5DAFF912c9466073684fcc33e0c71bca166cdb38ae7d969f95a23d56c5a8605d\","
+        "\"browser_download_url\":\"https://github.com/o/r/releases/download/v0.0.3/IV0000-GLDS10043_00-GLDS100430000000.pkg\"}"
+        "],\"tarball_url\":\"https://x\",\"body\":\"notes with \\\"quotes\\\" and {braces}\"}";
+    PwUpdateAsset asset;
+
+    assert(pw_update_release_asset(json, sizeof(json) - 1, "IV0000-GLDS10043_00-GLDS100430000000.pkg", &asset) == 0);
+    assert(!strcmp(asset.name, "IV0000-GLDS10043_00-GLDS100430000000.pkg"));
+    assert(asset.size == 505741312ull);
+    assert(!strcmp(asset.api_url, "https://api.github.com/a/2"));
+    assert(!strcmp(asset.sha256, "5daff912c9466073684fcc33e0c71bca166cdb38ae7d969f95a23d56c5a8605d"));
+    assert(!strcmp(asset.url, "https://github.com/o/r/releases/download/v0.0.3/IV0000-GLDS10043_00-GLDS100430000000.pkg"));
+    assert(pw_update_release_asset(json, sizeof(json) - 1, "BUILD-MANIFEST-01.49.txt", &asset) == 0 && asset.size == 1483);
+    assert(pw_update_release_asset(json, sizeof(json) - 1, "missing.pkg", &asset) == -1);
+    /* Cut short, or without a digest: refused. */
+    assert(pw_update_release_asset(json, 300, "IV0000-GLDS10043_00-GLDS100430000000.pkg", &asset) == -1);
+    const char no_digest[] = "{\"assets\":[{\"name\":\"a.pkg\",\"size\":5,\"browser_download_url\":\"https://x/a.pkg\"}]}";
+    assert(pw_update_release_asset(no_digest, sizeof(no_digest) - 1, "a.pkg", &asset) == -1);
+    const char http[] = "{\"assets\":[{\"name\":\"a.pkg\",\"size\":5,\"browser_download_url\":\"http://x/a.pkg\","
+                        "\"digest\":\"sha256:5daff912c9466073684fcc33e0c71bca166cdb38ae7d969f95a23d56c5a8605d\"}]}";
+    assert(pw_update_release_asset(http, sizeof(http) - 1, "a.pkg", &asset) == -1);
+    assert(pw_update_release_asset("[]", 2, "a.pkg", &asset) == -1);
+    /* An "url" that is not GitHub's API is not used. */
+    const char other[] = "{\"assets\":[{\"url\":\"https://example.com/a\",\"name\":\"a.pkg\",\"size\":5,"
+                         "\"browser_download_url\":\"https://x/a.pkg\","
+                         "\"digest\":\"sha256:5daff912c9466073684fcc33e0c71bca166cdb38ae7d969f95a23d56c5a8605d\"}]}";
+    assert(pw_update_release_asset(other, sizeof(other) - 1, "a.pkg", &asset) == 0 && !asset.api_url[0]);
+}
+
 int main(void)
 {
+    test_release_asset();
     unsigned v[3];
     char out[96], tag[32];
 

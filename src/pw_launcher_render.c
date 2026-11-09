@@ -11,6 +11,7 @@ typedef struct Glyph { char c;uint8_t rows[7]; } Glyph;
 static const Glyph glyphs[]={
     {' ',{0x00,0x00,0x00,0x00,0x00,0x00,0x00}},
     {'!',{0x04,0x04,0x04,0x04,0x04,0x00,0x04}},
+    {'%',{0x18,0x19,0x02,0x04,0x08,0x13,0x03}},
     {'\'',{0x04,0x04,0x08,0x00,0x00,0x00,0x00}},
     {'(',{0x02,0x04,0x08,0x08,0x08,0x04,0x02}},
     {')',{0x08,0x04,0x02,0x02,0x02,0x04,0x08}},
@@ -253,13 +254,59 @@ static void tile(const Canvas *c,int32_t x,int32_t y,const PwLauncherItem *item,
     if(item->detail)text(c,x+24,y+108,item->detail,fit(item->detail,3,2,TILE_W-48),
                          rgb(0x2c,0x3a,0x5c),TILE_W-48);
     if(item->available) {
+        const char *badge=item->badge?item->badge:"Ready";
         rounded(c,x+24,y+TILE_H-66,168,44,22,rgb(0x5c,0xc4,0x4c),rgb(0x2e,0x8c,0x28));
-        text(c,x+24+(168-text_width("Ready",4))/2,y+TILE_H-58,"Ready",4,rgb(0xff,0xff,0xff),168);
+        text(c,x+24+(168-text_width(badge,4))/2,y+TILE_H-58,badge,4,rgb(0xff,0xff,0xff),168);
     } else {
         text(c,x+24,y+TILE_H-56,"Not available yet",4,rgb(0xb4,0x3c,0x1c),TILE_W-48);
     }
 }
-static void taskbar(const Canvas *c,const char *status)
+/* The Settings page: one white panel, a header strip, then the rows; the
+ * selected row is framed in the tiles' selection blue. A value being edited
+ * turns amber, with the part being changed underlined. */
+enum { PANEL_W=1320,PANEL_X=(W-PANEL_W)/2,PANEL_Y=150,ROW_H=84,ROWS_Y=PANEL_Y+120 };
+static void settings_page(const Canvas *c,const PwLauncherSettingsView *view)
+{
+    int32_t panel_h=120+(int32_t)view->count*ROW_H+(view->help?96:24);
+    rounded(c,PANEL_X,PANEL_Y,PANEL_W,panel_h,18,rgb(0x6e,0x96,0xd8),rgb(0x6e,0x96,0xd8));
+    rounded(c,PANEL_X+4,PANEL_Y+4,PANEL_W-8,panel_h-8,15,rgb(0xff,0xff,0xff),rgb(0xdc,0xe8,0xfa));
+    ramp(c,PANEL_X+4,PANEL_Y+20,PANEL_W-8,72,rgb(0x4a,0x8e,0xee),rgb(0x22,0x5e,0xcc));
+    text(c,PANEL_X+40,PANEL_Y+35,"Settings",6,rgb(0xff,0xff,0xff),PANEL_W-80);
+    const char *note="Applies to the next game";
+    text(c,PANEL_X+PANEL_W-40-text_width(note,3),PANEL_Y+46,note,3,rgb(0xdc,0xea,0xff),PANEL_W);
+    for(uint32_t i=0;i<view->count;i++) {
+        int32_t y=ROWS_Y+(int32_t)i*ROW_H,x=PANEL_X+32,w=PANEL_W-64;
+        int selected=i==view->selected;
+        if(selected)rounded(c,x-6,y-6,w+12,ROW_H-12+12,16,rgb(0x3a,0x9b,0xf0),rgb(0x00,0x78,0xd4));
+        rounded(c,x,y,w,ROW_H-12,12,selected?rgb(0xff,0xff,0xff):rgb(0xf2,0xf6,0xfc),
+                selected?rgb(0xe8,0xf0,0xfc):rgb(0xe4,0xec,0xf8));
+        const char *label=view->labels&&view->labels[i]?view->labels[i]:"";
+        const char *value=view->values&&view->values[i]?view->values[i]:"";
+        int32_t value_w=text_width(value,4),value_x=x+w-32-value_w;
+        text(c,x+28,y+(ROW_H-12-28)/2,label,4,rgb(0x1c,0x2a,0x4c),value_x-x-56);
+        int editing=selected && view->editing;
+        if(editing)rounded(c,value_x-20,y+12,value_w+40,ROW_H-36,(ROW_H-36)/2,
+                           rgb(0xff,0xd2,0x5a),rgb(0xf0,0xa8,0x1e));
+        text(c,value_x,y+(ROW_H-12-28)/2,value,4,editing?rgb(0x3a,0x22,0x00):rgb(0x22,0x5e,0xcc),w);
+        if(editing) {
+            /* Underline the edit_part'th dot-separated run of digits. */
+            int part=0;size_t from=0,to=0,n=strlen(value);
+            for(size_t k=0;k<=n;k++) {
+                int digit=k<n && value[k]>='0' && value[k]<='9';
+                if(!digit) {
+                    if(k>from && part==view->edit_part){to=k;break;}
+                    if(k<n && value[k]=='.')part++;
+                    from=k+1;
+                }
+            }
+            if(to>from)fill(c,value_x+(int32_t)from*24,y+(ROW_H-12-28)/2+34,
+                            (int32_t)(to-from)*24-4,4,rgb(0x3a,0x22,0x00));
+        }
+    }
+    if(view->help)text(c,PANEL_X+40,ROWS_Y+(int32_t)view->count*ROW_H+24,view->help,3,
+                       rgb(0x2c,0x3a,0x5c),PANEL_W-80);
+}
+static void taskbar(const Canvas *c,const char *status,const char *hints_text)
 {
     ramp(c,0,TASKBAR_Y,W,H-TASKBAR_Y,rgb(0x3c,0x80,0xf0),rgb(0x14,0x4a,0xc4));
     fill(c,0,TASKBAR_Y,W,3,rgb(0x92,0xbe,0xff));
@@ -270,7 +317,8 @@ static void taskbar(const Canvas *c,const char *status)
         for(int32_t i=0;i<bw;i++)if(!cut(i+30,j,bw+30,bh,30))put(c,i,TASKBAR_Y+6+j,color);
     }
     text(c,(bw-text_width("Play",6))/2,TASKBAR_Y+6+(bh-42)/2,"Play",6,rgb(0xff,0xff,0xff),bw);
-    int32_t hints=text(c,bw+48,TASKBAR_Y+30,"Cross: launch   Options+Create (hold): close",3,
+    int32_t hints=text(c,bw+48,TASKBAR_Y+30,
+                       hints_text?hints_text:"Cross: launch   Options+Create (hold): close",3,
                        rgb(0xff,0xff,0xff),W-bw-96);
     if(status && *status) {
         int32_t tray=W-(bw+48+hints+48);
@@ -290,9 +338,17 @@ int pw_launcher_render(const PwLauncherScene *scene,const PwPresentTarget *targe
        target->stride%4u || (uint64_t)target->stride*H>target->bytes)return PW_ERR_MALFORMED;
     if(scene->selected!=PW_LAUNCHER_RENDER_NONE && scene->selected>=scene->count)
         return PW_ERR_PRECONDITION;
+    if(scene->settings && (scene->settings->count>8 ||
+       (scene->settings->count && scene->settings->selected>=scene->settings->count)))
+        return PW_ERR_PRECONDITION;
     for(uint32_t i=0;i<scene->count;i++)if(!scene->items[i].title)return PW_ERR_PRECONDITION;
     const Canvas canvas={target->pixels,target->stride};
     background(&canvas);title_bar(&canvas,scene->notice);
+    if(scene->settings) {
+        settings_page(&canvas,scene->settings);
+        taskbar(&canvas,scene->status,scene->hints);
+        return PW_OK;
+    }
     if(!scene->count) {
         const char *empty="No application profiles found";
         text(&canvas,(W-text_width(empty,5))/2,480,empty,5,rgb(0xff,0xff,0xff),W);
@@ -312,7 +368,7 @@ int pw_launcher_render(const PwLauncherScene *scene,const PwPresentTarget *targe
         text(&canvas,W-48-text_width(page,3),TILES_Y+2*(TILE_H+TILE_GAP+24),page,3,
              rgb(0xff,0xff,0xff),W);
     }
-    taskbar(&canvas,scene->status);
+    taskbar(&canvas,scene->status,scene->hints);
     return PW_OK;
 }
 
@@ -324,6 +380,7 @@ PwLauncherAction pw_launcher_key_action(uint32_t vk)
     case 0x27:return PW_LAUNCHER_ACTION_RIGHT;    /* VK_RIGHT */
     case 0x28:return PW_LAUNCHER_ACTION_DOWN;     /* VK_DOWN */
     case 0x0d:case 0x20:return PW_LAUNCHER_ACTION_CHOOSE;  /* VK_RETURN, VK_SPACE */
+    case 0x1b:case 0x08:return PW_LAUNCHER_ACTION_BACK;    /* VK_ESCAPE, VK_BACK */
     default:return PW_LAUNCHER_ACTION_NONE;
     }
 }

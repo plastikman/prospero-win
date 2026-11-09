@@ -75,6 +75,114 @@ int pw_update_release_tag(const char *json, size_t length, char *tag, size_t cap
     return n ? 0 : -1;
 }
 
+/* Past the JSON value starting at p (a string, object, array, or a bare
+ * word or number); NULL when it runs off the end. */
+static const char *skip_value(const char *p, const char *end)
+{
+    int depth = 0;
+
+    if (p >= end) return NULL;
+    if (*p != '"' && *p != '{' && *p != '[') {
+        while (p < end && *p != ',' && *p != '}' && *p != ']') p++;
+        return p;
+    }
+    for (; p < end; p++) {
+        if (*p == '"') {
+            for (p++; p < end && *p != '"'; p++)
+                if (*p == '\\') p++;
+            if (p >= end) return NULL;
+            if (!depth) return p + 1;
+        } else if (*p == '{' || *p == '[') {
+            depth++;
+        } else if (*p == '}' || *p == ']') {
+            if (--depth == 0) return p + 1;
+        }
+    }
+    return NULL;
+}
+
+static const char *skip_space(const char *p, const char *end)
+{
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',')) p++;
+    return p;
+}
+
+/* The value of key among the members of the object at [p, end) -- its own
+ * members, not those of objects inside it; NULL if absent. */
+static const char *member(const char *p, const char *end, const char *key)
+{
+    const size_t key_length = strlen(key);
+
+    if (p >= end || *p != '{') return NULL;
+    for (p = skip_space(p + 1, end); p < end && *p == '"';) {
+        const char *name = p + 1, *after = skip_value(p, end), *value;
+        if (!after) return NULL;
+        value = after;
+        while (value < end && (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n')) value++;
+        if (value >= end || *value != ':') return NULL;
+        value++;
+        while (value < end && (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n')) value++;
+        if ((size_t)(after - 1 - name) == key_length && !memcmp(name, key, key_length)) return value;
+        if (!(p = skip_value(value, end))) return NULL;
+        p = skip_space(p, end);
+    }
+    return NULL;
+}
+
+/* A plain JSON string (no escapes) at p into out. 0, or -1. */
+static int string_at(const char *p, const char *end, char *out, size_t capacity)
+{
+    size_t n = 0;
+
+    if (!p || p >= end || *p != '"') return -1;
+    for (p++; p < end && *p != '"'; p++) {
+        if (*p == '\\' || n + 1 >= capacity) return -1;
+        out[n++] = *p;
+    }
+    if (p >= end) return -1;
+    out[n] = 0;
+    return 0;
+}
+
+int pw_update_release_asset(const char *json, size_t length, const char *name, PwUpdateAsset *asset)
+{
+    const char *end = json + length, *p;
+
+    if (!json || !name || !asset) return -1;
+    memset(asset, 0, sizeof(*asset));
+    if (*skip_space(json, end) != '{') return -1;
+    if (!(p = member(skip_space(json, end), end, "assets")) || *p != '[') return -1;
+    for (p = skip_space(p + 1, end); p < end && *p == '{';) {
+        const char *next = skip_value(p, end), *value;
+        char text[128];
+        if (!next) return -1;
+        if (!string_at(member(p, next, "name"), next, text, sizeof(text)) && !strcmp(text, name)) {
+            char digest[80];
+            unsigned long long size = 0;
+            snprintf(asset->name, sizeof(asset->name), "%s", text);
+            if (string_at(member(p, next, "browser_download_url"), next, asset->url, sizeof(asset->url)) ||
+                strncmp(asset->url, "https://", 8)) return -1;
+            if (!(value = member(p, next, "size")) || *value < '0' || *value > '9') return -1;
+            for (; value < next && *value >= '0' && *value <= '9'; value++) size = size * 10u + (unsigned)(*value - '0');
+            asset->size = size;
+            if (string_at(member(p, next, "url"), next, asset->api_url, sizeof(asset->api_url)) ||
+                strncmp(asset->api_url, "https://api.github.com/", 23))
+                asset->api_url[0] = 0;
+            if (string_at(member(p, next, "digest"), next, digest, sizeof(digest)) ||
+                strncmp(digest, "sha256:", 7) || strlen(digest + 7) != 64) return -1;
+            for (int i = 0; i < 64; i++) {
+                char c = digest[7 + i];
+                if (c >= 'A' && c <= 'F') c = (char)(c - 'A' + 'a');
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return -1;
+                asset->sha256[i] = c;
+            }
+            return size ? 0 : -1;
+        }
+        p = skip_space(next, end);
+    }
+    return -1;
+}
+
 int pw_update_notice(const char *current, const char *json, size_t length, const char *site,
                      char *out, size_t capacity)
 {

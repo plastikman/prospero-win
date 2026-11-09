@@ -41,6 +41,7 @@
 #include "pw_pad_ps5.h"
 #include "pw_hid_ps5.h"
 #include "pw_update_ps4.h"
+#include "../src/pw_settings.h"
 #include "pw_osk_ps5.h"
 #include "pw_videoout_ps5.h"
 #include "pw_wine_library.h"
@@ -276,6 +277,12 @@ static PwWineApp catalog[PW_WINE_LIBRARY_MAX];
 static char catalog_detail[PW_WINE_LIBRARY_MAX][64];
 static size_t catalog_count;
 static const char *library_root = PW_WINE64_ROOT_SANDBOX;
+/* <root>/settings.conf, which the launcher's Settings card writes and every
+ * start reads (src/pw_settings.h). settings_status: pw_settings_load's. */
+static PwSettings settings;
+static int settings_status = 1;
+/* 1 when this start carried an older <root>/dev.conf over into settings.conf. */
+static int settings_migrated;
 
 /* The largest desktop shown: Wine's PS5 driver defaults to 800x600
  * (WINE_PS5_DESKTOP overrides, 1920x1080 for Warcraft III); bigger frames
@@ -288,6 +295,7 @@ enum { PW_WINE64_MAX_FRAME = 1920 * 1200 * 4, PW_WINE64_TICK_US = 16000,
 
 enum { PAD_CREATE = 0x1u, PAD_OPTIONS = 0x8u, PAD_UP = 0x10u, PAD_RIGHT = 0x20u,
        PAD_DOWN = 0x40u, PAD_LEFT = 0x80u, PAD_L1 = 0x400u, PAD_R1 = 0x800u,
+       PAD_TRIANGLE = 0x1000u, PAD_CIRCLE = 0x2000u,
        PAD_CROSS = 0x4000u, PAD_SQUARE = 0x8000u, PAD_CLOSE = PAD_OPTIONS | PAD_CREATE };
 /* The pad core needs a key map to open; the title reads raw edges and maps
  * them with the game's bindings (pw_game_profile). */
@@ -775,6 +783,19 @@ static int game_setup_failed(const char *reason)
 
 /* Complete the one-shot helper exchange before loading profiles or starting
  * Wine. A failed or incomplete request closes this process to Home. */
+/* Starts the app log on the PC the Settings card names; 0 when it is up. */
+static int settings_log_start(void)
+{
+    ps5log_config config;
+
+    if (settings.log != 1 || !pw_settings_valid_ipv4(settings.log_server)) return -1;
+    ps5log_config_defaults(&config);
+    snprintf(config.server, sizeof(config.server), "%s", settings.log_server);
+    config.port = settings.log_port;
+    config.enabled = 1;
+    return ps5log_init(&config, PW_TITLE_ID, PW_APP_NAME, now_ns()) == 0 ? 0 : -1;
+}
+
 static int open_library(void)
 {
     PwDataMountResult mount;
@@ -782,28 +803,48 @@ static int open_library(void)
 
     status = pw_data_mount_request(&mount);
     if (status == 0) library_root = PW_WINE64_ROOT_DATA;
-#ifdef __PS4__
-    /* ⚠ THE LOG SWITCH FOR PACKAGES WITHOUT /app0/dev.conf. ps5log reads its
-     * destination at the top of main(), before this grant, when only the
-     * package's own dev.conf is readable. A release package ships none, so it
-     * logs nowhere -- unless a dev.conf has been put on the console: copy one
-     * to /data/prospero-win/dev.conf to turn the app log on, delete it to turn
-     * it off. Only the lines before this point are missed (2026-11-06). */
-    if (status == 0 && !ps5log_enabled()) {
-        static const char *const late_paths[] = {
-            "/data/prospero-win/dev.conf",
-            "/data/homebrew/dev.conf",
-        };
-        ps5log_config late_config;
-        const char *used = NULL;
+    pw_settings_defaults(&settings);
+    if (status == 0) settings_status = pw_settings_load(library_root, &settings);
+    /* settings.conf is the one switch file on the console. A console that
+     * still has the older <root>/dev.conf (DEV_ENABLED, DEV_SERVER,
+     * DEV_PORT, DEV_GPU_HANG_REPORT) has it carried over once, the first time
+     * settings.conf has no log setting; after that dev.conf is not read. A
+     * package's own /app0/dev.conf (developer builds) is separate: ps5log
+     * reads it at the top of main(), before this grant. */
+    if (status == 0 && settings.log < 0) {
+        char path[160], text[1024];
+        FILE *file;
+        size_t length = 0;
 
-        ps5log_config_defaults(&late_config);
-        if (ps5log_load_config(late_paths, sizeof(late_paths) / sizeof(late_paths[0]),
-                               &late_config, &used) == 0 &&
-            ps5log_init(&late_config, PW_TITLE_ID, PW_APP_NAME, now_ns()) == 0)
-            PS5LOG_LOG("PW_WINE64 log enabled by %s after the /data grant", used ? used : "?");
+        snprintf(path, sizeof(path), "%s/dev.conf", library_root);
+        if ((file = fopen(path, "rb"))) {
+            ps5log_config devconf;
+            length = fread(text, 1, sizeof(text) - 1, file);
+            fclose(file);
+            text[length] = 0;
+            ps5log_config_defaults(&devconf);
+            (void)ps5log_parse_config(text, length, &devconf);
+            settings.log = devconf.enabled && pw_settings_valid_ipv4(devconf.server) &&
+                           strcmp(devconf.server, "0.0.0.0") ? 1 : 0;
+            if (pw_settings_valid_ipv4(devconf.server) && strcmp(devconf.server, "0.0.0.0")) {
+                snprintf(settings.log_server, sizeof(settings.log_server), "%s", devconf.server);
+                if (devconf.port) settings.log_port = devconf.port;
+            }
+            if (strstr(text, "DEV_GPU_HANG_REPORT=1")) settings.gpu_hang_report = 1;
+            settings_status = pw_settings_save(library_root, &settings);
+            settings_migrated = 1;
+        }
     }
-#endif
+    if (status == 0 && !ps5log_enabled() && settings.log == 1 && settings_log_start() == 0)
+        PS5LOG_LOG("PW_WINE64 log enabled by %s/settings.conf after the /data grant", library_root);
+    if (settings_migrated)
+        PS5LOG_LOG("PW_WINE64 settings carried over from %s/dev.conf (now ignored) save=%d",
+                   library_root, settings_status);
+    PS5LOG_LOG("PW_WINE64 settings status=%d log=%d server=%s:%u wine_log=%d wait_watchdog=%d "
+               "gpu_hang_report=%d update_check=%d", settings_status, settings.log,
+               settings.log_server[0] ? settings.log_server : "-", (unsigned)settings.log_port,
+               (int)settings.wine_log, settings.wait_watchdog, settings.gpu_hang_report,
+               settings.update_check);
     PS5LOG_LOG("PW_WINE64 data_mount data_before=%d elevated_before=%d helper_completed=%d "
                "helper_errno=%d data_after=%d elevated_after=%d waited_ms=%d settled_ms=%d root=%s",
                mount.data_before, mount.elevated_before, mount.helper_completed,
@@ -871,19 +912,194 @@ static unsigned long long cpu_ms(void)
 
 /* ---- launcher ----------------------------------------------------------- */
 
+/* The Settings card: the last tile after the games (or Triangle) opens it.
+ * Up/Down pick a row, Cross changes it, Circle goes back. Cross on the PC
+ * address opens the console's keyboard with the address in it; where the
+ * keyboard cannot open, the address is edited in place instead: Left/Right
+ * pick a part, Up/Down step it (held: repeats), L1/R1 step it by ten. Each
+ * change is saved at once. */
+typedef struct SettingsCard {
+    int open, editing, part;
+    int keyboard;                     /* the console's keyboard can be shown */
+    int typing;                       /* it is up, for the PC address */
+    char message[96];                 /* replaces the help line until the next press */
+    int opened_with_server_valid;     /* the in-place editor started from a real address */
+    /* The settings, then "Download update" while a newer release has a
+     * package (native/pw_update_ps4.h). */
+    const char *labels[PW_SETTINGS_ROW_COUNT + 1], *values[PW_SETTINGS_ROW_COUNT + 1];
+    char value_text[PW_SETTINGS_ROW_COUNT + 1][48];
+    char update_help[112];
+    PwUpdateDownload download;
+    PwLauncherSettingsView view;
+    PwSettings opened_with;           /* to see, on closing, what changed */
+    uint64_t repeat_at;               /* a held Up/Down while editing repeats from here */
+} SettingsCard;
+
+static void settings_card_refresh(SettingsCard *card)
+{
+    for (int row = 0; row < PW_SETTINGS_ROW_COUNT; row++) {
+        card->labels[row] = pw_settings_row_label((PwSettingsRow)row);
+        pw_settings_row_value(&settings, (PwSettingsRow)row,
+                              card->value_text[row], sizeof(card->value_text[row]));
+        /* On, but nothing took the connection: say so. */
+        if (row == PW_SETTINGS_ROW_LOG && settings.log == 1 &&
+            !ps5log_enabled())
+            strncat(card->value_text[row], " - no PC", sizeof(card->value_text[row]) - strlen(card->value_text[row]) - 1);
+        card->values[row] = card->value_text[row];
+    }
+    pw_update_ps4_download_status(&card->download);
+    if (card->download.state != PW_UPDATE_DOWNLOAD_NONE) {
+        const PwUpdateDownload *d = &card->download;
+        char *value = card->value_text[PW_SETTINGS_ROW_COUNT];
+        const size_t cap = sizeof(card->value_text[0]);
+        unsigned percent = d->total ? (unsigned)(d->done * 100u / d->total) : 0;
+
+        card->labels[PW_SETTINGS_ROW_COUNT] = "Download update";
+        card->values[PW_SETTINGS_ROW_COUNT] = value;
+        switch (d->state) {
+        case PW_UPDATE_DOWNLOAD_READY:
+            snprintf(value, cap, "%s, %llu MB", d->tag, d->total >> 20);
+            snprintf(card->update_help, sizeof(card->update_help),
+                     "To /data/pkg, checked against GitHub. Then install it with GoldHEN.");
+            break;
+        case PW_UPDATE_DOWNLOAD_RUNNING:
+            snprintf(value, cap, "%u%%  %llu/%llu MB", percent > 100 ? 100 : percent, d->done >> 20, d->total >> 20);
+            snprintf(card->update_help, sizeof(card->update_help), "Cross cancels. Games wait until it is done.");
+            break;
+        case PW_UPDATE_DOWNLOAD_DONE:
+            snprintf(value, cap, "Done");
+            snprintf(card->update_help, sizeof(card->update_help), "%s", d->detail);
+            break;
+        default:
+            snprintf(value, cap, "Failed: Cross retries");
+            snprintf(card->update_help, sizeof(card->update_help), "%s", d->detail);
+            break;
+        }
+    }
+    card->view.labels = card->labels;
+    card->view.values = card->values;
+    card->view.count = PW_SETTINGS_ROW_COUNT + (card->download.state != PW_UPDATE_DOWNLOAD_NONE);
+    if (card->view.selected >= card->view.count) card->view.selected = card->view.count - 1;
+    card->view.help = card->message[0] ? card->message :
+                      card->view.selected == PW_SETTINGS_ROW_COUNT ? card->update_help :
+                      card->editing ? "Left/Right: part   Up/Down: change by one   L1/R1: by ten" :
+                      pw_settings_row_help((PwSettingsRow)card->view.selected);
+    card->view.editing = card->editing;
+    card->view.edit_part = card->part;
+}
+
+static void settings_card_save(void)
+{
+    int status = pw_settings_save(library_root, &settings);
+    PS5LOG_LOG("PW_WINE64 settings saved status=%d log=%d server=%s:%u wine_log=%d wait_watchdog=%d "
+               "gpu_hang_report=%d update_check=%d", status, settings.log,
+               settings.log_server[0] ? settings.log_server : "-", (unsigned)settings.log_port,
+               (int)settings.wine_log, settings.wait_watchdog, settings.gpu_hang_report,
+               settings.update_check);
+}
+
+static void settings_card_open(SettingsCard *card)
+{
+    card->open = 1;
+    card->editing = card->typing = 0;
+    card->message[0] = '\0';
+    card->part = 0;
+    card->view.selected = 0;
+    card->opened_with = settings;
+    settings_card_refresh(card);
+}
+
+/* Closing applies what cannot wait for the next game: the app log, and the
+ * update check. */
+static void settings_card_close(SettingsCard *card, PwLauncherScene *scene)
+{
+    const PwSettings *was = &card->opened_with;
+
+    card->open = card->editing = 0;
+    if (settings.log != was->log || strcmp(settings.log_server, was->log_server) ||
+        settings.log_port != was->log_port) {
+        if (ps5log_enabled()) {
+            PS5LOG_LOG("PW_WINE64 log %s by the Settings card", settings.log == 1 ? "moved" : "off");
+            ps5log_close("settings");
+        }
+        if (settings.log == 1 && settings_log_start() == 0)
+            PS5LOG_LOG("PW_WINE64 log enabled by the Settings card server=%s:%u",
+                       settings.log_server, (unsigned)settings.log_port);
+    }
+    if (settings.update_check && !was->update_check) pw_update_ps4_start(library_root, update_log);
+    if (!settings.update_check) scene->notice = NULL;
+}
+
+/* One press (or a repeat); 1 when the screen changes. */
+static int settings_card_action(SettingsCard *card, PwLauncherScene *scene, PwLauncherAction action, int step)
+{
+    PwLauncherSettingsView *view = &card->view;
+
+    card->message[0] = '\0';
+    if (card->editing) {
+        switch (action) {
+        case PW_LAUNCHER_ACTION_LEFT: if (card->part > 0) card->part--; break;
+        case PW_LAUNCHER_ACTION_RIGHT: if (card->part < 3) card->part++; break;
+        case PW_LAUNCHER_ACTION_UP: pw_settings_ipv4_step(settings.log_server, (unsigned)card->part, step); break;
+        case PW_LAUNCHER_ACTION_DOWN: pw_settings_ipv4_step(settings.log_server, (unsigned)card->part, -step); break;
+        case PW_LAUNCHER_ACTION_CHOOSE: case PW_LAUNCHER_ACTION_BACK:
+            card->editing = 0;
+            if (!card->opened_with_server_valid && !strcmp(settings.log_server, "0.0.0.0"))
+                settings.log_server[0] = '\0';     /* left untouched: still no address */
+            else
+                settings_card_save();
+            break;
+        default: return 0;
+        }
+    } else {
+        switch (action) {
+        case PW_LAUNCHER_ACTION_UP: if (view->selected) view->selected--; break;
+        case PW_LAUNCHER_ACTION_DOWN: if (view->selected + 1 < view->count) view->selected++; break;
+        case PW_LAUNCHER_ACTION_CHOOSE:
+            if (view->selected == PW_SETTINGS_ROW_COUNT) {
+                /* Download update: start, cancel, or try again. */
+                if (card->download.state == PW_UPDATE_DOWNLOAD_RUNNING) pw_update_ps4_download_cancel();
+                else if (card->download.state != PW_UPDATE_DOWNLOAD_DONE) pw_update_ps4_download_start();
+            } else if (view->selected == PW_SETTINGS_ROW_LOG_SERVER) {
+                char current[32] = "";
+                if (settings.log_server[0])
+                    snprintf(current, sizeof(current), "%s:%u", settings.log_server, (unsigned)settings.log_port);
+                if (card->keyboard &&
+                    pw_osk_ps5_show_text(&osk_ps5, "PC address for the log (ps5logd)", current) == PW_OK) {
+                    card->typing = 1;
+                    break;
+                }
+                card->editing = 1;
+                card->part = 3;
+                card->opened_with_server_valid = pw_settings_valid_ipv4(settings.log_server);
+                if (!card->opened_with_server_valid) pw_settings_ipv4_step(settings.log_server, 0, 0);
+            } else if (pw_settings_row_activate(&settings, (PwSettingsRow)view->selected)) {
+                settings_card_save();
+            }
+            break;
+        case PW_LAUNCHER_ACTION_BACK: settings_card_close(card, scene); return 1;
+        default: return 0;
+        }
+    }
+    settings_card_refresh(card);
+    return 1;
+}
+
 /* Shown until a game is chosen; Wine is not loaded. Does not return. */
 static void run_launcher(void)
 {
     static PwVideoOutPs5 video;
     static PwPadPs5 pad;
     PwPadPs5Ops pad_ops;
-    PwLauncherItem items[PW_WINE_LIBRARY_MAX];
+    PwLauncherItem items[PW_WINE_LIBRARY_MAX + 1];   /* the games, Settings, the refused */
+    static SettingsCard card;
+    uint32_t settings_index;
     const size_t frame_bytes = (size_t)PW_LAUNCHER_RENDER_WIDTH * PW_LAUNCHER_RENDER_HEIGHT * 4u;
     uint8_t *frame = mmap(NULL, frame_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     PwLauncherScene scene = { items, 0, PW_LAUNCHER_RENDER_NONE,
         launch.refused ? "THAT GAME IS NOT IN THE LIBRARY" :
         !catalog_count ? "ADD PROFILES TO /DATA/PROSPERO-WIN/PROFILES" :
-        launch.cycle ? "WELCOME BACK" : "CHOOSE A GAME", NULL };
+        launch.cycle ? "WELCOME BACK" : "CHOOSE A GAME", NULL, NULL, NULL };
     static PwHidPs5 hid;
     int video_status = pw_videoout_ps5_open(&video), pad_status = pw_pad_ps5_platform_ops(&pad_ops);
     int hid_status, dirty = 1, chosen = -1;
@@ -900,27 +1116,39 @@ static void run_launcher(void)
             (void)pad_ops.foreground_user(&user);
         }
         hid_status = pw_hid_ps5_open(&hid, pw_hid_ps5_system_ops(hid_log), user);
+        /* The console's keyboard, for the Settings card's PC address. */
+        card.keyboard = pw_osk_ps5_open(&osk_ps5, pw_osk_ps5_system_ops(osk_log), user) == PW_OK;
     }
-    /* The games, then the refused profiles, listed by file as not available. */
+    /* The games, the Settings card, then the refused profiles, listed by
+     * file as not available. */
     for (size_t i = 0; i < catalog_count; i++)
-        items[scene.count++] = (PwLauncherItem){ catalog[i].name, catalog[i].detail, 1 };
+        items[scene.count++] = (PwLauncherItem){ catalog[i].name, catalog[i].detail, 1, NULL };
+    settings_index = scene.count;
+    items[scene.count++] = (PwLauncherItem){ "Settings", "Logs and updates", 1, "Open" };
     for (uint32_t i = 0; i < library.count; i++)
         if (library.entries[i].status != PW_OK)
-            items[scene.count++] = (PwLauncherItem){ library.entries[i].file, "profile refused", 0 };
+            items[scene.count++] = (PwLauncherItem){ library.entries[i].file, "profile refused", 0, NULL };
     if (scene.count) scene.selected = 0;
     PS5LOG_LOG("PW_WINE64 launcher video=%s pad=%s hid=%s frame=%d apps=%u cycle=%u refused=%u script=%d",
                pw_result_name(video_status), pw_result_name(pad_status), pw_result_name(hid_status),
                frame != MAP_FAILED,
                (unsigned)catalog_count, (unsigned)launch.cycle, launch.refused, PW_WINE64_SCRIPT);
-    char log_status[80], report_path[96];
+    char log_status[80], report_path[96], download_status[48];
+    PwUpdateDownloadState download_shown = PW_UPDATE_DOWNLOAD_NONE;
     snprintf(report_path, sizeof(report_path), "GET LOGS OVER FTP: %s/LOGS", library_root);
     int report_help = 0;
     pw_diagnostics_status(log_status, sizeof(log_status));
     scene.status = log_status;
     /* A newer stable release on GitHub, shown in the title bar once known;
      * the check runs on its own thread and never holds the launcher up. */
-    pw_update_ps4_start(library_root, update_log);
+    if (settings.update_check) pw_update_ps4_start(library_root, update_log);
+    else PS5LOG_LOG("PW_WINE64 update check: off (%s/settings.conf)", library_root);
     for (uint64_t tick = 1; chosen < 0; tick++) {
+        PwLauncherAction actions[16];
+        int steps[16];
+        size_t action_count = 0;
+        uint64_t now = now_ns();
+#define QUEUE(a, n) do { if (action_count < 16) { actions[action_count] = (a); steps[action_count++] = (n); } } while (0)
         pw_diagnostics_tick(now_ns());
         if (tick % PW_WINE64_TICKS_PER_S == 0 && !report_help) {
             pw_diagnostics_status(log_status, sizeof(log_status)); dirty = 1;
@@ -930,17 +1158,31 @@ static void run_launcher(void)
             static const struct { uint32_t button; PwLauncherAction action; } pad_actions[] = {
                 { PAD_RIGHT, PW_LAUNCHER_ACTION_RIGHT }, { PAD_LEFT, PW_LAUNCHER_ACTION_LEFT },
                 { PAD_DOWN, PW_LAUNCHER_ACTION_DOWN }, { PAD_UP, PW_LAUNCHER_ACTION_UP },
-                { PAD_CROSS, PW_LAUNCHER_ACTION_CHOOSE },
+                { PAD_CROSS, PW_LAUNCHER_ACTION_CHOOSE }, { PAD_CIRCLE, PW_LAUNCHER_ACTION_BACK },
             };
-            if (pad.core.pressed_edges & PAD_OPTIONS) {
+            const uint32_t edges = pad.core.pressed_edges;
+            if (edges & PAD_OPTIONS) {
                 report_help = !report_help;
                 scene.status = report_help ? report_path : log_status;
                 dirty = 1;
             }
+            if ((edges & PAD_TRIANGLE) && !card.open) {
+                settings_card_open(&card);
+                dirty = 1;
+            }
             for (size_t i = 0; i < sizeof(pad_actions) / sizeof(pad_actions[0]); i++)
-                if ((pad.core.pressed_edges & pad_actions[i].button) &&
-                    pw_launcher_navigate(&scene, pad_actions[i].action, (uint32_t)catalog_count))
-                    chosen = (int)scene.selected;
+                if (edges & pad_actions[i].button) QUEUE(pad_actions[i].action, 1);
+            if (card.editing) {
+                const uint32_t held = pad.core.previous_buttons & (PAD_UP | PAD_DOWN);
+                if (edges & PAD_R1) QUEUE(PW_LAUNCHER_ACTION_UP, 10);
+                if (edges & PAD_L1) QUEUE(PW_LAUNCHER_ACTION_DOWN, 10);
+                if (!held) card.repeat_at = 0;
+                else if (edges & (PAD_UP | PAD_DOWN)) card.repeat_at = now + 400000000ull;
+                else if (card.repeat_at && now >= card.repeat_at) {
+                    QUEUE(held & PAD_UP ? PW_LAUNCHER_ACTION_UP : PW_LAUNCHER_ACTION_DOWN, 1);
+                    card.repeat_at = now + 60000000ull;
+                }
+            }
         }
         /* Key presses; a keyboard plugged in later is found every few seconds. */
         if (hid.ops.load_module) {
@@ -949,14 +1191,78 @@ static void run_launcher(void)
             if (hid_status != PW_OK && tick % (5 * PW_WINE64_TICKS_PER_S) == 0)
                 hid_status = pw_hid_ps5_retry(&hid);
             pw_hid_ps5_poll(&hid, &poll);
-            for (size_t i = 0; i < poll.count && chosen < 0; i++)
-                if (poll.events[i].kind == PW_HID_EVENT_KEY && poll.events[i].down &&
-                    pw_launcher_navigate(&scene, pw_launcher_key_action(poll.events[i].code),
-                                         (uint32_t)catalog_count))
-                    chosen = (int)scene.selected;
+            for (size_t i = 0; i < poll.count; i++)
+                if (poll.events[i].kind == PW_HID_EVENT_KEY && poll.events[i].down)
+                    QUEUE(pw_launcher_key_action(poll.events[i].code), 1);
+        }
+#undef QUEUE
+        /* While the console's keyboard is up the system has the pad; the
+         * title only waits for the line, then takes it as the address. */
+        if (osk_ps5.showing) {
+            char typed[PW_OSK_PS5_TEXT];
+            int ended = pw_osk_ps5_poll(&osk_ps5, typed, sizeof(typed));
+
+            action_count = 0;
+            if (ended) {
+                card.typing = 0;
+                if (ended == 1 && typed[0]) {
+                    if (pw_settings_set_address(&settings, typed)) {
+                        settings_card_save();
+                    } else {
+                        snprintf(card.message, sizeof(card.message), "Not an address: %.40s", typed);
+                        PS5LOG_LOG("PW_WINE64 settings address refused: %s", typed);
+                    }
+                }
+                settings_card_refresh(&card);
+                dirty = 1;
+            }
+        }
+        /* The Settings card takes the presses while it is open; otherwise
+         * they move over the tiles, and choosing Settings opens it. */
+        for (size_t i = 0; i < action_count && chosen < 0; i++) {
+            if (card.open) {
+                dirty |= settings_card_action(&card, &scene, actions[i], steps[i]);
+            } else if (pw_launcher_navigate(&scene, actions[i], settings_index + 1)) {
+                if (scene.selected == settings_index) {
+                    settings_card_open(&card);
+                    dirty = 1;
+                } else {
+                    PwUpdateDownload d;
+                    pw_update_ps4_download_status(&d);
+                    /* Starting a game ends this process, and the download
+                     * with it. */
+                    if (d.state == PW_UPDATE_DOWNLOAD_RUNNING) {
+                        scene.status = "WAIT FOR THE UPDATE, OR CANCEL IT IN SETTINGS";
+                        dirty = 1;
+                    } else {
+                        chosen = (int)scene.selected;
+                    }
+                }
+            }
+        }
+        scene.settings = card.open ? &card.view : NULL;
+        scene.hints = !card.open ? "Cross: launch   Triangle: settings   Options+Create (hold): close" :
+                      card.editing ? "Cross or Circle: done" : "Cross: change   Circle: back";
+        /* A download in progress: its percentage in the taskbar and the card,
+         * twice a second. */
+        if (tick % (PW_WINE64_TICKS_PER_S / 2) == 0) {
+            PwUpdateDownload d;
+            pw_update_ps4_download_status(&d);
+            if (d.state == PW_UPDATE_DOWNLOAD_RUNNING || download_shown != d.state) {
+                if (d.state == PW_UPDATE_DOWNLOAD_RUNNING && !report_help) {
+                    snprintf(download_status, sizeof(download_status), "UPDATE %s: %u%%", d.tag,
+                             d.total ? (unsigned)(d.done * 100u / d.total) : 0);
+                    scene.status = download_status;
+                } else if (scene.status == download_status) {
+                    scene.status = log_status;
+                }
+                if (card.open && !osk_ps5.showing) settings_card_refresh(&card);
+                download_shown = d.state;
+                dirty = 1;
+            }
         }
         dirty |= scene.selected != before;
-        if (!scene.notice && (scene.notice = pw_update_ps4_notice())) dirty = 1;
+        if (settings.update_check && !scene.notice && (scene.notice = pw_update_ps4_notice())) dirty = 1;
         if (PW_WINE64_SCRIPT && tick == 3 * PW_WINE64_TICKS_PER_S) {
             if (launch.cycle >= PW_WINE64_SCRIPT_CYCLES) {
                 PS5LOG_LOG("PW_WINE64 launcher script done cycles=%u", (unsigned)launch.cycle);
@@ -975,11 +1281,19 @@ static void run_launcher(void)
             if (status == PW_OK) status = pw_videoout_ps5_present(&video, &view);
             if (status != PW_OK) PS5LOG_LOG("PW_WINE64 launcher present=%s", pw_result_name(status));
             dirty = 0;
+        } else if (osk_ps5.showing && video_status == PW_OK && frame != MAP_FAILED) {
+            /* The system draws its keyboard over the title's output: keep
+             * flipping the frame already drawn, as a game would. */
+            const PwPresentView view = { frame, PW_LAUNCHER_RENDER_WIDTH, PW_LAUNCHER_RENDER_HEIGHT,
+                                         PW_LAUNCHER_RENDER_WIDTH * 4u, (uint32_t)frame_bytes };
+            (void)pw_videoout_ps5_present(&video, &view);
+            usleep(PW_WINE64_TICK_US);
         } else {
             usleep(PW_WINE64_TICK_US);
         }
     }
     PS5LOG_LOG("PW_WINE64 launcher chose=%s", catalog[chosen].id);
+    pw_osk_ps5_close(&osk_ps5);
     if (pad_status == PW_OK) (void)pw_pad_ps5_close(&pad);
     if (video_status == PW_OK) (void)pw_videoout_ps5_close(&video);
     restart_title(&catalog[chosen], launch.cycle, "launcher");
@@ -1326,6 +1640,12 @@ int main(int argc, char **argv)
             extra[0].value = game->winedebug;
             PS5LOG_LOG("PW_WINE64 winedebug=%s", game->winedebug);
         }
+        /* The Settings card's Wine log, unless it is "profile", replaces
+         * both: Quiet for playing, Detailed for a crash report. */
+        if (pw_settings_winedebug(&settings)) {
+            extra[0].value = pw_settings_winedebug(&settings);
+            PS5LOG_LOG("PW_WINE64 winedebug=%s (settings wine_log)", extra[0].value);
+        }
         /* [debug] env: diagnostics variables; the parser refuses any the
          * title sets itself, so these only add (src/pw_game_profile.h). */
         {
@@ -1366,8 +1686,11 @@ int main(int argc, char **argv)
         /* ⚠ Not setenv(): the title and ntdll.prx each have a private
          * environ on the PS4, so only extra[] (pw_ps4_setenv) reaches Wine
          * (archive 0039/0070/0073). */
-        if (PW_WINE64_WAIT_WATCHDOG)
+        /* The build switch or the Settings card's Wait watchdog. */
+        if (PW_WINE64_WAIT_WATCHDOG || settings.wait_watchdog) {
             extra[config.extra_env_count++] = (PwWineStartEnv){ "WINE_PS5_WAIT_WATCHDOG", "1" };
+            PS5LOG_LOG("PW_WINE64 wait_watchdog=1 (%s)", PW_WINE64_WAIT_WATCHDOG ? "build" : "settings");
+        }
         if (PW_WINE64_HEAP_FLEXIBLE) {
             extra[config.extra_env_count++] = (PwWineStartEnv){ "WINE_PS5_HEAP_FLEXIBLE", "1" };
             PS5LOG_LOG("PW_WINE64 heap_direct=0 (anonymous mmap control)");

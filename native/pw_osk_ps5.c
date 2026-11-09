@@ -116,6 +116,11 @@ int pw_osk_ps5_open(PwOskPs5 *osk, const PwOskPs5Ops *ops, int32_t user_id)
 
 int pw_osk_ps5_show(PwOskPs5 *osk, const char *title)
 {
+    return pw_osk_ps5_show_text(osk, title, NULL);
+}
+
+int pw_osk_ps5_show_text(PwOskPs5 *osk, const char *title, const char *initial)
+{
     char line[160];
 
     if (!osk) return PW_ERR_PRECONDITION;
@@ -131,6 +136,7 @@ int pw_osk_ps5_show(PwOskPs5 *osk, const char *title)
         logf_(osk, line);
     }
     memset(osk->text, 0, sizeof(osk->text));
+    if (initial) pw_osk_ps5_utf16(initial, osk->text, PW_OSK_PS5_TEXT);
     pw_osk_ps5_utf16(title ? title : "prospero-win", osk->title, PW_OSK_PS5_TITLE);
     memset(&osk->param, 0, sizeof(osk->param));
     osk->param.user_id = osk->user_id;

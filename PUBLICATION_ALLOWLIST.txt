@@ -66,6 +66,10 @@ src/pw_launcher_render.c
 src/pw_launcher_render.h
 src/pw_update_check.c
 src/pw_update_check.h
+src/pw_settings.c
+src/pw_settings.h
+src/pw_sha256.c
+src/pw_sha256.h
 src/pw_profile_catalog.c
 src/pw_profile_catalog.h
 src/pw_present.c
@@ -114,6 +118,8 @@ tests/test_pw_x87.c
 tests/test_pw_x87_native.c
 tests/test_pw_launcher_render.c
 tests/test_pw_update_check.c
+tests/test_pw_settings.c
+tests/test_pw_sha256.c
 tests/test_pw_profile_catalog.c
 tests/test_pw_present.c
 tests/test_pw_x86_reference.S

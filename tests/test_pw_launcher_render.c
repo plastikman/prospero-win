@@ -30,8 +30,8 @@ static uint32_t render(const PwLauncherScene *scene)
 
 static void test_navigation(void)
 {
-    const PwLauncherItem items[8]={{"a",0,1},{"b",0,1},{"c",0,1},{"d",0,1},{"e",0,1},{"f",0,1},{"g",0,1},{"h",0,0}};
-    PwLauncherScene scene={items,8,0,NULL,NULL};
+    const PwLauncherItem items[8]={{"a",0,1,NULL},{"b",0,1,NULL},{"c",0,1,NULL},{"d",0,1,NULL},{"e",0,1,NULL},{"f",0,1,NULL},{"g",0,1,NULL},{"h",0,0,NULL}};
+    PwLauncherScene scene={items,8,0,NULL,NULL,NULL,NULL};
 
     /* Keys: the arrows move, Enter and Space choose, others do nothing. */
     assert(pw_launcher_key_action(0x25)==PW_LAUNCHER_ACTION_LEFT);
@@ -40,6 +40,9 @@ static void test_navigation(void)
     assert(pw_launcher_key_action(0x28)==PW_LAUNCHER_ACTION_DOWN);
     assert(pw_launcher_key_action(0x0d)==PW_LAUNCHER_ACTION_CHOOSE);
     assert(pw_launcher_key_action(0x20)==PW_LAUNCHER_ACTION_CHOOSE);
+    assert(pw_launcher_key_action(0x1b)==PW_LAUNCHER_ACTION_BACK);
+    assert(pw_launcher_key_action(0x08)==PW_LAUNCHER_ACTION_BACK);
+    assert(!pw_launcher_navigate(&scene,PW_LAUNCHER_ACTION_BACK,7) && scene.selected==0);
     assert(pw_launcher_key_action('A')==PW_LAUNCHER_ACTION_NONE);
     assert(pw_launcher_key_action(0)==PW_LAUNCHER_ACTION_NONE);
     /* The grid is three wide: left and up stop at the first tile, right and
@@ -63,7 +66,7 @@ static void test_navigation(void)
     assert(pw_launcher_navigate(&scene,PW_LAUNCHER_ACTION_CHOOSE,7)==1 && scene.selected==4);
     assert(!pw_launcher_navigate(&scene,PW_LAUNCHER_ACTION_NONE,7) && scene.selected==4);
     /* No tiles, no selection, or none of it: nothing happens. */
-    PwLauncherScene empty={items,0,PW_LAUNCHER_RENDER_NONE,NULL,NULL};
+    PwLauncherScene empty={items,0,PW_LAUNCHER_RENDER_NONE,NULL,NULL,NULL,NULL};
     assert(!pw_launcher_navigate(&empty,PW_LAUNCHER_ACTION_CHOOSE,0) && empty.selected==PW_LAUNCHER_RENDER_NONE);
     assert(!pw_launcher_navigate(NULL,PW_LAUNCHER_ACTION_CHOOSE,1));
 }
@@ -72,13 +75,13 @@ int main(void)
 {
     test_navigation();
     const PwLauncherItem items[]={
-        {"Space Cadet Pinball","pe32  gdi  prospero-win-direct",1},
-        {"Paint","pe32  gdi  wine-wow64",0},
-        {"Minesweeper",NULL,1},
+        {"Space Cadet Pinball","pe32  gdi  prospero-win-direct",1,NULL},
+        {"Paint","pe32  gdi  wine-wow64",0,NULL},
+        {"Minesweeper",NULL,1,NULL},
     };
-    const PwLauncherScene library={items,3,0,"Ready",NULL};
-    const PwLauncherScene unavailable={items,3,1,"Pinball closed normally",NULL};
-    const PwLauncherScene empty={NULL,0,PW_LAUNCHER_RENDER_NONE,NULL,NULL};
+    const PwLauncherScene library={items,3,0,"Ready",NULL,NULL,NULL};
+    const PwLauncherScene unavailable={items,3,1,"Pinball closed normally",NULL,NULL,NULL};
+    const PwLauncherScene empty={NULL,0,PW_LAUNCHER_RENDER_NONE,NULL,NULL,NULL,NULL};
     uint32_t hashes[3]={render(&library),render(&unavailable),render(&empty)};
     /* Golden frames: a visual change must update these deliberately, after
      * looking at the new rendering. */
@@ -118,8 +121,8 @@ int main(void)
 
     /* A second page is shown for a selection past the first six tiles. */
     PwLauncherItem many[8];
-    for(unsigned i=0;i<8;i++)many[i]=(PwLauncherItem){i<6?"First":"Second",NULL,1};
-    const PwLauncherScene first={many,8,5,NULL,NULL},second={many,8,6,NULL,NULL};
+    for(unsigned i=0;i<8;i++)many[i]=(PwLauncherItem){i<6?"First":"Second",NULL,1,NULL};
+    const PwLauncherScene first={many,8,5,NULL,NULL,NULL,NULL},second={many,8,6,NULL,NULL,NULL,NULL};
     assert(render(&first)!=render(&second));
     render(&second);assert(at(135,300)==selected_edge);
 
@@ -144,15 +147,50 @@ int main(void)
     noticed.notice="";
     assert(render(&noticed)==plain_hash);
 
+    /* The Settings page replaces the tiles: a white panel with a blue
+     * header, the selected row framed in the selection blue; a value being
+     * edited is amber with its part underlined. */
+    const char *const labels[]={"Send log to PC","PC address","Wine log"};
+    const char *const values[]={"On","10.168.2.47:9300","Profile"};
+    PwLauncherSettingsView view={labels,values,3,0,"Streams the app log to ps5logd.",0,0};
+    PwLauncherScene settings=library;
+    settings.settings=&view;
+    settings.hints="Cross: change   Circle: back";
+    uint32_t settings_hash=render(&settings);
+    assert(settings_hash!=plain_hash);
+    uint32_t panel=at(320,600),row0_frame=at(328,300),row1_frame=at(328,384);
+    assert((panel>>16&0xff)>0xd0 && (panel&0xff)>0xe0);                 /* pale panel */
+    assert((row0_frame&0xff)>0xc0 && (row0_frame>>16)<0x50);           /* selection blue */
+    assert(row1_frame!=row0_frame);
+    view.selected=1;
+    render(&settings);
+    assert(at(328,300)!=row0_frame && at(328,384)==row0_frame);
+    uint32_t value_bg=at(1570,380);
+    view.editing=1;view.edit_part=1;
+    render(&settings);
+    uint32_t edit_bg=at(1570,380);
+    assert(edit_bg!=value_bg && (edit_bg>>16&0xff)>0xe0 && (edit_bg&0xff)<0x60);   /* amber */
+    view.edit_part=3;
+    uint32_t part1=render(&settings);
+    view.edit_part=1;
+    assert(render(&settings)!=part1);                                   /* the underline moved */
+    view.selected=3;
+    assert(pw_launcher_render(&settings,&(PwPresentTarget){pixels,W,H,STRIDE,sizeof(pixels)})==PW_ERR_PRECONDITION);
+    /* A tile's badge replaces "Ready". */
+    PwLauncherItem badged[]={{"Settings","Logging and updates",1,"Open"}};
+    PwLauncherItem readied[]={{"Settings","Logging and updates",1,NULL}};
+    const PwLauncherScene b1={badged,1,0,NULL,NULL,NULL,NULL},b2={readied,1,0,NULL,NULL,NULL,NULL};
+    assert(render(&b1)!=render(&b2));
+
     const PwPresentTarget target={pixels,W,H,STRIDE,sizeof(pixels)};
     PwPresentTarget small=target;small.width=1280;
     assert(pw_launcher_render(&library,&small)==PW_ERR_MALFORMED);
     small=target;small.bytes=(uint64_t)STRIDE*H-1;
     assert(pw_launcher_render(&library,&small)==PW_ERR_MALFORMED);
-    const PwLauncherScene bad_selection={items,3,3,NULL,NULL};
+    const PwLauncherScene bad_selection={items,3,3,NULL,NULL,NULL,NULL};
     assert(pw_launcher_render(&bad_selection,&target)==PW_ERR_PRECONDITION);
-    const PwLauncherItem untitled[]={{NULL,NULL,1}};
-    const PwLauncherScene bad_item={untitled,1,0,NULL,NULL};
+    const PwLauncherItem untitled[]={{NULL,NULL,1,NULL}};
+    const PwLauncherScene bad_item={untitled,1,0,NULL,NULL,NULL,NULL};
     assert(pw_launcher_render(&bad_item,&target)==PW_ERR_PRECONDITION);
     assert(pw_launcher_render(NULL,&target)==PW_ERR_PRECONDITION);
     return 0;

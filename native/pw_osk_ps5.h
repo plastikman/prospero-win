@@ -123,6 +123,9 @@ int pw_osk_ps5_open(PwOskPs5 *osk, const PwOskPs5Ops *ops, int32_t user_id);
  * common-dialog family up the first time. PW_OK when the system took it;
  * the title then polls. */
 int pw_osk_ps5_show(PwOskPs5 *osk, const char *title);
+/* The same, starting from initial (UTF-8; NULL or "" starts empty), for
+ * editing a value rather than typing a new line. */
+int pw_osk_ps5_show_text(PwOskPs5 *osk, const char *title, const char *initial);
 
 /* Ends a dialog that is still up (the title is leaving the game); nothing
  * otherwise. */
