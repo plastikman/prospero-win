@@ -42,6 +42,7 @@
 #include "pw_hid_ps5.h"
 #include "pw_update_ps4.h"
 #include "../src/pw_settings.h"
+#include "../src/pw_title.h"
 #include "pw_osk_ps5.h"
 #include "pw_videoout_ps5.h"
 #include "pw_wine_library.h"
@@ -57,6 +58,7 @@
 #include <stdio.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
@@ -106,8 +108,13 @@ static int single_program(void) { return fixed_profile[0] != '\0'; }
 #define PW_WINE64_RUNTIME "/win/wine/lib/wine/x86_64-unix"
 /* Its 64-bit PE modules, among them the WoW64 CPU backends. */
 #define PW_WINE64_PE_RUNTIME "/win/wine/lib/wine/x86_64-windows"
-#define PW_SANDBOX_APP0 "/mnt/sandbox/" PW_TITLE_ID "_000/app0"
-static const char *const runtime_roots[] = { "/app0", PW_SANDBOX_APP0 };
+/* The running title, read from the package's param.sfo when the runtime
+ * starts (runtime_title_init), so one released runtime serves every title
+ * that ships it; the build's PW_TITLE_ID only stands in when it cannot be read. */
+static char title_id[PW_TITLE_ID_CAPACITY] = PW_TITLE_ID;
+static const char *title_source = "build";
+static char sandbox_app0[64] = "/mnt/sandbox/" PW_TITLE_ID "_000/app0";
+static const char *const runtime_roots[] = { "/app0", sandbox_app0 };
 /* The title's data: profiles/, input/, prefix/ and prefixes/<name>. */
 #ifndef PW_WINE64_ROOT_DATA
 #define PW_WINE64_ROOT_DATA "/data/prospero-win"            /* when /data is granted */
@@ -734,10 +741,12 @@ static void leave_to_home(const char *reason)
  * console's home instead (leave_to_home). */
 static void restart_title(const PwWineApp *app, uint32_t cycle, const char *reason)
 {
-    static const char *const eboots[] = { "/app0/eboot.bin", PW_SANDBOX_APP0 "/eboot.bin" };
+    static char sandbox_eboot[80];
+    const char *const eboots[] = { "/app0/eboot.bin", sandbox_eboot };
     static char storage[2 * PW_WINE_LAUNCH_PATH_MAX + 64];
     char *next[PW_WINE_LAUNCH_ARGS];
 
+    snprintf(sandbox_eboot, sizeof(sandbox_eboot), "%s/eboot.bin", sandbox_app0);
     if (!app && single_program()) {
         PS5LOG_LOG("PW_WINE64 leave to=home cycle=%u reason=%s", (unsigned)cycle, reason);
         leave_to_home(reason);
@@ -783,6 +792,63 @@ static int game_setup_failed(const char *reason)
 
 /* Complete the one-shot helper exchange before loading profiles or starting
  * Wine. A failed or incomplete request closes this process to Home. */
+static int is_directory(const char *path)
+{
+    struct stat info;
+    return stat(path, &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+/* The running title's ID: from the kernel's record of this app
+ * (sceKernelGetAppInfo, as PS4 homebrew reads it), else from the package's
+ * /app0/sce_sys/param.sfo. A PS4 title could not open param.sfo (01.60,
+ * 2026-11-09), so the kernel comes first; title_detail keeps why each failed. */
+int32_t sceKernelGetAppInfo(pid_t pid, void *info);
+static char title_detail[96] = "";
+
+static void runtime_title_init(void)
+{
+    static uint8_t sfo[8192];
+    /* OrbisAppInfo: AppId, Unk, 4 bytes, AppType, then TitleId[10] at 0x10;
+     * a larger zeroed buffer in case the kernel writes more than the SDK's
+     * 0x48 bytes. */
+    uint8_t info[0x100];
+    char id[PW_TITLE_ID_CAPACITY];
+    int rc;
+    FILE *file;
+
+    memset(info, 0, sizeof(info));
+    rc = sceKernelGetAppInfo(getpid(), info);
+    if (rc == 0) {
+        memcpy(id, info + 0x10, 10);
+        id[10] = '\0';
+        int valid = id[0] != '\0';
+        for (const char *c = id; *c; c++)
+            if (!((*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9'))) valid = 0;
+        if (valid) {
+            memcpy(title_id, id, sizeof(title_id));
+            title_source = "appinfo";
+            goto done;
+        }
+    }
+    snprintf(title_detail, sizeof(title_detail), "appinfo=%#x", (unsigned)rc);
+    if ((file = fopen("/app0/sce_sys/param.sfo", "rb"))) {
+        size_t length = fread(sfo, 1, sizeof(sfo), file);
+        fclose(file);
+        if (pw_title_id_from_sfo(sfo, length, id) == 0) {
+            memcpy(title_id, id, sizeof(title_id));
+            title_source = "param.sfo";
+            goto done;
+        }
+        snprintf(title_detail + strlen(title_detail), sizeof(title_detail) - strlen(title_detail),
+                 " sfo=unreadable(%zu bytes)", length);
+    } else {
+        snprintf(title_detail + strlen(title_detail), sizeof(title_detail) - strlen(title_detail),
+                 " sfo_errno=%d", errno);
+    }
+done:
+    snprintf(sandbox_app0, sizeof(sandbox_app0), "/mnt/sandbox/%s_000/app0", title_id);
+}
+
 /* Starts the app log on the PC the Settings card names; 0 when it is up. */
 static int settings_log_start(void)
 {
@@ -793,7 +859,7 @@ static int settings_log_start(void)
     snprintf(config.server, sizeof(config.server), "%s", settings.log_server);
     config.port = settings.log_port;
     config.enabled = 1;
-    return ps5log_init(&config, PW_TITLE_ID, PW_APP_NAME, now_ns()) == 0 ? 0 : -1;
+    return ps5log_init(&config, title_id, PW_APP_NAME, now_ns()) == 0 ? 0 : -1;
 }
 
 static int open_library(void)
@@ -802,7 +868,16 @@ static int open_library(void)
     int status;
 
     status = pw_data_mount_request(&mount);
-    if (status == 0) library_root = PW_WINE64_ROOT_DATA;
+    /* The title's own /data/<TITLE_ID> when it has one (Playden: PLDN10001),
+     * else the build's default (orbis-win: /data/prospero-win). The GPU
+     * driver picks its folder the same way (pw_vulkan_radv_ps4.c). */
+    if (status == 0) {
+        static char data_root[PW_TITLE_ROOT_CAPACITY];
+        if (pw_title_data_root(title_id, PW_WINE64_ROOT_DATA, is_directory, data_root, sizeof(data_root)) == 0)
+            library_root = data_root;
+        else
+            library_root = PW_WINE64_ROOT_DATA;
+    }
     pw_settings_defaults(&settings);
     if (status == 0) settings_status = pw_settings_load(library_root, &settings);
     /* settings.conf is the one switch file on the console. A console that
@@ -1473,10 +1548,11 @@ int main(int argc, char **argv)
     int status, video_status = PW_ERR_STATE, pad_status = PW_ERR_STATE, hid_status = PW_ERR_STATE;
     uint64_t close_requested = 0, combo_ticks = 0, started = now_ns();
 
+    runtime_title_init();
     ps5log_config_defaults(&log_config);
     if (ps5log_load_config(ps5log_default_conf_paths, ps5log_default_conf_path_count,
                            &log_config, NULL) == 0)
-        ps5log_init(&log_config, PW_TITLE_ID, PW_APP_NAME, now_ns());
+        ps5log_init(&log_config, title_id, PW_APP_NAME, now_ns());
     pw_hid_ps5_preload(hid_log);   /* before the /data grant changes the title's credentials */
     pw_osk_ps5_preload(osk_log);   /* the dialog's module is a system module too */
     if (open_library() != 0) {
@@ -1490,6 +1566,8 @@ int main(int argc, char **argv)
     /* The package's own identity (title, APP_VER, commit), defined by
      * scripts/build-app-ps4.sh, so every run is attributable from its log. */
     PS5LOG_LOG("PW_WINE64 build_marker=%s", PW_BUILD_ID);
+    PS5LOG_LOG("PW_WINE64 title=%s from=%s root=%s%s%s", title_id, title_source, library_root,
+               title_detail[0] ? " " : "", title_detail);
     PS5LOG_LOG("PW_WINE64 args argc=%d mode=%s profile=%s cycle=%u refused=%u", argc,
                launch.mode == PW_WINE_LAUNCH_GAME ? "game" : "launcher",
                launch.app ? launch.app->id : "-", (unsigned)launch.cycle, launch.refused);
@@ -1574,7 +1652,9 @@ int main(int argc, char **argv)
             extra[config.extra_env_count++] = (PwWineStartEnv){ "SDL_JOYSTICK_RAWINPUT", "0" };
         /* [runtime]: opt-in runtime settings for this game. */
         {
-            if (access("/data/prospero-win/mprotect-nocache", F_OK) == 0) {
+            char nocache[PW_TITLE_ROOT_CAPACITY + 24];
+            snprintf(nocache, sizeof(nocache), "%s/mprotect-nocache", library_root);
+            if (access(nocache, F_OK) == 0) {
                 extra[config.extra_env_count++] =
                     (PwWineStartEnv){ "PW_PS4_MPROTECT_TRUST_CACHE", "0" };
                 PS5LOG_LOG("PW_WINE64 mprotect_trust_cache=0 (marker file)");
