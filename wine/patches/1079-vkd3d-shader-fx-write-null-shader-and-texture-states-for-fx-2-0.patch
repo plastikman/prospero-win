@@ -1,0 +1,97 @@
+From b844fc127a1ea6d5934f02e4a510ceb620a8425a Mon Sep 17 00:00:00 2001
+From: Leonardo Lobato <leo@cliqconsulting.com>
+Date: Tue, 13 Oct 2026 19:26:02 +0200
+Subject: [PATCH 962/963] vkd3d-shader/fx: Write NULL shader and texture states
+ for fx_2_0.
+
+"PixelShader = NULL;" was written as an integer state. d3dx9 reads shader
+and texture states as object pointers, so the state now has the object type
+and an object without data, which d3dx9 loads as NULL.
+
+Taken unchanged from leolobato/prospero-win patch 0962 (main 7ae9bdb),
+Playden's runtime; not yet upstream.
+---
+ libs/vkd3d/libs/vkd3d-shader/fx.c | 60 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/libs/vkd3d/libs/vkd3d-shader/fx.c b/libs/vkd3d/libs/vkd3d-shader/fx.c
+index c5d14b79..c4ac220e 100644
+--- a/libs/vkd3d/libs/vkd3d-shader/fx.c
++++ b/libs/vkd3d/libs/vkd3d-shader/fx.c
+@@ -2354,6 +2354,63 @@ static uint32_t write_fx_2_parameter_reference(const struct hlsl_ir_var *var,
+     return write_fx_2_resource(FX_2_ASSIGNMENT_PARAMETER, name, strlen(name) + 1, fx);
+ }
+ 
++static const struct fx_state *get_fx_2_state(const struct hlsl_state_block_entry *entry,
++        struct fx_write_context *fx)
++{
++    const struct fx_state *states = fx->writing_sampler_states ? fx_2_sampler_states : fx_2_pass_states;
++    size_t count = fx->writing_sampler_states ? ARRAY_SIZE(fx_2_sampler_states) : ARRAY_SIZE(fx_2_pass_states);
++
++    for (size_t i = 0; i < count; ++i)
++    {
++        if (states[i].id == entry->name_id)
++            return &states[i];
++    }
++
++    return NULL;
++}
++
++/* An object state set to NULL, like "PixelShader = NULL;", gets an object
++ * of the state's type that holds no data. */
++static bool write_fx_2_null_object_state(const struct hlsl_state_block_entry *entry,
++        uint32_t *type, uint32_t *value, struct fx_write_context *fx)
++{
++    struct vkd3d_bytecode_buffer *unstructured = &fx->unstructured;
++    const struct fx_state *state = get_fx_2_state(entry, fx);
++    D3DXPARAMETER_TYPE object_type;
++    uint32_t id;
++
++    if (!state)
++        return false;
++
++    switch (state->type)
++    {
++        case FX_VERTEXSHADER:
++            object_type = D3DXPT_VERTEXSHADER;
++            break;
++        case FX_PIXELSHADER:
++            object_type = D3DXPT_PIXELSHADER;
++            break;
++        case FX_TEXTURE:
++            object_type = D3DXPT_TEXTURE;
++            break;
++        default:
++            return false;
++    }
++
++    *type = put_u32(unstructured, object_type);
++    put_u32(unstructured, D3DXPC_OBJECT);
++    put_u32(unstructured, 0); /* Name */
++    put_u32(unstructured, 0); /* Semantic */
++    put_u32(unstructured, 0); /* Element count */
++
++    id = fx->object_variable_count++;
++    *value = put_u32(unstructured, id);
++    put_u32(&fx->objects, id);
++    put_u32(&fx->objects, 0); /* Size */
++
++    return true;
++}
++
+ /* Writes the type and value of a state to the unstructured data. */
+ static void write_fx_2_state_value(const struct hlsl_ir_var *var, struct hlsl_state_block_entry *entry,
+         uint32_t *type, uint32_t *value, struct fx_write_context *fx)
+@@ -2369,6 +2426,9 @@ static void write_fx_2_state_value(const struct hlsl_ir_var *var, struct hlsl_st
+     {
+         case HLSL_IR_CONSTANT:
+         {
++            if (write_fx_2_null_object_state(entry, type, value, fx))
++                break;
++
+             *type = write_fx_2_state_type(entry, fx);
+             *value = unstructured->size;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Wed, 4 Nov 2026 22:00:00 +0100
+Subject: [PATCH] win32u: Don't wait for the PS5 desktop window's owner.
+
+A game that sent a message to the desktop window could stop forever: a
+frozen picture with almost no CPU in use and no crash (The Evil Within).
+
+On a desktop Wine, explorer owns the desktop window and reads its queue.
+On the PS5 the server creates that window and no process serves it. The
+window's handle entry still names the first thread that asked for it,
+so a message sent from any other thread goes to that thread's queue and
+the sender waits for a reply. If that thread never reads its queue, the
+reply never comes. The Evil Within's main thread only waits for the game
+thread, and the game thread calls InvalidateRect(NULL, NULL, TRUE), whose
+RDW_ERASENOW sends WM_ERASEBKGND to the desktop.
+
+If that thread does read its queue the reply is always 0, because this
+process holds no WND for the window: call_window_proc() and
+init_window_call_params() refuse it, so the desktop's window procedure
+never runs here. A sender on another thread now gets that 0 at once. The
+same goes for the message-only window, whose procedure also answers 0.
+
+This holds for every message that waits for a result, such as the
+WM_DISPLAYCHANGE from a display mode change. Notify and callback messages
+do not wait and stay as they were, as does a send from the named thread.
+A WH_CALLWNDPROC hook on the named thread no longer sees these sends.
+
+Taken unchanged from leolobato/prospero-win patch 0967 (main 7ae9bdb),
+Playden's runtime; not yet upstream.
+---
+
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 8c9a2aa..734b72d 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -4422,6 +4422,24 @@ static BOOL process_message( struct send_message_info *info, DWORD_PTR *res_ptr,
+     if (!(info->dest_tid = get_window_thread( info->hwnd, &dest_pid ))) return FALSE;
+     if (is_exiting_thread( info->dest_tid )) return FALSE;
+ 
++#ifdef WINE_PS5_USER_DRIVER
++    /* no explorer serves the server-created desktop: its handle still names the
++     * thread that first asked for it, which may never read its queue. That thread
++     * could only answer 0, as this process holds no WND for the window, so a
++     * sender gets the 0 now. A new thread hasn't yet cached the handles that
++     * is_desktop_window() reads. */
++    if (info->dest_tid != GetCurrentThreadId() &&
++        (info->type == MSG_ASCII || info->type == MSG_UNICODE || info->type == MSG_OTHER_PROCESS))
++    {
++        cache_thread_desktop_windows();
++        if (is_desktop_window( info->hwnd ))
++        {
++            if (res_ptr) *res_ptr = 0;
++            return TRUE;
++        }
++    }
++#endif
++
+     if (info->params && info->dest_tid == GetCurrentThreadId() &&
+         !is_hooked( WH_CALLWNDPROC ) && !is_hooked( WH_CALLWNDPROCRET ) &&
+         thread_info->msg_call_depth <= MAX_WINPROC_RECURSION)
+-- 
+2.43.0

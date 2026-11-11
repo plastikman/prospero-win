@@ -1,0 +1,38 @@
+From 3e7ced8bb40d3a736882e77f2306689c9b72bfab Mon Sep 17 00:00:00 2001
+From: Leonardo Lobato <leo@cliqconsulting.com>
+Date: Tue, 13 Oct 2026 19:26:03 +0200
+Subject: [PATCH 963/963] vkd3d-shader/hlsl: Compile ps_1_x effect shaders as
+ ps_2_0.
+
+The shader model 1 pixel shader writer cannot sample textures, so effects
+with a ps_1_x pass shader failed to compile:
+
+    PixelShader = compile ps_1_0 main();
+
+Compile these as ps_2_0 instead, which can run anything ps_1_x can.
+
+Taken unchanged from leolobato/prospero-win patch 0963 (main 7ae9bdb),
+Playden's runtime; not yet upstream.
+---
+ libs/vkd3d/libs/vkd3d-shader/hlsl.y | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/libs/vkd3d/libs/vkd3d-shader/hlsl.y b/libs/vkd3d/libs/vkd3d-shader/hlsl.y
+index 673b1395..f80c1da8 100644
+--- a/libs/vkd3d/libs/vkd3d-shader/hlsl.y
++++ b/libs/vkd3d/libs/vkd3d-shader/hlsl.y
+@@ -5802,6 +5802,11 @@ static struct hlsl_block *add_shader_compilation(struct hlsl_ctx *ctx, const cha
+         goto out;
+     }
+ 
++    /* The ps_1_x writer cannot sample textures; ps_2_0 runs the same shaders. */
++    if (ctx->profile->type == VKD3D_SHADER_TYPE_EFFECT
++            && profile_info->type == VKD3D_SHADER_TYPE_PIXEL && profile_info->major_version == 1)
++        profile_info = hlsl_get_target_info("ps_2_0");
++
+     for (unsigned int i = 0; i < args->args_count; ++i)
+     {
+         if (args->args[i]->data_type->class == HLSL_CLASS_ERROR)
+-- 
+2.50.1 (Apple Git-155)
+

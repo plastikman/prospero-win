@@ -1,0 +1,67 @@
+From e86da5b04ee5a9e4d5157ef8bdfdc9f200dac8d9 Mon Sep 17 00:00:00 2001
+From: Leonardo Lobato <leo@cliqconsulting.com>
+Date: Tue, 13 Oct 2026 19:26:02 +0200
+Subject: [PATCH 961/963] vkd3d-shader/fx: Accept TRUE and FALSE for any fx_2_0
+ state.
+
+Native effects take TRUE and FALSE for every state, including states such as
+AlphaBlendEnable and Lighting that have no list of named values.
+
+Taken unchanged from leolobato/prospero-win patch 0961 (main 7ae9bdb),
+Playden's runtime; not yet upstream.
+---
+ libs/vkd3d/libs/vkd3d-shader/fx.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/libs/vkd3d-shader/fx.c b/libs/vkd3d/libs/vkd3d-shader/fx.c
+index 5fdd3635..c5d14b79 100644
+--- a/libs/vkd3d/libs/vkd3d-shader/fx.c
++++ b/libs/vkd3d/libs/vkd3d-shader/fx.c
+@@ -2911,6 +2911,8 @@ static bool state_block_contains_state(const struct hlsl_state_block_entry *entr
+ struct replace_state_context
+ {
+     const struct rhs_named_value *values;
++    /* Names that any state accepts, like TRUE and FALSE in fx_2_0. */
++    const struct rhs_named_value *common_values;
+     struct hlsl_ir_var *var;
+ };
+ 
+@@ -2939,14 +2941,17 @@ static bool replace_state_block_constant(struct hlsl_ctx *ctx, struct hlsl_ir_no
+     struct hlsl_ir_node *c;
+     unsigned int value;
+ 
+-    if (!replace_context->values)
++    if (!replace_context->values && !replace_context->common_values)
+         return false;
+ 
+     if (instr->type != HLSL_IR_STATEBLOCK_CONSTANT)
+         return false;
+ 
+     state_constant = hlsl_ir_stateblock_constant(instr);
+-    if (!get_fx_4_state_enum_value(replace_context->values, state_constant->name, &value))
++    if (!(replace_context->values && get_fx_4_state_enum_value(replace_context->values,
++            state_constant->name, &value))
++            && !(replace_context->common_values && get_fx_4_state_enum_value(replace_context->common_values,
++            state_constant->name, &value)))
+     {
+         hlsl_error(ctx, &replace_context->var->loc, VKD3D_SHADER_ERROR_HLSL_INVALID_SYNTAX,
+                 "Unrecognized state constant %s.", state_constant->name);
+@@ -3372,6 +3377,7 @@ static void resolve_fx_2_state_block_values(struct hlsl_ir_var *var,
+     entry->name_id = state->id;
+ 
+     replace_context.values = state->values;
++    replace_context.common_values = bool_values;
+     replace_context.var = var;
+ 
+     /* Turn named constants into actual constants. */
+@@ -3531,6 +3537,7 @@ static void resolve_fx_4_state_block_values(struct hlsl_ir_var *var,
+     entry->name_id = state->id;
+ 
+     replace_context.values = state->values;
++    replace_context.common_values = NULL;
+     replace_context.var = var;
+ 
+     /* Turn named constants to actual constants. */
+-- 
+2.50.1 (Apple Git-155)
+

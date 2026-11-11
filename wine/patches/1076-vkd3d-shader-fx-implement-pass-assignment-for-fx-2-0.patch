@@ -1,0 +1,256 @@
+From e4506eeceb7d5fd4a6cd23f8c2b0e6fb7d7c8889 Mon Sep 17 00:00:00 2001
+From: Manuel Preibisch <manuel.preibisch@gmail.com>
+Date: Fri, 17 Jul 2026 23:51:03 +0200
+Subject: [PATCH] vkd3d-shader/fx: Implement pass assignment for fx_2_0
+
+This allowes for shaders and render states to be assigned inside pass:
+
+```
+technique {
+    pass {
+        PixelShader = compile ps_2_0 PS_Main();
+        VertexShader = compile vs_2_0 VS_Main();
+    }
+}
+```
+
+From the open vkd3d merge request 2145
+(https://gitlab.winehq.org/wine/vkd3d/-/merge_requests/2145), first
+patch only, not merged upstream as of 2026-10-13. D3DX effects that
+compile shaders in a pass (DoDonPachi Resurrection) need it.
+
+
+Taken unchanged from leolobato/prospero-win patch 0959 (main 7ae9bdb),
+Playden's runtime; not yet upstream.
+---
+ libs/vkd3d/libs/vkd3d-shader/fx.c | 97 +++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 81 insertions(+), 16 deletions(-)
+
+diff --git a/libs/vkd3d/libs/vkd3d-shader/fx.c b/libs/vkd3d/libs/vkd3d-shader/fx.c
+index 36a0439f..76beb92f 100644
+--- a/libs/vkd3d/libs/vkd3d-shader/fx.c
++++ b/libs/vkd3d/libs/vkd3d-shader/fx.c
+@@ -280,6 +280,7 @@ struct fx_write_context
+     struct vkd3d_bytecode_buffer unstructured;
+     struct vkd3d_bytecode_buffer structured;
+     struct vkd3d_bytecode_buffer objects;
++    struct vkd3d_bytecode_buffer resources;
+ 
+     struct rb_tree strings;
+     struct list types;
+@@ -287,6 +288,9 @@ struct fx_write_context
+     unsigned int min_technique_version;
+     unsigned int max_technique_version;
+ 
++    unsigned int current_pass_index;
++    unsigned int current_state_index;
++
+     uint32_t technique_count;
+     uint32_t group_count;
+     uint32_t buffer_count;
+@@ -294,6 +298,7 @@ struct fx_write_context
+     uint32_t numeric_variable_count;
+     uint32_t shared_numeric_variable_count;
+     uint32_t object_variable_count;
++    uint32_t resource_count;
+     uint32_t shared_object_count;
+     uint32_t shader_count;
+     uint32_t parameter_count;
+@@ -1579,7 +1584,7 @@ static uint32_t write_fx_4_type(const struct type_entry *type, struct fx_write_c
+ static void write_fx_4_technique(struct hlsl_ir_var *var, struct fx_write_context *fx)
+ {
+     struct vkd3d_bytecode_buffer *buffer = &fx->structured;
+-    uint32_t name_offset, count = 0;
++    uint32_t name_offset;
+     struct hlsl_ir_var *pass;
+     uint32_t count_offset;
+ 
+@@ -1588,14 +1593,14 @@ static void write_fx_4_technique(struct hlsl_ir_var *var, struct fx_write_contex
+     count_offset = put_u32(buffer, 0);
+     write_fx_4_annotations(var->annotations, fx);
+ 
+-    count = 0;
++    fx->current_pass_index = 0;
+     LIST_FOR_EACH_ENTRY(pass, &var->scope->vars, struct hlsl_ir_var, scope_entry)
+     {
+         write_pass(pass, fx);
+-        ++count;
++        ++fx->current_pass_index;
+     }
+ 
+-    set_u32(buffer, count_offset, count);
++    set_u32(buffer, count_offset, fx->current_pass_index);
+ }
+ 
+ static void write_techniques(struct hlsl_scope *scope, struct fx_write_context *fx)
+@@ -1811,7 +1816,7 @@ static uint32_t write_fx_2_parameter(const struct hlsl_ir_var *var, struct fx_wr
+ 
+ static void write_fx_2_technique(struct hlsl_ir_var *var, struct fx_write_context *fx)
+ {
+-    uint32_t name_offset, pass_count_offset, annotation_count_offset, count = 0;
++    uint32_t name_offset, pass_count_offset, annotation_count_offset;
+     struct vkd3d_bytecode_buffer *buffer = &fx->structured;
+     struct hlsl_ir_var *pass;
+ 
+@@ -1822,13 +1827,14 @@ static void write_fx_2_technique(struct hlsl_ir_var *var, struct fx_write_contex
+ 
+     write_fx_2_annotations(var, annotation_count_offset, fx);
+ 
++    fx->current_pass_index = 0;
+     LIST_FOR_EACH_ENTRY(pass, &var->scope->vars, struct hlsl_ir_var, scope_entry)
+     {
+         write_pass(pass, fx);
+-        ++count;
++        ++fx->current_pass_index;
+     }
+ 
+-    set_u32(buffer, pass_count_offset, count);
++    set_u32(buffer, pass_count_offset, fx->current_pass_index);
+ }
+ 
+ /* Effects represent bool values as 1/0, as opposed to ~0u/0 as used by
+@@ -2175,13 +2181,25 @@ static uint32_t write_fx_2_state_type(const struct hlsl_state_block_entry *entry
+     struct hlsl_type *data_type = value->data_type;
+     uint32_t offset;
+ 
+-    /* TODO: only handles numeric types */
++    /* TODO: only handles numeric and shader types */
+ 
+     offset = put_u32(buffer, hlsl_sm1_base_type(data_type, false, HLSL_SAMPLER_DIM_GENERIC));
+-    put_u32(buffer, D3DXPC_MATRIX_ROWS);
++
++    switch (data_type->class)
++    {
++        case HLSL_CLASS_PIXEL_SHADER:
++        case HLSL_CLASS_VERTEX_SHADER:
++            put_u32(buffer, D3DXPC_OBJECT);
++            break;
++
++        default:
++            put_u32(buffer, D3DXPC_MATRIX_ROWS);
++            break;
++    }
++
+     put_u32(buffer, 0); /* Name */
+     put_u32(buffer, 0); /* Semantic */
+-    put_u32(buffer, 1); /* Element count */
++    put_u32(buffer, 0); /* Element count */
+ 
+     put_u32(buffer, entry->args_count); /* Rows */
+     put_u32(buffer, 1); /* Columns */
+@@ -2189,6 +2207,41 @@ static uint32_t write_fx_2_state_type(const struct hlsl_state_block_entry *entry
+     return offset;
+ }
+ 
++static uint32_t write_fx_2_shader(const struct hlsl_ir_compile *compile, struct fx_write_context *fx)
++{
++    struct vkd3d_bytecode_buffer *buffer = &fx->resources;
++    struct vkd3d_shader_code code;
++    uint32_t offset, id;
++
++    memset(&code, 0, sizeof(code));
++    compile_shader(compile, fx, &code);
++
++    id = fx->object_variable_count++;
++    ++fx->resource_count;
++
++    offset = put_u32(&fx->unstructured, id);
++
++    put_u32(buffer, fx->technique_count);
++    put_u32(buffer, fx->current_pass_index);
++    put_u32(buffer, UINT32_MAX); /* Element */
++    put_u32(buffer, fx->current_state_index);
++    put_u32(buffer, FX_2_ASSIGNMENT_CODE_BLOB);
++
++    put_u32(buffer, code.size);
++    if (code.size)
++    {
++        static const uint32_t pad;
++
++        bytecode_put_bytes(buffer, code.code, code.size);
++        if (code.size % 4)
++            bytecode_put_bytes_unaligned(buffer, &pad, 4 - (code.size % 4));
++    }
++
++    vkd3d_shader_free_shader_code(&code);
++
++    return offset;
++}
++
+ static void write_fx_2_state_assignment(const struct hlsl_ir_var *var,
+         struct hlsl_state_block_entry *entry, struct fx_write_context *fx)
+ {
+@@ -2218,6 +2271,14 @@ static void write_fx_2_state_assignment(const struct hlsl_ir_var *var,
+             }
+             break;
+         }
++        case HLSL_IR_COMPILE:
++        {
++            type = write_fx_2_state_type(entry, fx);
++            value = write_fx_2_shader(hlsl_ir_compile(value_node), fx);
++            ++fx->shader_count;
++
++            break;
++        }
+         default:
+             hlsl_fixme(ctx, &var->loc, "Unsupported assignment type for state %s.", entry->name);
+     }
+@@ -2263,11 +2324,11 @@ static int hlsl_fx_2_write(struct hlsl_ctx *ctx, struct vkd3d_shader_code *out)
+ 
+     write_fx_2_parameters(&fx);
+     write_techniques(ctx->globals, &fx);
+-    put_u32(structured, fx.object_variable_count - 1);
+-    put_u32(structured, 0); /* Resource count */
++    put_u32(structured, fx.object_variable_count - fx.resource_count - 1);
++    put_u32(structured, fx.resource_count);
+ 
+     bytecode_put_bytes(structured, fx.objects.data, fx.objects.size);
+-    /* TODO: resources */
++    bytecode_put_bytes(structured, fx.resources.data, fx.resources.size);
+ 
+     set_u32(structured, parameter_count, fx.parameter_count);
+     set_u32(structured, object_count, fx.object_variable_count);
+@@ -2283,6 +2344,7 @@ static int hlsl_fx_2_write(struct hlsl_ctx *ctx, struct vkd3d_shader_code *out)
+     vkd3d_free(fx.unstructured.data);
+     vkd3d_free(fx.structured.data);
+     vkd3d_free(fx.objects.data);
++    vkd3d_free(fx.resources.data);
+ 
+     if (!fx.technique_count)
+         hlsl_error(ctx, &ctx->location, VKD3D_SHADER_ERROR_HLSL_MISSING_TECHNIQUE, "No techniques found.");
+@@ -2754,6 +2816,7 @@ static bool replace_state_block_constant(struct hlsl_ctx *ctx, struct hlsl_ir_no
+ 
+     if (!replace_context->values)
+         return false;
++
+     if (instr->type != HLSL_IR_STATEBLOCK_CONSTANT)
+         return false;
+ 
+@@ -3606,7 +3669,9 @@ static uint32_t write_state_block(struct hlsl_ir_var *var, unsigned int block_in
+         struct fx_write_context *fx)
+ {
+     struct hlsl_state_block *block;
+-    uint32_t i, count = 0;
++    uint32_t i;
++
++    fx->current_state_index = 0;
+ 
+     if (var->state_blocks)
+     {
+@@ -3624,11 +3689,11 @@ static uint32_t write_state_block(struct hlsl_ir_var *var, unsigned int block_in
+             resolve_state_block_values(var, entry, fx);
+ 
+             write_state_assignment(var, entry, fx);
+-            ++count;
++            ++fx->current_state_index;
+         }
+     }
+ 
+-    return count;
++    return fx->current_state_index;
+ }
+ 
+ static void write_fx_4_state_object_initializer(struct hlsl_ir_var *var, struct fx_write_context *fx)
+-- 
+2.50.1 (Apple Git-155)
+
