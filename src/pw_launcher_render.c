@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "pw_launcher_render.h"
+#include <stdio.h>
 #include <string.h>
 
 enum { W=PW_LAUNCHER_RENDER_WIDTH,H=PW_LAUNCHER_RENDER_HEIGHT,
@@ -267,15 +268,27 @@ static void tile(const Canvas *c,int32_t x,int32_t y,const PwLauncherItem *item,
 enum { PANEL_W=1320,PANEL_X=(W-PANEL_W)/2,PANEL_Y=150,ROW_H=84,ROWS_Y=PANEL_Y+120 };
 static void settings_page(const Canvas *c,const PwLauncherSettingsView *view)
 {
-    int32_t panel_h=120+(int32_t)view->count*ROW_H+(view->help?96:24);
+    /* At most PW_LAUNCHER_SETTINGS_VISIBLE rows, a window that follows the selection. */
+    uint32_t shown=view->count<PW_LAUNCHER_SETTINGS_VISIBLE?view->count:PW_LAUNCHER_SETTINGS_VISIBLE;
+    uint32_t first=0;
+    if(view->count>shown && view->selected>=shown/2) {
+        first=view->selected-shown/2;
+        if(first>view->count-shown)first=view->count-shown;
+    }
+    int32_t panel_h=120+(int32_t)shown*ROW_H+(view->help?96:24);
     rounded(c,PANEL_X,PANEL_Y,PANEL_W,panel_h,18,rgb(0x6e,0x96,0xd8),rgb(0x6e,0x96,0xd8));
     rounded(c,PANEL_X+4,PANEL_Y+4,PANEL_W-8,panel_h-8,15,rgb(0xff,0xff,0xff),rgb(0xdc,0xe8,0xfa));
     ramp(c,PANEL_X+4,PANEL_Y+20,PANEL_W-8,72,rgb(0x4a,0x8e,0xee),rgb(0x22,0x5e,0xcc));
-    text(c,PANEL_X+40,PANEL_Y+35,"Settings",6,rgb(0xff,0xff,0xff),PANEL_W-80);
+    text(c,PANEL_X+40,PANEL_Y+35,view->title?view->title:"Settings",6,rgb(0xff,0xff,0xff),PANEL_W-480);
+    char position[24];
     const char *note="Applies to the next game";
+    if(view->count>shown) {
+        snprintf(position,sizeof(position),"%u of %u",(unsigned)view->selected+1,(unsigned)view->count);
+        note=position;
+    }
     text(c,PANEL_X+PANEL_W-40-text_width(note,3),PANEL_Y+46,note,3,rgb(0xdc,0xea,0xff),PANEL_W);
-    for(uint32_t i=0;i<view->count;i++) {
-        int32_t y=ROWS_Y+(int32_t)i*ROW_H,x=PANEL_X+32,w=PANEL_W-64;
+    for(uint32_t i=first;i<first+shown;i++) {
+        int32_t y=ROWS_Y+(int32_t)(i-first)*ROW_H,x=PANEL_X+32,w=PANEL_W-64;
         int selected=i==view->selected;
         if(selected)rounded(c,x-6,y-6,w+12,ROW_H-12+12,16,rgb(0x3a,0x9b,0xf0),rgb(0x00,0x78,0xd4));
         rounded(c,x,y,w,ROW_H-12,12,selected?rgb(0xff,0xff,0xff):rgb(0xf2,0xf6,0xfc),
@@ -303,7 +316,7 @@ static void settings_page(const Canvas *c,const PwLauncherSettingsView *view)
                             (int32_t)(to-from)*24-4,4,rgb(0x3a,0x22,0x00));
         }
     }
-    if(view->help)text(c,PANEL_X+40,ROWS_Y+(int32_t)view->count*ROW_H+24,view->help,3,
+    if(view->help)text(c,PANEL_X+40,ROWS_Y+(int32_t)shown*ROW_H+24,view->help,3,
                        rgb(0x2c,0x3a,0x5c),PANEL_W-80);
 }
 static void taskbar(const Canvas *c,const char *status,const char *hints_text)
@@ -338,7 +351,7 @@ int pw_launcher_render(const PwLauncherScene *scene,const PwPresentTarget *targe
        target->stride%4u || (uint64_t)target->stride*H>target->bytes)return PW_ERR_MALFORMED;
     if(scene->selected!=PW_LAUNCHER_RENDER_NONE && scene->selected>=scene->count)
         return PW_ERR_PRECONDITION;
-    if(scene->settings && (scene->settings->count>8 ||
+    if(scene->settings && (scene->settings->count>PW_LAUNCHER_SETTINGS_MAX ||
        (scene->settings->count && scene->settings->selected>=scene->settings->count)))
         return PW_ERR_PRECONDITION;
     for(uint32_t i=0;i<scene->count;i++)if(!scene->items[i].title)return PW_ERR_PRECONDITION;

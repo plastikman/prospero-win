@@ -152,7 +152,7 @@ int main(void)
      * edited is amber with its part underlined. */
     const char *const labels[]={"Send log to PC","PC address","Wine log"};
     const char *const values[]={"On","10.168.2.47:9300","Profile"};
-    PwLauncherSettingsView view={labels,values,3,0,"Streams the app log to ps5logd.",0,0};
+    PwLauncherSettingsView view={labels,values,3,0,"Streams the app log to ps5logd.",0,0,NULL};
     PwLauncherScene settings=library;
     settings.settings=&view;
     settings.hints="Cross: change   Circle: back";
@@ -176,6 +176,23 @@ int main(void)
     assert(render(&settings)!=part1);                                   /* the underline moved */
     view.selected=3;
     assert(pw_launcher_render(&settings,&(PwPresentTarget){pixels,W,H,STRIDE,sizeof(pixels)})==PW_ERR_PRECONDITION);
+    /* A long list (the game card) scrolls: the window follows the selection, and a title replaces
+     * "Settings". */
+    {
+        static const char *long_labels[20],*long_values[20];
+        for(int i=0;i<20;i++){long_labels[i]=i%2?"Odd row":"Even row";long_values[i]=i%3?"As shipped":"Left stick";}
+        PwLauncherSettingsView card={long_labels,long_values,20,0,"help",0,0,NULL};
+        const PwLauncherScene game={NULL,0,PW_LAUNCHER_RENDER_NONE,NULL,NULL,&card,NULL};
+        uint32_t top=render(&game);
+        card.selected=15;
+        uint32_t scrolled=render(&game);
+        assert(scrolled!=top);
+        assert(at(328,300+4*84)==row0_frame);                 /* row 15 shows fifth */
+        card.title="Mafia";
+        assert(render(&game)!=scrolled);
+        card.count=65;
+        assert(pw_launcher_render(&game,&(PwPresentTarget){pixels,W,H,STRIDE,sizeof(pixels)})==PW_ERR_PRECONDITION);
+    }
     /* A tile's badge replaces "Ready". */
     PwLauncherItem badged[]={{"Settings","Logging and updates",1,"Open"}};
     PwLauncherItem readied[]={{"Settings","Logging and updates",1,NULL}};

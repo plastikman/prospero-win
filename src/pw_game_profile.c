@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "pw_game_profile.h"
+#include <stdio.h>
 #include <string.h>
 
 enum { SET_MODE = 1u << 0, SET_MOUSE = 1u << 1, SET_SPEED = 1u << 2, SET_PRESET = 1u << 3,
@@ -598,6 +599,145 @@ int pw_game_profile_parse(const uint8_t *bytes, size_t length, PwGameProfile *pr
     for (size_t i = 0; parsed.display.framegen && i < parsed.debug_env_count; i++)
         if (!strncmp(parsed.debug_env[i].name, "PW_FRAMEGEN", 11)) return PW_ERR_UNSUPPORTED;
     *profile = parsed;
+    return PW_OK;
+}
+
+/* Characters a WINEDLLOVERRIDES list is made of. */
+static int dll_override_char(uint8_t c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           c == '_' || c == '-' || c == '.' || c == ',' || c == ';' || c == '=' || c == '*' || c == '+';
+}
+
+/* A program in the game's folder, relative to the profile's own program: names separated by \ or /,
+ * none empty or "..", no drive, ending in .exe. Copied with \ separators. */
+static int relative_program(const uint8_t *value, size_t length, char *out, size_t capacity)
+{
+    size_t segment = 0;
+
+    if (!length || length >= capacity || length < 5) return 0;
+    for (size_t i = 0; i <= length; i++) {
+        uint8_t c = i < length ? value[i] : '\\';
+        if (i < length && (c < 0x20 || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' ||
+                           c == '>' || c == '|'))
+            return 0;
+        if (c == '\\' || c == '/') {
+            size_t n = i - segment;
+            if (!n || (n == 2 && value[segment] == '.' && value[segment + 1] == '.') ||
+                (n == 1 && value[segment] == '.'))
+                return 0;
+            segment = i + 1;
+        }
+        if (i < length) out[i] = c == '/' ? '\\' : (char)c;
+    }
+    out[length] = 0;
+    return lower((char)out[length - 4]) == '.' && lower((char)out[length - 3]) == 'e' &&
+           lower((char)out[length - 2]) == 'x' && lower((char)out[length - 1]) == 'e';
+}
+
+int pw_game_profile_apply_settings(PwGameProfile *profile, const uint8_t *bytes, size_t length)
+{
+    PwGameProfile result, debug;
+    PwGameInput input;
+    PwGameDisplay display;
+    char add[PW_APP_DLL_OVERRIDES_CAPACITY] = "", program[PW_APP_PATH_CAPACITY] = "";
+    uint32_t seen_sections = 0, display_seen = 0;
+    int section = SECTION_NONE;
+    size_t cursor = 0;
+
+    if (!profile || (!bytes && length)) return PW_ERR_PRECONDITION;
+    if (length > PW_APP_PROFILE_MAX_BYTES) return PW_ERR_LIMIT;
+    pw_game_input_init(&input);
+    input.mouse_speed = 0;
+    memset(&display, 0, sizeof(display));
+    memset(&debug, 0, sizeof(debug));
+    while (cursor < length) {
+        const uint8_t *begin, *end, *equals, *key_end, *value;
+        size_t key_length, value_length;
+        int status;
+
+        cursor = next_line(bytes, length, cursor, &begin, &end);
+        if (begin == end || *begin == ';' || *begin == '#') continue;
+        if (*begin == '[') {
+            int next = section_of(begin, end);
+            if (next < 0 || next == SECTION_RUNTIME || (seen_sections & (1u << next))) return PW_ERR_MALFORMED;
+            seen_sections |= 1u << next;
+            section = next;
+            continue;
+        }
+        if (section == SECTION_NONE) return PW_ERR_MALFORMED;
+        for (equals = begin; equals < end && *equals != '='; equals++) {}
+        if (equals == end) return PW_ERR_MALFORMED;
+        key_end = equals;
+        trim(&begin, &key_end);
+        value = equals + 1;
+        trim(&value, &end);
+        key_length = (size_t)(key_end - begin);
+        value_length = (size_t)(end - value);
+        if (!key_length) return PW_ERR_MALFORMED;
+        switch (section) {
+        case SECTION_APPLICATION:
+            if (is(begin, key_length, "executable")) {
+                if (program[0] || !relative_program(value, value_length, program, sizeof(program)))
+                    return PW_ERR_MALFORMED;
+                status = PW_OK;
+                break;
+            }
+            if (!is(begin, key_length, "dll_overrides_add")) return PW_ERR_UNSUPPORTED;
+            if (add[0] || !value_length || value_length >= sizeof(add)) return PW_ERR_MALFORMED;
+            for (size_t i = 0; i < value_length; i++)
+                if (!dll_override_char(value[i])) return PW_ERR_MALFORMED;
+            memcpy(add, value, value_length);
+            add[value_length] = 0;
+            status = PW_OK;
+            break;
+        case SECTION_DISPLAY:
+            if (!is(begin, key_length, "desktop")) return PW_ERR_UNSUPPORTED;
+            status = display_field(&display, &display_seen, begin, key_length, value, value_length);
+            break;
+        case SECTION_DEBUG:
+            if (!is(begin, key_length, "winedebug")) return PW_ERR_UNSUPPORTED;
+            status = debug_field(&debug, begin, key_length, value, value_length);
+            break;
+        default:
+            status = input_field(&input, begin, key_length, value, value_length, 1);
+            break;
+        }
+        if (status != PW_OK) return status;
+    }
+    result = *profile;
+    if (input.set & SET_PRESET) {
+        /* A chosen preset is the game's whole input, the profile's own lines included. */
+        memcpy(input.player2, result.input.player2, sizeof(input.player2));
+        result.input = input;
+    } else {
+        pw_game_input_overlay(&result.input, &input);
+    }
+    if (display_seen & 1u) {
+        result.display.width = display.width;
+        result.display.height = display.height;
+    }
+    if (debug.winedebug[0]) memcpy(result.winedebug, debug.winedebug, sizeof(result.winedebug));
+    if (program[0]) {
+        /* Another program in the game's folder: from the folder of the profile's own, which it
+         * also starts in; the game's arguments are not its. */
+        char *slash = strrchr(result.app.executable, '\\');
+        size_t folder = slash ? (size_t)(slash - result.app.executable) : 0;
+        if (!slash || folder + 1 + strlen(program) >= sizeof(result.app.executable)) return PW_ERR_LIMIT;
+        snprintf(result.app.executable + folder + 1, sizeof(result.app.executable) - folder - 1, "%s", program);
+        char *last = strrchr(result.app.executable, '\\');
+        size_t start_in = (size_t)(last - result.app.executable);
+        memcpy(result.app.working_directory, result.app.executable, start_in);
+        result.app.working_directory[start_in] = 0;
+        result.app.arguments[0] = 0;
+    }
+    if (add[0]) {
+        size_t have = strlen(result.app.dll_overrides), more = strlen(add);
+        if (have + (have ? 1 : 0) + more >= sizeof(result.app.dll_overrides)) return PW_ERR_LIMIT;
+        if (have) result.app.dll_overrides[have++] = ';';
+        memcpy(result.app.dll_overrides + have, add, more + 1);
+    }
+    *profile = result;
     return PW_OK;
 }
 

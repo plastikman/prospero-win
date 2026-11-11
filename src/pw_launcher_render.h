@@ -26,7 +26,11 @@ typedef struct PwLauncherSettingsView {
     const char *help;            /* optional line under the rows */
     int editing;                 /* the selected value is being edited */
     int edit_part;               /* while editing: which dot-separated part (0-3) */
+    const char *title;           /* the panel's heading; NULL: "Settings" */
 } PwLauncherSettingsView;
+/* Rows a settings page shows at once; a longer list scrolls with the selection (at most
+ * PW_LAUNCHER_SETTINGS_MAX rows). */
+enum { PW_LAUNCHER_SETTINGS_VISIBLE = 8, PW_LAUNCHER_SETTINGS_MAX = 64 };
 typedef struct PwLauncherScene {
     const PwLauncherItem *items;
     uint32_t count,selected;     /* selected==PW_LAUNCHER_RENDER_NONE: no highlight */

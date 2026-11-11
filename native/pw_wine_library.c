@@ -189,6 +189,15 @@ int pw_wine_library_load(PwWineLibrary *library, const char *root)
         if (length < 0) entry->status = PW_ERR_NOT_FOUND;
         else if (length >= (ssize_t)sizeof(text) - 1) entry->status = PW_ERR_LIMIT;
         else entry->status = pw_game_profile_parse(text, (size_t)length, &entry->profile);
+        if (entry->status != PW_OK) continue;
+        /* The player's settings for this game, from the launcher's game card. */
+        if (snprintf(path, sizeof(path), "%s/settings/%s.conf", root, entry->profile.app.id) >= (int)sizeof(path))
+            continue;
+        length = read_file(path, text, sizeof(text) - 1);
+        if (length < 0) continue;
+        entry->settings = length >= (ssize_t)sizeof(text) - 1 ? PW_ERR_LIMIT :
+                          pw_game_profile_apply_settings(&entry->profile, text, (size_t)length);
+        if (entry->settings == PW_OK) entry->settings = 1;
     }
     return PW_OK;
 }
@@ -200,6 +209,15 @@ const PwGameProfile *pw_wine_library_find(const PwWineLibrary *library, const ch
         if (library->entries[i].status == PW_OK && !strcmp(library->entries[i].profile.app.id, id))
             return &library->entries[i].profile;
     return NULL;
+}
+
+int pw_wine_library_settings(const PwWineLibrary *library, const char *id)
+{
+    if (!library || !id) return 0;
+    for (uint32_t i = 0; i < library->count; i++)
+        if (library->entries[i].status == PW_OK && !strcmp(library->entries[i].profile.app.id, id))
+            return library->entries[i].settings;
+    return 0;
 }
 
 /* input/<name>.input under root, parsed into input. */

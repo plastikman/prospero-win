@@ -210,6 +210,13 @@ size_t pw_game_graphics_env(const PwGameProfile *profile, PwGameEnv *env);
 size_t pw_game_debug_env(const PwGameProfile *profile, PwGameEnv *env);
 /* An input with nothing bound, keyboard mode, no pointer, full rumble. */
 void pw_game_input_init(PwGameInput *input);
+/* A player's settings for one game (settings/<profile id>.conf), over its parsed profile: [input] takes
+ * any input key, and a preset= line there replaces the profile's whole [input]; [display] desktop;
+ * [debug] winedebug; [application] dll_overrides_add, appended to the profile's dll_overrides, and
+ * [application] executable, another program in the game's folder (relative to the profile's own, no
+ * "..", ending .exe), started in its own folder without the profile's arguments. Other
+ * sections and keys are refused. The profile is changed only when the whole file is valid. */
+int pw_game_profile_apply_settings(PwGameProfile *profile, const uint8_t *bytes, size_t length);
 /* Parse an input preset file (one [input] section, no preset= line) into
  * input, overriding what it sets. PW_OK or a PW_ERR_* status. */
 int pw_game_input_parse(const uint8_t *bytes, size_t length, PwGameInput *input);

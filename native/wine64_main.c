@@ -42,6 +42,7 @@
 #include "pw_hid_ps5.h"
 #include "pw_update_ps4.h"
 #include "../src/pw_settings.h"
+#include "../src/pw_game_card.h"
 #include "../src/pw_title.h"
 #include "pw_osk_ps5.h"
 #include "pw_videoout_ps5.h"
@@ -56,9 +57,12 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <strings.h>
+#include <dirent.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1160,6 +1164,337 @@ static int settings_card_action(SettingsCard *card, PwLauncherScene *scene, PwLa
     return 1;
 }
 
+/* The game card: Triangle on a game's tile. Each row starts "As shipped"; a
+ * change is saved at once to <root>/settings/<profile id>.conf, which the
+ * runtime applies over the profile when the game starts
+ * (pw_game_profile_apply_settings). Up/Down pick a row, Left/Right change it
+ * (L1/R1 by ten), Cross types library overrides or resets the game, Circle
+ * goes back. */
+enum { GAME_CARD_PICKS = PW_LAUNCHER_SETTINGS_MAX };  /* choices plus "Type your own" */
+typedef struct GameCardUi {
+    int open, typing;
+    PwGameCardRow typing_row;                       /* which row the console's keyboard fills */
+    size_t game;                                    /* catalog index */
+    PwGameCard card;
+    const char *labels[PW_GAME_CARD_ROW_COUNT], *values[PW_GAME_CARD_ROW_COUNT];
+    char value_text[PW_GAME_CARD_ROW_COUNT][80];
+    char title[96], message[112];
+    PwLauncherSettingsView view;
+    /* Found next to the game's program with stat (the title cannot list a folder). */
+    char programs[16][64];
+    size_t program_count;
+    /* The library overrides picker: the game's own DLLs, the common ones, then "Type your own". */
+    int picking;
+    char pick_names[GAME_CARD_PICKS][32], pick_labels[GAME_CARD_PICKS][64];
+    const char *pick_label_ptrs[GAME_CARD_PICKS], *pick_value_ptrs[GAME_CARD_PICKS];
+    size_t pick_count;                              /* choices; "Type your own" follows */
+    PwLauncherSettingsView pick_view;
+} GameCardUi;
+
+/* The console folder of the game's program, from its Windows path: Z: is the console's root, C: the
+ * game's prefix. 0 when the drive is neither. */
+static int game_card_folder(const PwGameProfile *profile, char *out, size_t capacity)
+{
+    const char *exe = profile->app.executable, *slash = strrchr(exe, '\\');
+    size_t length;
+    int n;
+    if (!slash || strlen(exe) < 3 || exe[1] != ':' || exe[2] != '\\') return 0;
+    length = (size_t)(slash - exe);
+    if (exe[0] == 'Z' || exe[0] == 'z') n = snprintf(out, capacity, "/%.*s", (int)(length > 3 ? length - 3 : 0), exe + 3);
+    else if (exe[0] == 'C' || exe[0] == 'c')
+        n = strcmp(profile->app.prefix, "default") ?
+            snprintf(out, capacity, "%s/prefixes/%s/drive_c/%.*s", library_root, profile->app.prefix,
+                     (int)(length > 3 ? length - 3 : 0), exe + 3) :
+            snprintf(out, capacity, "%s/prefix/drive_c/%.*s", library_root, (int)(length > 3 ? length - 3 : 0), exe + 3);
+    else return 0;
+    if (n < 0 || (size_t)n >= capacity) return 0;
+    for (char *c = out; *c; c++) if (*c == '\\') *c = '/';
+    return 1;
+}
+
+static int game_card_by_name(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
+
+static int game_card_exists(const char *folder, const char *name)
+{
+    char path[640];
+    struct stat info;
+    return snprintf(path, sizeof(path), "%s/%s", folder, name) < (int)sizeof(path) && stat(path, &info) == 0 &&
+           S_ISREG(info.st_mode);
+}
+
+/* What is next to the game's program: setup tools for the Program row, and the DLLs it brings for the
+ * overrides picker. */
+static void game_card_probe(GameCardUi *ui)
+{
+    const PwGameProfile *profile = pw_wine_library_find(&library, catalog[ui->game].id);
+    char folder[512];
+    ui->program_count = 0;
+    ui->pick_count = 0;
+    int found = profile && game_card_folder(profile, folder, sizeof(folder));
+    /* Every other .exe next to the game's own (FalloutNVLauncher.exe, OblivionLauncher.exe: a game's
+     * launcher is rarely named launcher.exe). readdir lists /data in this title (the library scan measured
+     * it); the fixed list of setup-tool names stays for a folder that can't be read. */
+    const char *own = profile ? strrchr(profile->app.executable, '\\') : NULL;
+    own = own ? own + 1 : "";
+    DIR *dir = found ? opendir(folder) : NULL;
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) && ui->program_count < 16) {
+            const char *name = entry->d_name;
+            const size_t length = strlen(name);
+            if (length < 5 || length >= sizeof(ui->programs[0]) || strcasecmp(name + length - 4, ".exe") ||
+                !strcasecmp(name, own) || !game_card_exists(folder, name))
+                continue;
+            snprintf(ui->programs[ui->program_count++], sizeof(ui->programs[0]), "%s", name);
+        }
+        closedir(dir);
+        qsort(ui->programs, ui->program_count, sizeof(ui->programs[0]), game_card_by_name);
+    }
+    for (size_t i = 0; found && !dir && i < pw_game_card_program_count() && ui->program_count < 16; i++)
+        if (game_card_exists(folder, pw_game_card_program_name(i)))
+            snprintf(ui->programs[ui->program_count++], sizeof(ui->programs[0]), "%s", pw_game_card_program_name(i));
+    for (size_t i = 0; found && i < pw_game_card_dll_count() && ui->pick_count + 1 + pw_game_card_common_count() < GAME_CARD_PICKS; i++) {
+        const char *name = pw_game_card_dll_name(i);
+        char lower_file[48], upper_file[48];
+        snprintf(lower_file, sizeof(lower_file), "%s.dll", name);
+        snprintf(upper_file, sizeof(upper_file), "%s.DLL", name);
+        if (!game_card_exists(folder, lower_file) && !game_card_exists(folder, upper_file)) continue;
+        snprintf(ui->pick_names[ui->pick_count], sizeof(ui->pick_names[0]), "%s", name);
+        snprintf(ui->pick_labels[ui->pick_count++], sizeof(ui->pick_labels[0]), "%s.dll (the game's own)", name);
+    }
+    for (size_t i = 0; i < pw_game_card_common_count() && ui->pick_count < GAME_CARD_PICKS - 1; i++) {
+        const char *name = pw_game_card_common_name(i);
+        int listed = 0;
+        for (size_t k = 0; k < ui->pick_count; k++) listed |= !strcmp(ui->pick_names[k], name);
+        if (listed) continue;
+        snprintf(ui->pick_names[ui->pick_count], sizeof(ui->pick_names[0]), "%s", name);
+        snprintf(ui->pick_labels[ui->pick_count++], sizeof(ui->pick_labels[0]), "%s.dll (if the game has one)", name);
+    }
+    PS5LOG_LOG("PW_WINE64 game card id=%s folder=%s programs=%zu overrides=%zu", catalog[ui->game].id,
+               found ? folder : "-", ui->program_count, ui->pick_count);
+}
+
+static void game_card_picker_refresh(GameCardUi *ui)
+{
+    for (size_t i = 0; i < ui->pick_count; i++) {
+        ui->pick_label_ptrs[i] = ui->pick_labels[i];
+        ui->pick_value_ptrs[i] = pw_game_card_override_on(&ui->card, ui->pick_names[i]) ? "On" : "Off";
+    }
+    ui->pick_label_ptrs[ui->pick_count] = "Type your own";
+    ui->pick_value_ptrs[ui->pick_count] = ui->card.values[PW_GAME_CARD_OVERRIDES][0] ?
+                                          ui->card.values[PW_GAME_CARD_OVERRIDES] : "None";
+    ui->pick_view.labels = ui->pick_label_ptrs;
+    ui->pick_view.values = ui->pick_value_ptrs;
+    ui->pick_view.count = (uint32_t)ui->pick_count + 1;
+    if (ui->pick_view.selected >= ui->pick_view.count) ui->pick_view.selected = ui->pick_view.count - 1;
+    ui->pick_view.title = "Library overrides";
+    ui->pick_view.help = ui->message[0] ? ui->message :
+                         "Cross: on/off (the game's copy first, then Wine's). Circle: back.";
+}
+
+static void game_card_path(const GameCardUi *ui, char *path, size_t capacity)
+{
+    snprintf(path, capacity, "%s/settings/%s.conf", library_root, catalog[ui->game].id);
+}
+
+static void game_card_refresh(GameCardUi *ui)
+{
+    for (int row = 0; row < PW_GAME_CARD_ROW_COUNT; row++) {
+        ui->labels[row] = pw_game_card_label((PwGameCardRow)row);
+        pw_game_card_show(&ui->card, (PwGameCardRow)row, ui->value_text[row], sizeof(ui->value_text[row]));
+        /* A preset the data folder does not have: the runtime would play without it. */
+        if (row == PW_GAME_CARD_PRESET && ui->card.values[row][0]) {
+            char path[512];
+            struct stat info;
+            snprintf(path, sizeof(path), "%s/input/%s.input", library_root, ui->card.values[row]);
+            if (stat(path, &info) != 0)
+                strncat(ui->value_text[row], " (not installed)",
+                        sizeof(ui->value_text[row]) - strlen(ui->value_text[row]) - 1);
+        }
+        ui->values[row] = ui->value_text[row];
+    }
+    ui->view.labels = ui->labels;
+    ui->view.values = ui->values;
+    ui->view.count = PW_GAME_CARD_ROW_COUNT;
+    if (ui->view.selected >= ui->view.count) ui->view.selected = ui->view.count - 1;
+    ui->view.title = ui->title;
+    ui->view.help = ui->message[0] ? ui->message : pw_game_card_help((PwGameCardRow)ui->view.selected);
+    ui->view.editing = 0;
+}
+
+/* Writes the card (or removes the file when nothing differs from the profile). The runtime's own
+ * parser checks the file first, so a saved card always applies. */
+static void game_card_save(GameCardUi *ui)
+{
+    char path[512], temporary[520], text[4096];
+    const char *id = catalog[ui->game].id;
+    const PwGameProfile *profile = pw_wine_library_find(&library, id);
+    size_t length;
+    int status = PW_OK;
+
+    game_card_path(ui, path, sizeof(path));
+    if (!pw_game_card_changed(&ui->card)) {
+        if (unlink(path) != 0 && errno != ENOENT) status = PW_ERR_STATE;
+        snprintf(ui->message, sizeof(ui->message), status == PW_OK ? "Back to the profile's own settings."
+                                                                    : "Could not remove the old settings.");
+        PS5LOG_LOG("PW_WINE64 game card cleared id=%s status=%d", id, status);
+        return;
+    }
+    length = pw_game_card_format(&ui->card, text, sizeof(text));
+    if (!length) status = PW_ERR_LIMIT;
+    if (status == PW_OK && profile) {
+        PwGameProfile check = *profile;
+        status = pw_game_profile_apply_settings(&check, (const uint8_t *)text, length);
+    }
+    if (status == PW_OK) {
+        char directory[512];
+        snprintf(directory, sizeof(directory), "%s/settings", library_root);
+        (void)mkdir(directory, 0777);
+        snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+        int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0 || write(fd, text, length) != (ssize_t)length || fsync(fd) != 0) status = PW_ERR_STATE;
+        if (fd >= 0) close(fd);
+        if (status == PW_OK && rename(temporary, path) != 0) status = PW_ERR_STATE;
+        if (status != PW_OK) unlink(temporary);
+    }
+    if (status == PW_OK) snprintf(ui->message, sizeof(ui->message), "Saved. Applies the next time the game starts.");
+    else snprintf(ui->message, sizeof(ui->message), "Not saved (%s).", pw_result_name(status));
+    PS5LOG_LOG("PW_WINE64 game card saved id=%s status=%s bytes=%zu", id, pw_result_name(status), length);
+}
+
+static void game_card_open(GameCardUi *ui, size_t game)
+{
+    char path[512];
+    static uint8_t text[4096];
+    int fd;
+    ssize_t length = -1;
+
+    memset(ui, 0, sizeof(*ui));
+    ui->open = 1;
+    ui->game = game;
+    snprintf(ui->title, sizeof(ui->title), "%s", catalog[game].name);
+    game_card_probe(ui);
+    game_card_path(ui, path, sizeof(path));
+    if ((fd = open(path, O_RDONLY)) >= 0) {
+        length = read(fd, text, sizeof(text));
+        close(fd);
+    }
+    if (length > 0 && length < (ssize_t)sizeof(text) &&
+        pw_game_card_parse(text, (size_t)length, &ui->card) != PW_OK)
+        snprintf(ui->message, sizeof(ui->message), "This game's settings file has lines the card cannot read.");
+    game_card_refresh(ui);
+}
+
+/* One press; 1 when the screen changes. */
+static int game_card_action(GameCardUi *ui, PwLauncherAction action, int step)
+{
+    PwLauncherSettingsView *view = &ui->view;
+    const PwGameCardRow row = (PwGameCardRow)view->selected;
+
+    ui->message[0] = '\0';
+    if (ui->picking) {
+        PwLauncherSettingsView *pick = &ui->pick_view;
+        switch (action) {
+        case PW_LAUNCHER_ACTION_UP: if (pick->selected) pick->selected--; break;
+        case PW_LAUNCHER_ACTION_DOWN: if (pick->selected + 1 < pick->count) pick->selected++; break;
+        case PW_LAUNCHER_ACTION_CHOOSE: case PW_LAUNCHER_ACTION_LEFT: case PW_LAUNCHER_ACTION_RIGHT:
+            if (pick->selected < ui->pick_count) {
+                if (pw_game_card_override_toggle(&ui->card, ui->pick_names[pick->selected])) game_card_save(ui);
+                else snprintf(ui->message, sizeof(ui->message), "The override list is full.");
+            } else if (action == PW_LAUNCHER_ACTION_CHOOSE) {
+                if (pw_osk_ps5_show_text(&osk_ps5, "Library overrides, e.g. d3dx9_27=n,b",
+                                         ui->card.values[PW_GAME_CARD_OVERRIDES]) == PW_OK) {
+                    ui->typing = 1;
+                    ui->typing_row = PW_GAME_CARD_OVERRIDES;
+                } else {
+                    snprintf(ui->message, sizeof(ui->message), "The console's keyboard did not open.");
+                }
+            }
+            break;
+        case PW_LAUNCHER_ACTION_BACK: ui->picking = 0; break;
+        default: return 0;
+        }
+        game_card_picker_refresh(ui);
+        game_card_refresh(ui);
+        return 1;
+    }
+    switch (action) {
+    case PW_LAUNCHER_ACTION_UP: if (view->selected) view->selected--; break;
+    case PW_LAUNCHER_ACTION_DOWN: if (view->selected + 1 < view->count) view->selected++; break;
+    case PW_LAUNCHER_ACTION_LEFT: case PW_LAUNCHER_ACTION_RIGHT:
+        if (row == PW_GAME_CARD_PROGRAM) {
+            /* As shipped, then each program found next to the game's own. */
+            long count = (long)ui->program_count + 1, index = 0;
+            for (size_t i = 0; i < ui->program_count; i++)
+                if (!strcmp(ui->programs[i], ui->card.values[row])) index = (long)i + 1;
+            if (count == 1) {
+                snprintf(ui->message, sizeof(ui->message), "No other program found next to the game. Cross: type a name.");
+                break;
+            }
+            index = ((index + (action == PW_LAUNCHER_ACTION_LEFT ? -1 : 1)) % count + count) % count;
+            if (pw_game_card_set_text(&ui->card, row, index ? ui->programs[index - 1] : "")) game_card_save(ui);
+        } else if (pw_game_card_step(&ui->card, row, action == PW_LAUNCHER_ACTION_LEFT ? -step : step)) {
+            game_card_save(ui);
+        }
+        break;
+    case PW_LAUNCHER_ACTION_CHOOSE:
+        if (row == PW_GAME_CARD_RESET) {
+            pw_game_card_clear(&ui->card);
+            game_card_save(ui);
+        } else if (row == PW_GAME_CARD_OVERRIDES) {
+            ui->picking = 1;
+            ui->pick_view.selected = 0;
+            game_card_picker_refresh(ui);
+            return 1;
+        } else if (row == PW_GAME_CARD_PROGRAM) {
+            if (pw_osk_ps5_show_text(&osk_ps5, "Program to start, next to the game's (setup.exe)",
+                                     ui->card.values[row]) == PW_OK) {
+                ui->typing = 1;
+                ui->typing_row = row;
+            } else {
+                snprintf(ui->message, sizeof(ui->message), "The console's keyboard did not open.");
+            }
+        } else if (pw_game_card_step(&ui->card, row, 1)) {
+            game_card_save(ui);
+        }
+        break;
+    case PW_LAUNCHER_ACTION_BACK: ui->open = 0; return 1;
+    default: return 0;
+    }
+    game_card_refresh(ui);
+    return 1;
+}
+
+/* The controller presets the package ships (/app0/input), copied into the data folder when it lacks
+ * them; a player's own copy is never replaced. */
+static void install_presets(void)
+{
+    char directory[512];
+    unsigned copied = 0;
+
+    snprintf(directory, sizeof(directory), "%s/input", library_root);
+    (void)mkdir(directory, 0777);
+    for (size_t i = 0; i < pw_game_card_preset_count(); i++) {
+        const char *name = pw_game_card_preset_name(i);
+        char source[512], target[520];
+        static uint8_t text[8192];
+        struct stat info;
+        snprintf(source, sizeof(source), "/app0/input/%s.input", name);
+        snprintf(target, sizeof(target), "%s/%s.input", directory, name);
+        if (stat(target, &info) == 0) continue;
+        int in = open(source, O_RDONLY);
+        if (in < 0) continue;
+        ssize_t length = read(in, text, sizeof(text));
+        close(in);
+        if (length <= 0 || length >= (ssize_t)sizeof(text)) continue;
+        int out = open(target, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        if (out < 0) continue;
+        if (write(out, text, (size_t)length) == length) copied++;
+        close(out);
+    }
+    if (copied) PS5LOG_LOG("PW_WINE64 presets installed=%u to %s", copied, directory);
+}
+
 /* Shown until a game is chosen; Wine is not loaded. Does not return. */
 static void run_launcher(void)
 {
@@ -1168,6 +1503,7 @@ static void run_launcher(void)
     PwPadPs5Ops pad_ops;
     PwLauncherItem items[PW_WINE_LIBRARY_MAX + 1];   /* the games, Settings, the refused */
     static SettingsCard card;
+    static GameCardUi game_card;
     uint32_t settings_index;
     const size_t frame_bytes = (size_t)PW_LAUNCHER_RENDER_WIDTH * PW_LAUNCHER_RENDER_HEIGHT * 4u;
     uint8_t *frame = mmap(NULL, frame_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -1179,6 +1515,7 @@ static void run_launcher(void)
     int video_status = pw_videoout_ps5_open(&video), pad_status = pw_pad_ps5_platform_ops(&pad_ops);
     int hid_status, dirty = 1, chosen = -1;
 
+    install_presets();
     if (pad_status == PW_OK)
         pad_status = pw_pad_ps5_open(&pad, &pad_ops, pad_open_map,
                                      sizeof(pad_open_map) / sizeof(pad_open_map[0]));
@@ -1241,12 +1578,18 @@ static void run_launcher(void)
                 scene.status = report_help ? report_path : log_status;
                 dirty = 1;
             }
-            if ((edges & PAD_TRIANGLE) && !card.open) {
-                settings_card_open(&card);
+            /* Triangle: the selected game's card, or the Settings card from any other tile. */
+            if ((edges & PAD_TRIANGLE) && !card.open && !game_card.open) {
+                if (scene.selected < settings_index) game_card_open(&game_card, scene.selected);
+                else settings_card_open(&card);
                 dirty = 1;
             }
             for (size_t i = 0; i < sizeof(pad_actions) / sizeof(pad_actions[0]); i++)
                 if (edges & pad_actions[i].button) QUEUE(pad_actions[i].action, 1);
+            if (game_card.open) {
+                if (edges & PAD_R1) QUEUE(PW_LAUNCHER_ACTION_RIGHT, 10);
+                if (edges & PAD_L1) QUEUE(PW_LAUNCHER_ACTION_LEFT, 10);
+            }
             if (card.editing) {
                 const uint32_t held = pad.core.previous_buttons & (PAD_UP | PAD_DOWN);
                 if (edges & PAD_R1) QUEUE(PW_LAUNCHER_ACTION_UP, 10);
@@ -1278,7 +1621,18 @@ static void run_launcher(void)
             int ended = pw_osk_ps5_poll(&osk_ps5, typed, sizeof(typed));
 
             action_count = 0;
-            if (ended) {
+            if (ended && game_card.typing) {
+                game_card.typing = 0;
+                if (ended == 1) {
+                    if (pw_game_card_set_text(&game_card.card, game_card.typing_row, typed)) game_card_save(&game_card);
+                    else snprintf(game_card.message, sizeof(game_card.message), "%s: %.60s",
+                                  game_card.typing_row == PW_GAME_CARD_PROGRAM ? "Not a program next to the game's"
+                                                                               : "Not an override list", typed);
+                }
+                game_card_refresh(&game_card);
+                if (game_card.picking) game_card_picker_refresh(&game_card);
+                dirty = 1;
+            } else if (ended) {
                 card.typing = 0;
                 if (ended == 1 && typed[0]) {
                     if (pw_settings_set_address(&settings, typed)) {
@@ -1295,7 +1649,9 @@ static void run_launcher(void)
         /* The Settings card takes the presses while it is open; otherwise
          * they move over the tiles, and choosing Settings opens it. */
         for (size_t i = 0; i < action_count && chosen < 0; i++) {
-            if (card.open) {
+            if (game_card.open) {
+                dirty |= game_card_action(&game_card, actions[i], steps[i]);
+            } else if (card.open) {
                 dirty |= settings_card_action(&card, &scene, actions[i], steps[i]);
             } else if (pw_launcher_navigate(&scene, actions[i], settings_index + 1)) {
                 if (scene.selected == settings_index) {
@@ -1315,8 +1671,11 @@ static void run_launcher(void)
                 }
             }
         }
-        scene.settings = card.open ? &card.view : NULL;
-        scene.hints = !card.open ? "Cross: launch   Triangle: settings   Options+Create (hold): close" :
+        scene.settings = game_card.open ? (game_card.picking ? &game_card.pick_view : &game_card.view) :
+                         card.open ? &card.view : NULL;
+        scene.hints = game_card.picking ? "Cross: on/off   Circle: back" :
+                      game_card.open ? "Left/Right: change   L1/R1: by ten   Cross: type, pick or reset   Circle: back" :
+                      !card.open ? "Cross: launch   Triangle: game settings (Settings tile: all)   Options+Create (hold): close" :
                       card.editing ? "Cross or Circle: done" : "Cross: change   Circle: back";
         /* A download in progress: its percentage in the taskbar and the card,
          * twice a second. */
@@ -1585,6 +1944,12 @@ int main(int argc, char **argv)
      * path= runs in the default prefix with nothing bound. */
     pw_game_input_init(&game_input);
     game = launch.app ? pw_wine_library_find(&library, launch.app->id) : NULL;
+    if (game) {
+        const int game_settings = pw_wine_library_settings(&library, launch.app->id);
+        if (game_settings)
+            PS5LOG_LOG("PW_WINE64 game settings %s/settings/%s.conf %s (%d)", library_root, launch.app->id,
+                       game_settings == 1 ? "applied" : "ignored", game_settings);
+    }
     if (game && strcmp(game->app.prefix, "default"))
         snprintf(prefix, sizeof(prefix), "%s/prefixes/%s", library_root, game->app.prefix);
     else

@@ -27,7 +27,10 @@ enum {
 typedef struct PwWineLibraryEntry {
     char file[PW_WINE_LIBRARY_NAME];    /* <name>.profile */
     int status;                         /* PW_OK, or why the profile was refused */
-    PwGameProfile profile;              /* valid when status is PW_OK */
+    PwGameProfile profile;              /* valid when status is PW_OK, the player's settings applied */
+    /* The player's settings/<id>.conf: 1 applied, 0 none, or the PW_ERR_* it was ignored for (the
+     * profile then plays as shipped). */
+    int settings;
 } PwWineLibraryEntry;
 
 typedef struct PwWineLibrary {
@@ -43,6 +46,8 @@ typedef struct PwWineLibrary {
 int pw_wine_library_load(PwWineLibrary *library, const char *root);
 /* The valid profile whose [application] id is id, or NULL. */
 const PwGameProfile *pw_wine_library_find(const PwWineLibrary *library, const char *id);
+/* The game's settings/<id>.conf outcome (PwWineLibraryEntry.settings); 0 when there is none. */
+int pw_wine_library_settings(const PwWineLibrary *library, const char *id);
 /* A profile's input: its preset from <root>/input, then its own lines. A
  * missing or refused preset leaves only the profile's lines; the status
  * says why. */

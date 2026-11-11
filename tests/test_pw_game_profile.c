@@ -655,6 +655,66 @@ static void test_keyboard_stick(void)
     assert(in.stick_deadzone == 60);   /* the profile said nothing, so the preset holds */
 }
 
+static int apply(PwGameProfile *profile, const char *text)
+{
+    return pw_game_profile_apply_settings(profile, (const uint8_t *)text, strlen(text));
+}
+
+/* A player's settings file over a shipped profile (the launcher's game card). */
+static void test_settings(void)
+{
+    PwGameProfile p, before;
+    assert(parse(APP "dll_overrides = d3d9=n\n[display]\ndesktop = 1280x720\n[input]\nmode = xinput\n"
+                     "cross = space\ncircle = escape\n[debug]\nwinedebug = err+all\n", &p) == PW_OK);
+    /* No file, an empty file: nothing changes. */
+    before = p;
+    assert(apply(&p, "") == PW_OK && !memcmp(&p, &before, sizeof(p)));
+    /* Keys without a preset override one by one; the rest of the profile's input stays. */
+    assert(apply(&p, "[input]\nmode = keyboard\ncross = enter\nmouse = right_stick\nkeyboard_stick = left_stick\n"
+                     "[display]\ndesktop = 1152x864\n[debug]\nwinedebug = err+all,warn+all\n"
+                     "[application]\ndll_overrides_add = d3dx9_27=n,b\n") == PW_OK);
+    assert(p.input.mode == PW_GAME_INPUT_KEYBOARD && p.input.mouse == PW_GAME_STICK_RIGHT);
+    assert(p.input.keyboard_stick == PW_GAME_STICK_LEFT);
+    assert(p.input.bindings[CROSS].kind == PW_GAME_BIND_KEY && p.input.bindings[CROSS].code == 0x0d);
+    assert(p.input.bindings[CIRCLE].kind == PW_GAME_BIND_KEY && p.input.bindings[CIRCLE].code == 0x1b);
+    assert(p.display.width == 1152 && p.display.height == 864);
+    assert(!strcmp(p.winedebug, "err+all,warn+all"));
+    assert(!strcmp(p.app.dll_overrides, "d3d9=n;d3dx9_27=n,b"));
+    /* A preset replaces the profile's whole [input]: its own buttons no longer apply. */
+    assert(parse(APP "[input]\nmode = xinput\ncross = space\n", &p) == PW_OK);
+    assert(apply(&p, "[input]\npreset = mouselook\nsquare = e\n") == PW_OK);
+    assert(!strcmp(p.input.preset, "mouselook"));
+    assert(p.input.bindings[CROSS].kind == PW_GAME_BIND_UNSET && !(p.input.set & 1u));
+    assert(p.input.bindings[SQUARE].kind == PW_GAME_BIND_KEY && p.input.bindings[SQUARE].code == 'E');
+    /* Another program in the game's folder (Mafia's setup.exe), started in its folder. */
+    assert(parse(APP "arguments = -window\n", &p) == PW_OK);
+    assert(apply(&p, "[application]\nexecutable = setup.exe\n") == PW_OK);
+    assert(!strcmp(p.app.executable, "C:\\Games\\Pinball\\setup.exe"));
+    assert(!strcmp(p.app.working_directory, "C:\\Games\\Pinball") && !p.app.arguments[0]);
+    assert(parse(APP, &p) == PW_OK);
+    assert(apply(&p, "[application]\nexecutable = Tools/Config.EXE\n") == PW_OK);
+    assert(!strcmp(p.app.executable, "C:\\Games\\Pinball\\Tools\\Config.EXE"));
+    assert(!strcmp(p.app.working_directory, "C:\\Games\\Pinball\\Tools"));
+    assert(parse(APP, &p) == PW_OK);
+    before = p;
+    assert(apply(&p, "[application]\nexecutable = ..\\x.exe\n") == PW_ERR_MALFORMED);
+    assert(apply(&p, "[application]\nexecutable = C:\\x.exe\n") == PW_ERR_MALFORMED);
+    assert(apply(&p, "[application]\nexecutable = readme.txt\n") == PW_ERR_MALFORMED);
+    assert(apply(&p, "[application]\nexecutable = a\\\\b.exe\n") == PW_ERR_MALFORMED);
+    assert(!memcmp(&p, &before, sizeof(p)));
+    /* Anything else is refused, and a refused file changes nothing. */
+    assert(parse(APP, &p) == PW_OK);
+    before = p;
+    assert(apply(&p, "[runtime]\nfast_clock = true\n") != PW_OK);
+    assert(apply(&p, "[display]\nshow_fps = false\n") == PW_ERR_UNSUPPORTED);
+    assert(apply(&p, "[debug]\nenv = PW_X=1\n") == PW_ERR_UNSUPPORTED);
+    assert(apply(&p, "[application]\ndll_overrides_add = a b\n") == PW_ERR_MALFORMED);
+    assert(apply(&p, "[input]\nmode = xinput\nmode = keyboard\n") != PW_OK);
+    assert(apply(&p, "[input]\nmode = keyboard\n[display]\ndesktop = 9x9\n") != PW_OK);
+    assert(apply(&p, "mode = keyboard\n") == PW_ERR_MALFORMED);
+    assert(!memcmp(&p, &before, sizeof(p)));
+}
+
 int main(void)
 {
     test_graphics_env();
@@ -667,7 +727,8 @@ int main(void)
     test_presets();
     test_default_mode();
     test_keyboard_stick();
+    test_settings();
     printf("game profile passed: application plus display and input, every binding kind, "
-           "runtime settings and their environment, the CPU backend choice, debug env variables, refusals, shared presets overridden by the profile, a stick driving the direction keys\n");
+           "runtime settings and their environment, the CPU backend choice, debug env variables, refusals, shared presets overridden by the profile, a stick driving the direction keys, a player's settings file over a profile\n");
     return 0;
 }

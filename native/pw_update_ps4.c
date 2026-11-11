@@ -18,8 +18,17 @@
 #ifndef PW_RELEASE_VERSION
 #define PW_RELEASE_VERSION ""
 #endif
+/* The release feed, the site its notice names and the HTTP agent; a title that ships this updater for
+ * its own releases (Playden) sets them at build time. */
+#ifndef PW_UPDATE_URL
 #define PW_UPDATE_URL "https://api.github.com/repos/plastikman/orbis-win/releases/latest"
+#endif
+#ifndef PW_UPDATE_SITE
 #define PW_UPDATE_SITE "github.com/plastikman/orbis-win"
+#endif
+#ifndef PW_UPDATE_AGENT
+#define PW_UPDATE_AGENT "orbis-win"
+#endif
 #define PW_UPDATE_BODY_MAX (64u * 1024u)    /* tag_name is near the top; more is not needed */
 #define PW_UPDATE_TIMEOUT_US (8u * 1000u * 1000u)
 /* The release's package, as every release names it, and where it goes:
@@ -172,7 +181,7 @@ static long get_release(int ctx, char *body, size_t capacity)
     long length = -1;
     size_t used = 0;
 
-    template_id = http.create_template(ctx, "orbis-win-update-check/" PW_RELEASE_VERSION, HTTP_VERSION_1_1, 1);
+    template_id = http.create_template(ctx, PW_UPDATE_AGENT "-update-check/" PW_RELEASE_VERSION, HTTP_VERSION_1_1, 1);
     if (template_id < 0) { note("update check: template %#x", (unsigned)template_id); return -1; }
     http.resolve_timeout(template_id, PW_UPDATE_TIMEOUT_US);
     http.connect_timeout(template_id, PW_UPDATE_TIMEOUT_US);
@@ -380,7 +389,7 @@ static void *download_run(void *unused)
     if (bind_http()) { download_set(PW_UPDATE_DOWNLOAD_FAILED, 0, "The console's HTTPS is unavailable"); return NULL; }
     if ((net_pool = sceNetPoolCreate("pw-update-download", 16 * 1024, 0)) < 0 ||
         (ssl_ctx = http.ssl_init(256 * 1024)) < 0 || (ctx = http.init(net_pool, ssl_ctx, 256 * 1024)) < 0 ||
-        (template_id = http.create_template(ctx, "orbis-win-update/" PW_RELEASE_VERSION, HTTP_VERSION_1_1, 1)) < 0) {
+        (template_id = http.create_template(ctx, PW_UPDATE_AGENT "-update/" PW_RELEASE_VERSION, HTTP_VERSION_1_1, 1)) < 0) {
         download_set(PW_UPDATE_DOWNLOAD_FAILED, 0, "Could not start the console's HTTPS");
         goto done;
     }
