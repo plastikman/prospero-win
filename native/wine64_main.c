@@ -44,6 +44,8 @@
 #include "../src/pw_settings.h"
 #include "../src/pw_game_card.h"
 #include "../src/pw_title.h"
+#include "../src/pw_title_launch.h"
+#include "../src/pw_title_session.h"
 #include "pw_osk_ps5.h"
 #include "pw_videoout_ps5.h"
 #include "pw_wine_library.h"
@@ -292,6 +294,12 @@ static PwWineApp catalog[PW_WINE_LIBRARY_MAX];
 static char catalog_detail[PW_WINE_LIBRARY_MAX][64];
 static size_t catalog_count;
 static const char *library_root = PW_WINE64_ROOT_SANDBOX;
+static PwTitleLaunch playden_launch;
+static PwTitleSession playden_session;
+static int playden_mode;
+static char playden_library_root[sizeof(playden_launch.data_root) + sizeof("/library")];
+static const char *playden_descriptor_argument;
+static const char *playden_session_argument;
 /* <root>/settings.conf, which the launcher's Settings card writes and every
  * start reads (src/pw_settings.h). settings_status: pw_settings_load's. */
 static PwSettings settings;
@@ -764,6 +772,14 @@ static void restart_title_chain(const PwWineApp *app, uint32_t cycle, uint32_t c
     static char storage[2 * PW_WINE_LAUNCH_PATH_MAX + 64];
     char *next[PW_WINE_LAUNCH_ARGS];
 
+    if (playden_mode && playden_session.active && !app) {
+        const int recorded = !strcmp(reason, "wine-exit") || !strcmp(reason, "guest-exit")
+            ? pw_title_session_exited(&playden_session, 0, 0)
+            : pw_title_session_failed(&playden_session, 0, 0);
+        PS5LOG_LOG("PW_WINE64 Playden session end id=%s reason=%s status=%d",
+                   playden_session.session_id, reason, recorded);
+    }
+
     snprintf(sandbox_eboot, sizeof(sandbox_eboot), "%s/eboot.bin", sandbox_app0);
     if (!app && single_program()) {
         PS5LOG_LOG("PW_WINE64 leave to=home cycle=%u reason=%s", (unsigned)cycle, reason);
@@ -943,10 +959,85 @@ static int settings_log_start(void)
     return ps5log_init(&config, title_id, PW_APP_NAME, now_ns()) == 0 ? 0 : -1;
 }
 
-static int open_library(void)
+/* Playden's PS4 title passes a small path and session ID. The descriptor itself
+ * remains in its per-game /data/homebrew title folder and names the private
+ * bottle, profile and Steam install. A regular Orbis-Win start has neither arg. */
+static int playden_descriptor_open(void)
+{
+    static const char prefix[] = "/data/homebrew/";
+    static const char suffix[] = "/game-launch.json";
+    char expected_title[10], bytes[PW_TITLE_LAUNCH_MAX_BYTES + 1], error[160];
+    const char *path = playden_descriptor_argument;
+    const size_t prefix_size = sizeof(prefix) - 1, suffix_size = sizeof(suffix) - 1;
+    const size_t length = path ? strlen(path) : 0;
+    int fd;
+    ssize_t read_size;
+    size_t used = 0;
+
+    if (!path || !playden_session_argument || strcmp(title_id, "PLDN10001") ||
+        length != prefix_size + 9 + suffix_size || strncmp(path, prefix, prefix_size) ||
+        strcmp(path + prefix_size + 9, suffix) ||
+        !pw_title_session_id_valid(playden_session_argument + 8) ||
+        !pw_title_path_is_regular_file(path)) {
+        PS5LOG_LOG("PW_WINE64 Playden descriptor refused: path or session is invalid");
+        return -1;
+    }
+    memcpy(expected_title, path + prefix_size, 9);
+    expected_title[9] = 0;
+    if (strncmp(expected_title, "FAKE78", 6) ||
+        expected_title[6] < '0' || expected_title[6] > '9' ||
+        expected_title[7] < '0' || expected_title[7] > '9' ||
+        expected_title[8] < '0' || expected_title[8] > '9')
+        return -1;
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    while (used < sizeof(bytes)) {
+        read_size = read(fd, bytes + used, sizeof(bytes) - used);
+        if (read_size < 0 && errno == EINTR) continue;
+        if (read_size <= 0) break;
+        used += (size_t)read_size;
+    }
+    close(fd);
+    if (read_size < 0 || !used || used > PW_TITLE_LAUNCH_MAX_BYTES ||
+        pw_title_launch_parse(bytes, used, expected_title,
+                              &playden_launch, error, sizeof(error)) != 0) {
+        PS5LOG_LOG("PW_WINE64 Playden descriptor refused reason=%s",
+                   read_size < 0 || !used || used > PW_TITLE_LAUNCH_MAX_BYTES ? "size or read" : error);
+        return -1;
+    }
+    if (snprintf(playden_library_root, sizeof(playden_library_root), "%s/library",
+                 playden_launch.data_root) >= (int)sizeof(playden_library_root))
+        return -1;
+    library_root = playden_library_root;
+    if (pw_title_session_start(&playden_session, &playden_launch,
+                               playden_session_argument, error, sizeof(error)) != 0) {
+        PS5LOG_LOG("PW_WINE64 Playden session refused reason=%s", error);
+        return -1;
+    }
+    PS5LOG_LOG("PW_WINE64 Playden descriptor title=%s install=%s profile=%s session=%s root=%s",
+               playden_launch.title_id, playden_launch.install_id,
+               playden_launch.default_profile_id, playden_session.session_id,
+               playden_launch.data_root);
+    return 0;
+}
+
+static int open_library(int argc, char **argv)
 {
     PwDataMountResult mount;
     int status;
+
+    for (int i = 0; argv && i < argc; ++i) {
+        if (!argv[i]) continue;
+        if (!strncmp(argv[i], "descriptor=", 11)) {
+            if (playden_descriptor_argument) return -1;
+            playden_descriptor_argument = argv[i] + 11;
+            playden_mode = 1;
+        } else if (!strncmp(argv[i], "session=", 8)) {
+            if (playden_session_argument) return -1;
+            playden_session_argument = argv[i];
+        }
+    }
+    if (!!playden_descriptor_argument != !!playden_session_argument) return -1;
 
     status = pw_data_mount_request(&mount);
     /* The title's own /data/<TITLE_ID> when it has one (Playden: PLDN10001),
@@ -1007,7 +1098,12 @@ static int open_library(void)
                mount.helper_errno, mount.data_after, mount.elevated_after, mount.waited_ms,
                mount.settled_ms, status == 0 ? library_root : "unavailable");
     if (status != 0) return -1;
+    if (playden_mode && playden_descriptor_open() != 0) return -1;
     status = pw_wine_library_load(&library, library_root);
+    if (status != PW_OK && playden_mode) {
+        (void)pw_title_session_failed(&playden_session, 0, 0);
+        return -1;
+    }
     catalog_count = 0;
     for (uint32_t i = 0; i < library.count; i++) {
         const PwWineLibraryEntry *entry = &library.entries[i];
@@ -1992,12 +2088,20 @@ int main(int argc, char **argv)
         ps5log_init(&log_config, title_id, PW_APP_NAME, now_ns());
     pw_hid_ps5_preload(hid_log);   /* before the /data grant changes the title's credentials */
     pw_osk_ps5_preload(osk_log);   /* the dialog's module is a system module too */
-    if (open_library() != 0) {
+    if (open_library(argc, argv) != 0) {
         PS5LOG_LOG("PW_WINE64 startup blocked reason=data-helper-incomplete");
+        if (playden_mode) restart_title(NULL, 0, "playden-startup-failed");
         ps5log_close("data-helper-incomplete");
         return 1;
     }
-    (void)pw_wine_launch_parse(argc, argv, catalog, catalog_count, &launch);
+    if (playden_mode) {
+        char profile_word[sizeof(playden_launch.default_profile_id) + 9];
+        char *profile_arguments[] = { profile_word };
+        snprintf(profile_word, sizeof(profile_word), "profile=%s", playden_launch.default_profile_id);
+        (void)pw_wine_launch_parse(1, profile_arguments, catalog, catalog_count, &launch);
+    } else {
+        (void)pw_wine_launch_parse(argc, argv, catalog, catalog_count, &launch);
+    }
     (void)pw_diagnostics_open(library_root, PW_BUILD_ID,
                               launch.app ? launch.app->id : "launcher", launch.cycle);
     /* The package's own identity (title, APP_VER, commit), defined by
@@ -2008,6 +2112,8 @@ int main(int argc, char **argv)
     PS5LOG_LOG("PW_WINE64 args argc=%d mode=%s profile=%s cycle=%u refused=%u", argc,
                launch.mode == PW_WINE_LAUNCH_GAME ? "game" : "launcher",
                launch.app ? launch.app->id : "-", (unsigned)launch.cycle, launch.refused);
+    if (playden_mode && launch.mode != PW_WINE_LAUNCH_GAME)
+        return game_setup_failed("playden-profile-missing");
     if (launch.mode != PW_WINE_LAUNCH_GAME && single_program()) {
         /* A single-program title starts its profile as the launcher would. */
         for (uint32_t i = 0; i < catalog_count; i++)
@@ -2022,6 +2128,8 @@ int main(int argc, char **argv)
      * path= runs in the default prefix with nothing bound. */
     pw_game_input_init(&game_input);
     game = launch.app ? pw_wine_library_find(&library, launch.app->id) : NULL;
+    if (playden_mode && (!game || strcmp(game->app.prefix, "game")))
+        return game_setup_failed("playden-bottle-invalid");
     if (game) {
         const int game_settings = pw_wine_library_settings(&library, launch.app->id);
         if (game_settings)
@@ -2434,6 +2542,8 @@ int main(int argc, char **argv)
     if (status == PW_OK) {
         status = pw_wine_start_run(&start, &config, &ops);
         PS5LOG_LOG("PW_WINE64 run status=%d", status);
+        if (status == PW_OK && playden_mode && pw_title_session_running(&playden_session) != 0)
+            return game_setup_failed("playden-session-running-failed");
     }
 #if PW_WINE64_SCRIPT
     const uint64_t script_start_ns = now_ns();
