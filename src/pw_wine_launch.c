@@ -46,6 +46,7 @@ int pw_wine_launch_parse(int argc, char *const *argv, const PwWineApp *apps, siz
         if ((value = value_of(word, "profile"))) profile = value;
         else if ((value = value_of(word, "path"))) path = value;
         else if ((value = value_of(word, "cycle")) && parse_count(value, &out->cycle)) out->cycle = 0;
+        else if ((value = value_of(word, "chain")) && parse_count(value, &out->chain)) out->chain = 0;
     }
     if (profile) {
         for (size_t i = 0; i < count && !out->app; i++)
@@ -73,16 +74,31 @@ static int add_word(char *storage, size_t size, size_t *used, const char *key, c
     return 0;
 }
 
+static void decimal(uint32_t value, char number[11])
+{
+    char digits[11];
+    size_t n = 0;
+
+    do digits[n++] = (char)('0' + value % 10u); while ((value /= 10u) && n < sizeof(digits));
+    for (size_t i = 0; i < n; i++) number[i] = digits[n - 1 - i];
+    number[n] = 0;
+}
+
 size_t pw_wine_launch_argv(const PwWineApp *app, uint32_t cycle, char *storage, size_t size,
                            char **argv, size_t max)
 {
-    char digits[11], number[11];
-    size_t used = 0, words = 0, n = 0;
+    return pw_wine_launch_argv_chain(app, cycle, 0, storage, size, argv, max);
+}
 
-    if (!storage || !argv || max < PW_WINE_LAUNCH_ARGS) return 0;
-    do digits[n++] = (char)('0' + cycle % 10u); while ((cycle /= 10u) && n < sizeof(digits));
-    for (size_t i = 0; i < n; i++) number[i] = digits[n - 1 - i];
-    number[n] = 0;
+size_t pw_wine_launch_argv_chain(const PwWineApp *app, uint32_t cycle, uint32_t chain, char *storage,
+                                 size_t size, char **argv, size_t max)
+{
+    char number[11];
+    size_t used = 0, words = 0;
+
+    /* profile and path (or launcher), cycle, chain, NULL; the launcher has no chain. */
+    if (!storage || !argv || (chain && !app) || max < 4u + (chain ? 1u : 0u)) return 0;
+    decimal(cycle, number);
     if (app) {
         if (!app->id || !app->executable) return 0;
         argv[words++] = storage + used;
@@ -95,8 +111,74 @@ size_t pw_wine_launch_argv(const PwWineApp *app, uint32_t cycle, char *storage, 
     }
     argv[words++] = storage + used;
     if (add_word(storage, size, &used, "cycle", number)) return 0;
+    if (chain) {
+        decimal(chain, number);
+        argv[words++] = storage + used;
+        if (add_word(storage, size, &used, "chain", number)) return 0;
+    }
     argv[words] = NULL;
     return words;
+}
+
+/* A path with a ".." component. */
+static int has_parent(const char *path)
+{
+    for (const char *p = path; (p = strstr(p, "..")); p += 2)
+        if ((p == path || p[-1] == '\\') && (p[2] == 0 || p[2] == '\\')) return 1;
+    return 0;
+}
+
+static int ends_exe(const char *path)
+{
+    size_t length = strlen(path);
+    const char *tail = path + length - 4;
+
+    return length > 4 && tail[0] == '.' && (tail[1] | 0x20) == 'e' && (tail[2] | 0x20) == 'x' &&
+           (tail[3] | 0x20) == 'e';
+}
+
+int pw_wine_launch_chain_parse(const char *text, size_t length, PwWineChain *out)
+{
+    int version = 0, image = 0;
+    size_t start = 0;
+
+    if (!text || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    while (start < length) {
+        size_t end = start, field;
+        const char *line = text + start, *value = NULL;
+        char *target = NULL;
+        size_t capacity = 0;
+
+        while (end < length && text[end] != '\n') end++;
+        field = end - start;
+        if (field == 15 && !memcmp(line, "pw-exec-chain 1", 15)) version = 1;
+        else if (field >= 6 && !memcmp(line, "image=", 6)) { value = line + 6; target = out->image; capacity = sizeof(out->image); image = 1; }
+        else if (field >= 5 && !memcmp(line, "args=", 5)) { value = line + 5; target = out->arguments; capacity = sizeof(out->arguments); }
+        else if (field >= 4 && !memcmp(line, "cwd=", 4)) { value = line + 4; target = out->cwd; capacity = sizeof(out->cwd); }
+        if (target) {
+            size_t value_length = field - (size_t)(value - line);
+            if (value_length >= capacity || memchr(value, 0, value_length)) return -1;
+            memcpy(target, value, value_length);
+            target[value_length] = 0;
+        }
+        start = end + 1;
+    }
+    if (!version || !image || !valid_path(out->image) || !ends_exe(out->image) || has_parent(out->image))
+        return -1;
+    {
+        size_t cwd_length = strlen(out->cwd);
+        while (cwd_length > 3 && out->cwd[cwd_length - 1] == '\\') out->cwd[--cwd_length] = 0;
+    }
+    if (!valid_path(out->cwd) || has_parent(out->cwd)) {
+        /* The image's own folder; a program at a drive's root keeps the root. */
+        const char *slash = strrchr(out->image, '\\');
+        size_t folder = (size_t)(slash - out->image);
+        if (folder < 3) folder = 3;
+        memcpy(out->cwd, out->image, folder);
+        out->cwd[folder] = 0;
+    }
+    return 0;
 }
 
 int pw_wine_launch_split(const char *text, char *storage, size_t size, const char **words,

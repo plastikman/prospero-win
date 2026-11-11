@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Sun, 1 Nov 2026 20:00:00 +0100
+Subject: [PATCH] ntdll: Say which program could not start on PS5.
+
+When the title doesn't turn the exec chain on, a program the game starts
+fails, and whoever runs the game has no way to tell that it was a launcher
+asking for its game. With WINE_PS5_EXEC_REFUSED naming a file, the first
+such program is written there. Windows programs and other files the chain
+would refuse are left out.
+
+Taken unchanged from leolobato/prospero-win patch 0997 (main 7ae9bdb),
+Playden's runtime; not yet upstream. On the PS4 the title side is
+native/wine64_main.c (exec chain, chain=<n>).
+---
+ dlls/ntdll/unix/process.c | 23 +
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index 2d87024..c99ce10 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -795,12 +795,24 @@ static int ps5_chain_write( const char *request, const char *temp, const UNICODE
+     return -1;
+ }
+ 
++/* The title didn't turn the chain on: say which program couldn't start, for
++ * whoever reads the file after the game. The first one stays. */
++static void ps5_chain_note_refused( const char *path, const UNICODE_STRING *image )
++{
++    int fd = open( path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600 ), failed;
++
++    if (fd == -1) return;
++    failed = write( fd, "pw-exec-refused 1\n", 18 ) != 18 ||
++             ps5_chain_put( fd, "image=", image->Buffer, image->Length / sizeof(WCHAR), PS5_CHAIN_PATH_MAX );
++    if (close( fd ) || failed) unlink( path );
++}
++
+ static NTSTATUS ps5_exec_chain( HANDLE *process_handle_ptr, HANDLE *thread_handle_ptr,
+                                 const RTL_USER_PROCESS_PARAMETERS *params, PS_ATTRIBUTE_LIST *ps_attr )
+ {
+     static const WCHAR windir[] = {'c',':','\\','w','i','n','d','o','w','s','\\'};
+     static const WCHAR exe[] = {'.','e','x','e'};
+-    const char *request = getenv( "WINE_PS5_EXEC_CHAIN" );
++    const char *request = getenv( "WINE_PS5_EXEC_CHAIN" ), *refused = getenv( "WINE_PS5_EXEC_REFUSED" );
+     const WCHAR *image = params->ImagePathName.Buffer, *args = params->CommandLine.Buffer;
+     DWORD image_len = params->ImagePathName.Length / sizeof(WCHAR);
+     DWORD args_len = params->CommandLine.Length / sizeof(WCHAR);
+@@ -810,7 +822,9 @@ static NTSTATUS ps5_exec_chain( HANDLE *process_handle_ptr, HANDLE *thread_handl
+     NTSTATUS status;
+     BOOL quoted = FALSE;
+ 
+-    if (!request || !*request || strlen( request ) + 5 > sizeof(temp)) return STATUS_NOT_SUPPORTED;
++    if (request && !*request) request = NULL;
++    if (refused && !*refused) refused = NULL;
++    if ((!request && !refused) || (request && strlen( request ) + 5 > sizeof(temp))) return STATUS_NOT_SUPPORTED;
+     if (!image || image_len <= ARRAY_SIZE(exe)) return STATUS_NOT_SUPPORTED;
+     for (i = 0; i < ARRAY_SIZE(exe); i++)
+         if (towlower( image[image_len - ARRAY_SIZE(exe) + i] ) != exe[i]) return STATUS_NOT_SUPPORTED;
+@@ -823,6 +837,11 @@ static NTSTATUS ps5_exec_chain( HANDLE *process_handle_ptr, HANDLE *thread_handl
+             return STATUS_NOT_SUPPORTED;
+         }
+     }
++    if (!request)
++    {
++        ps5_chain_note_refused( refused, &params->ImagePathName );
++        return STATUS_NOT_SUPPORTED;
++    }
+ 
+     /* The arguments: the command line without its first word (the program),
+      * split as the C runtime does: a quoted first word ends at its closing quote. */
+-- 
+2.39.5

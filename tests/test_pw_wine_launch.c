@@ -100,6 +100,47 @@ static void test_argv(void)
     assert(!pw_wine_launch_argv(&broken, 0, storage, sizeof(storage), argv, 4));
     assert(!pw_wine_launch_argv(&apps[0], 0, NULL, sizeof(storage), argv, 4));
     assert(!pw_wine_launch_argv(&apps[0], 0, storage, sizeof(storage), NULL, 4));
+
+    /* chain=<n> follows the cycle and parses back; it needs a fifth entry and a game. */
+    assert(pw_wine_launch_argv_chain(&apps[0], 3, 1, storage, sizeof(storage), argv, 5) == 4);
+    assert(!strcmp(argv[2], "cycle=3") && !strcmp(argv[3], "chain=1") && !argv[4]);
+    assert(!pw_wine_launch_parse(4, argv, apps, COUNT, &back));
+    assert(back.mode == PW_WINE_LAUNCH_GAME && back.app == &apps[0] && back.cycle == 3 && back.chain == 1);
+    assert(!pw_wine_launch_argv_chain(&apps[0], 3, 1, storage, sizeof(storage), argv, 4));
+    assert(!pw_wine_launch_argv_chain(NULL, 3, 1, storage, sizeof(storage), argv, 5));
+    assert(pw_wine_launch_argv_chain(&apps[0], 3, 0, storage, sizeof(storage), argv, 4) == 3);
+    assert(!pw_wine_launch_parse(3, argv, apps, COUNT, &back) && !back.chain);
+}
+
+static void test_chain(void)
+{
+    static const char good[] = "pw-exec-chain 1\nimage=C:\\Games\\FNV\\FalloutNV.exe\n"
+                               "args=-windowed \"a b\"\ncwd=C:\\Games\\FNV\\\n";
+    static const char bare[] = "pw-exec-chain 1\nimage=C:\\Games\\Mafia\\Game.EXE\nargs=\ncwd=\n";
+    static const char root[] = "pw-exec-chain 1\nimage=C:\\run.exe";
+    static const char parent[] = "pw-exec-chain 1\nimage=C:\\Games\\x.exe\ncwd=C:\\Games\\..\\..\n";
+    PwWineChain chain;
+    char huge[PW_WINE_CHAIN_ARGS_MAX + 64] = "pw-exec-chain 1\nimage=C:\\a.exe\nargs=";
+
+    assert(!pw_wine_launch_chain_parse(good, sizeof(good) - 1, &chain));
+    assert(!strcmp(chain.image, "C:\\Games\\FNV\\FalloutNV.exe"));
+    assert(!strcmp(chain.arguments, "-windowed \"a b\"") && !strcmp(chain.cwd, "C:\\Games\\FNV"));
+    /* No working directory: the program's own folder. */
+    assert(!pw_wine_launch_chain_parse(bare, sizeof(bare) - 1, &chain));
+    assert(!strcmp(chain.cwd, "C:\\Games\\Mafia") && !chain.arguments[0]);
+    assert(!pw_wine_launch_chain_parse(root, sizeof(root) - 1, &chain) && !strcmp(chain.cwd, "C:\\"));
+    assert(!pw_wine_launch_chain_parse(parent, sizeof(parent) - 1, &chain) && !strcmp(chain.cwd, "C:\\Games"));
+
+    /* Refused: no version, not an .exe, relative, "..", a field too long, NULL. */
+    assert(pw_wine_launch_chain_parse("image=C:\\a.exe\n", 16, &chain) == -1);
+    assert(pw_wine_launch_chain_parse("pw-exec-chain 1\nimage=C:\\a.bat", 31, &chain) == -1);
+    assert(pw_wine_launch_chain_parse("pw-exec-chain 1\nimage=a.exe", 28, &chain) == -1);
+    assert(pw_wine_launch_chain_parse("pw-exec-chain 1\nimage=C:\\..\\a.exe", 35, &chain) == -1);
+    assert(pw_wine_launch_chain_parse("pw-exec-chain 2\nimage=C:\\a.exe", 31, &chain) == -1);
+    memset(huge + strlen(huge), 'x', PW_WINE_CHAIN_ARGS_MAX + 1);
+    huge[sizeof(huge) - 1] = 0;
+    assert(pw_wine_launch_chain_parse(huge, strlen(huge), &chain) == -1);
+    assert(pw_wine_launch_chain_parse(NULL, 0, &chain) == -1 && pw_wine_launch_chain_parse(good, 3, NULL) == -1);
 }
 
 
@@ -156,6 +197,7 @@ int main(void)
 {
     test_parse();
     test_argv();
+    test_chain();
     test_split();
     test_host_dir();
     printf("wine launch passed: launcher on no game, profile and path, overrides, refusals, "

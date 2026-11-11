@@ -177,6 +177,9 @@ typedef struct PwGameProfile {
     PwGameDebugEnv debug_env[PW_GAME_DEBUG_ENV_MAX];    /* [debug] env lines */
     size_t debug_env_count;
     PwGameRuntime runtime;      /* [runtime], everything off by default */
+    /* A player's settings chose another program than the profile's own ([application]
+     * executable): a launcher or setup tool, whose game the title may run next. */
+    uint8_t other_program;
 } PwGameProfile;
 
 /* Parse a whole profile. [application] must come first; [display],

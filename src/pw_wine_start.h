@@ -18,7 +18,7 @@
 #include "pw_wine_launch.h"
 
 enum {
-    PW_WINE_START_MAX_ENV = 30,  /* +1: WINE_PS4_NETCFG (2026-11-05) */
+    PW_WINE_START_MAX_ENV = 31,  /* +1: WINE_PS4_NETCFG (2026-11-05); +1: the exec chain's file */
     /* wine, the executable and every word a profile's arguments may split into */
     PW_WINE_START_MAX_ARGS = 2 + PW_WINE_LAUNCH_WORDS,
     /* Stages, reported so a failed start names where it stopped. */

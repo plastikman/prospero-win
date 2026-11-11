@@ -730,6 +730,7 @@ int pw_game_profile_apply_settings(PwGameProfile *profile, const uint8_t *bytes,
         memcpy(result.app.working_directory, result.app.executable, start_in);
         result.app.working_directory[start_in] = 0;
         result.app.arguments[0] = 0;
+        result.other_program = 1;
     }
     if (add[0]) {
         size_t have = strlen(result.app.dll_overrides), more = strlen(add);

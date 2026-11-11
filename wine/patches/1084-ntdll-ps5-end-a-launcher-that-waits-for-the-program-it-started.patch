@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: prospero-win <prospero-win@invalid>
+Date: Sun, 1 Nov 2026 14:00:00 +0100
+Subject: [PATCH] ntdll: End a program that waits for the one it started on
+ PS5.
+
+A launcher that starts its game and stays until the game ends never lets
+the game run: the game starts only once the launcher has ended, and the
+handle the launcher waits on is its own process, which cannot signal
+before that.
+
+A wait for the queued program now ends the caller, with exit code 0, unless
+something it waits on is ready at that moment. The program is recognized by object, as
+a thread pool waits on a copy of the handle. A wait with no end does so at
+once. A finite one answers that the program runs for the first 10 seconds
+after the start, so a launcher that checks on its game and then exits
+still exits by itself; after that, or if it would last longer, it ends the
+caller too, as a launcher that polls in its message loop would never stop.
+A thread that waits on the thread handle it got, on that alone and not
+alertably, is waiting for itself, which cannot end either, so it counts too.
+The same handle waited on by another thread does not: that thread may be
+joining a starter that exits.
+
+The launcher ends without its exit handlers. A launcher that waits for a
+helper and then starts the game does not come back after the helper.
+
+Taken unchanged from leolobato/prospero-win patch 0996 (main 7ae9bdb),
+Playden's runtime; not yet upstream. On the PS4 the title side is
+native/wine64_main.c (exec chain, chain=<n>).
+---
+ dlls/ntdll/unix/process.c | 58 +
+ dlls/ntdll/unix/sync.c | 31 +
+ dlls/ntdll/unix/unix_private.h | 2 +
+ 3 files changed, 90 insertions(+), 1 deletions(-)
+
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index da4f8ac..2d87024 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -689,7 +689,8 @@ static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_
+  * prefix, once this one has ended (sceSystemServiceLoadExec, as console games
+  * switch programs). The caller gets handles to its own process and thread with
+  * only query and wait rights, so a launcher that starts its game and exits
+- * carries on as on Windows; one that waits for the program waits forever.
++ * carries on as on Windows. One that waits for the program would wait for
++ * itself, so it ends there instead (ps5_chain_ends_wait).
+  * A suspended start is accepted too (The Witcher 3's REDprelauncher starts its
+  * game suspended): the thread handle may also resume, which does nothing to a
+  * thread that is not suspended, so the caller's ResumeThread succeeds.
+@@ -698,6 +699,56 @@ static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_
+ enum { PS5_CHAIN_PATH_MAX = 259, PS5_CHAIN_ARGS_MAX = 512 };  /* bytes, without the NUL */
+ 
+ static pthread_mutex_t ps5_chain_mutex = PTHREAD_MUTEX_INITIALIZER;
++/* Set once a program is queued: this process, to recognize a wait for the
++ * program under any handle (a thread pool waits on its own copy), and when that
++ * was. A wait for this process cannot end while it runs. The thread handle is
++ * the starter's: it counts only when that thread waits on it alone and not
++ * alertably, which cannot end either; another thread may join a starter that
++ * exits, and an event or an APC could still end a wider wait. */
++static HANDLE ps5_chain_self;
++static ULONGLONG ps5_chain_queued_us;
++static BOOL ps5_chain_queued;
++
++/* Whether a wait is one for the program that cannot end before this program
++ * does. A wait with no end is. A finite one is too once it has had the time a
++ * launcher takes to check on its game and exit by itself, or if it would last
++ * past that; until then it answers that the program runs. The program waited
++ * for might be a helper the launcher needs back: this one does not return. */
++BOOL ps5_chain_ends_wait( DWORD count, const HANDLE *handles, BOOLEAN alertable, const LARGE_INTEGER *timeout )
++{
++    enum { GRACE_US = 10000000 };
++    ULONGLONG waited;
++    BOOL found = FALSE;
++    DWORD i;
++
++    if (!__atomic_load_n( &ps5_chain_queued, __ATOMIC_ACQUIRE )) return FALSE;
++    waited = ps5_now_us() - ps5_chain_queued_us;
++    if (timeout && waited < GRACE_US)
++    {
++        LONGLONG length = timeout->QuadPart;
++
++        if (length > 0)
++        {
++            LARGE_INTEGER now;
++            NtQuerySystemTime( &now );
++            length = now.QuadPart - length;     /* an absolute deadline: negative while ahead */
++        }
++        if (length > -(LONGLONG)(GRACE_US - waited) * 10) return FALSE;
++    }
++    for (i = 0; i < count && !found; i++)
++    {
++        if (!handles[i] || (HandleToLong( handles[i] ) >= ~5 && HandleToLong( handles[i] ) <= ~0)) continue;
++        found = !NtCompareObjects( handles[i], ps5_chain_self ) ||
++                (count == 1 && !alertable && !NtCompareObjects( handles[i], NtCurrentThread() ));
++    }
++    return found;
++}
++
++void ps5_chain_end_wait(void)
++{
++    MESSAGE( "wine: PS5 exec chain: the program waits for the one it started, ending it\n" );
++    NtTerminateProcess( NtCurrentProcess(), 0 );
++}
+ 
+ static int ps5_chain_put( int fd, const char *key, const WCHAR *str, DWORD len, int max )
+ {
+@@ -799,14 +850,19 @@ static NTSTATUS ps5_exec_chain( HANDLE *process_handle_ptr, HANDLE *thread_handl
+     if (!status)
+         status = NtDuplicateObject( NtCurrentProcess(), NtCurrentThread(), NtCurrentProcess(), &thread,
+                                     SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME, 0, 0 );
++    if (!status)
++        status = NtDuplicateObject( NtCurrentProcess(), NtCurrentProcess(), NtCurrentProcess(), &ps5_chain_self, 0, 0, 0 );
+     if (status)
+     {
+         MESSAGE( "wine: PS5 exec chain cannot make placeholder handles (status %#x)\n", (int)status );
+         if (process) NtClose( process );
++        if (thread) NtClose( thread );
+         unlink( request );
+         pthread_mutex_unlock( &ps5_chain_mutex );
+         return STATUS_NOT_SUPPORTED;
+     }
++    ps5_chain_queued_us = ps5_now_us();
++    __atomic_store_n( &ps5_chain_queued, TRUE, __ATOMIC_RELEASE );
+     pthread_mutex_unlock( &ps5_chain_mutex );
+ 
+     for (i = 0; i < attr_count; i++)
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 6256fa8..43ec511 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2324,6 +2324,12 @@ NTSTATUS WINAPI NtQueryTimer( HANDLE handle, TIMER_INFORMATION_CLASS class,
+ /******************************************************************
+  *		NtWaitForMultipleObjects (NTDLL.@)
+  */
++#ifdef __PROSPERO__
++/* Marks the look a wait takes before it ends the program (ps5_chain_ends_wait):
++ * what can finish it now, such as another handle or a message, still does. */
++static const LARGE_INTEGER ps5_chain_look;
++#endif
++
+ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WAIT_TYPE type,
+                                           BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
+@@ -2334,6 +2340,15 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
+     if (!count || count > MAXIMUM_WAIT_OBJECTS) return STATUS_INVALID_PARAMETER_1;
+     if (type != WaitAll && type != WaitAny) FIXME( "Unsupported wait type %u\n", type );
+ 
++#ifdef __PROSPERO__
++    if (timeout != &ps5_chain_look && ps5_chain_ends_wait( count, handles, alertable, timeout ))
++    {
++        if ((ret = NtWaitForMultipleObjects( count, handles, type, alertable, &ps5_chain_look )) != STATUS_TIMEOUT)
++            return ret;
++        ps5_chain_end_wait();
++    }
++#endif
++
+     if (TRACE_ON(sync))
+     {
+         TRACE( "type %u, alertable %u, handles {%p", type, alertable, handles[0] );
+@@ -2373,6 +2388,13 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
+ 
+     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
+ 
++#ifdef __PROSPERO__
++    if (timeout != &ps5_chain_look && ps5_chain_ends_wait( 1, &handle, alertable, timeout ))
++    {
++        if ((ret = NtWaitForSingleObject( handle, alertable, &ps5_chain_look )) != STATUS_TIMEOUT) return ret;
++        ps5_chain_end_wait();
++    }
++#endif
+     if ((ret = inproc_wait( 1, &handle, WaitAny, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+     {
+         TRACE( "-> %#x\n", ret );
+@@ -2408,6 +2430,15 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
+ 
+     if (!signal) return STATUS_INVALID_HANDLE;
+ 
++#ifdef __PROSPERO__
++    if (timeout != &ps5_chain_look && ps5_chain_ends_wait( 1, &wait, alertable, timeout ))
++    {
++        if ((ret = NtSignalAndWaitForSingleObject( signal, wait, alertable, &ps5_chain_look )) != STATUS_TIMEOUT)
++            return ret;
++        ps5_chain_end_wait();
++    }
++#endif
++
+     if ((ret = inproc_signal_and_wait( signal, wait, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+         return ret;
+ 
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 4c8875a..33d624d 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -260,6 +260,8 @@ extern unsigned int server_try_shared_sync(HANDLE handle, unsigned int operation
+                                             const LARGE_INTEGER *timeout, unsigned int *previous);
+ extern void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
+ extern int ps5_slow_log(void);
++extern BOOL ps5_chain_ends_wait( DWORD count, const HANDLE *handles, BOOLEAN alertable, const LARGE_INTEGER *timeout );
++extern void ps5_chain_end_wait(void);
+ extern ULONGLONG ps5_now_us(void);
+ extern void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
+ extern unsigned int server_select( const union select_op *select_op, data_size_t size, UINT flags,
+-- 
+2.39.5

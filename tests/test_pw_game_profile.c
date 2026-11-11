@@ -691,6 +691,9 @@ static void test_settings(void)
     assert(apply(&p, "[application]\nexecutable = setup.exe\n") == PW_OK);
     assert(!strcmp(p.app.executable, "C:\\Games\\Pinball\\setup.exe"));
     assert(!strcmp(p.app.working_directory, "C:\\Games\\Pinball") && !p.app.arguments[0]);
+    assert(p.other_program);
+    assert(parse(APP, &p) == PW_OK && !p.other_program);
+    assert(apply(&p, "[input]\npreset = mouse\n") == PW_OK && !p.other_program);
     assert(parse(APP, &p) == PW_OK);
     assert(apply(&p, "[application]\nexecutable = Tools/Config.EXE\n") == PW_OK);
     assert(!strcmp(p.app.executable, "C:\\Games\\Pinball\\Tools\\Config.EXE"));
