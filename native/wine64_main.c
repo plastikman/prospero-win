@@ -300,6 +300,8 @@ static int playden_mode;
 static char playden_library_root[sizeof(playden_launch.data_root) + sizeof("/library")];
 static const char *playden_descriptor_argument;
 static const char *playden_session_argument;
+static const char *playden_chain_argument;
+static const char *playden_cycle_argument;
 /* <root>/settings.conf, which the launcher's Settings card writes and every
  * start reads (src/pw_settings.h). settings_status: pw_settings_load's. */
 static PwSettings settings;
@@ -771,6 +773,11 @@ static void restart_title_chain(const PwWineApp *app, uint32_t cycle, uint32_t c
     const char *const eboots[] = { "/app0/eboot.bin", sandbox_eboot };
     static char storage[2 * PW_WINE_LAUNCH_PATH_MAX + 64];
     char *next[PW_WINE_LAUNCH_ARGS];
+    static char descriptor_word[PW_TITLE_LAUNCH_MAX_BYTES / 8];
+    static char session_word[PW_TITLE_SESSION_ID_SIZE + 8];
+    static char chain_word[24], cycle_word[24];
+    char *playden_next[6];
+    char **arguments;
 
     if (playden_mode && playden_session.active && !app) {
         const int recorded = !strcmp(reason, "wine-exit") || !strcmp(reason, "guest-exit")
@@ -786,16 +793,31 @@ static void restart_title_chain(const PwWineApp *app, uint32_t cycle, uint32_t c
         leave_to_home(reason);
     }
 
-    if (!pw_wine_launch_argv_chain(app, cycle, chain, storage, sizeof(storage), next, PW_WINE_LAUNCH_ARGS)) {
-        PS5LOG_LOG("PW_WINE64 restart refused: arguments do not fit");
-        return;
+    if (playden_mode && app) {
+        snprintf(descriptor_word, sizeof(descriptor_word), "descriptor=%s", playden_descriptor_argument);
+        snprintf(session_word, sizeof(session_word), "%s", playden_session_argument);
+        snprintf(chain_word, sizeof(chain_word), "chain=%u", (unsigned)chain);
+        snprintf(cycle_word, sizeof(cycle_word), "cycle=%u", (unsigned)cycle);
+        playden_next[0] = (char *)"pldn-runtime=wine";
+        playden_next[1] = descriptor_word;
+        playden_next[2] = session_word;
+        playden_next[3] = chain_word;
+        playden_next[4] = cycle_word;
+        playden_next[5] = NULL;
+        arguments = playden_next;
+    } else {
+        if (!pw_wine_launch_argv_chain(app, cycle, chain, storage, sizeof(storage), next, PW_WINE_LAUNCH_ARGS)) {
+            PS5LOG_LOG("PW_WINE64 restart refused: arguments do not fit");
+            return;
+        }
+        arguments = next;
     }
     display_quiesce(reason);
     for (size_t i = 0; i < sizeof(eboots) / sizeof(eboots[0]); i++) {
         PS5LOG_LOG("PW_WINE64 restart to=%s cycle=%u chain=%u reason=%s eboot=%s", app ? app->id : "launcher",
                    (unsigned)cycle, (unsigned)chain, reason, eboots[i]);
         pw_diagnostics_close(reason);
-        int rc = sceSystemServiceLoadExec(eboots[i], next);
+        int rc = sceSystemServiceLoadExec(eboots[i], arguments);
         pw_diagnostics_resume();
         PS5LOG_LOG("PW_WINE64 restart failed rc=0x%08x", (unsigned)rc);
     }
@@ -1009,8 +1031,12 @@ static int playden_descriptor_open(void)
                  playden_launch.data_root) >= (int)sizeof(playden_library_root))
         return -1;
     library_root = playden_library_root;
-    if (pw_title_session_start(&playden_session, &playden_launch,
-                               playden_session_argument, error, sizeof(error)) != 0) {
+    const int session_status = playden_chain_argument
+        ? pw_title_session_resume(&playden_session, &playden_launch,
+                                  playden_session_argument, error, sizeof(error))
+        : pw_title_session_start(&playden_session, &playden_launch,
+                                 playden_session_argument, error, sizeof(error));
+    if (session_status != 0) {
         PS5LOG_LOG("PW_WINE64 Playden session refused reason=%s", error);
         return -1;
     }
@@ -1035,6 +1061,16 @@ static int open_library(int argc, char **argv)
         } else if (!strncmp(argv[i], "session=", 8)) {
             if (playden_session_argument) return -1;
             playden_session_argument = argv[i];
+        } else if (!strncmp(argv[i], "chain=", 6)) {
+            unsigned long value;
+            if (playden_chain_argument || !argv[i][6] ||
+                strspn(argv[i] + 6, "0123456789") != strlen(argv[i] + 6)) return -1;
+            value = strtoul(argv[i] + 6, NULL, 10);
+            if (value > PW_WINE64_CHAIN_MAX) return -1;
+            playden_chain_argument = argv[i];
+        } else if (!strncmp(argv[i], "cycle=", 6)) {
+            if (playden_cycle_argument) return -1;
+            playden_cycle_argument = argv[i];
         }
     }
     if (!!playden_descriptor_argument != !!playden_session_argument) return -1;
@@ -2096,9 +2132,12 @@ int main(int argc, char **argv)
     }
     if (playden_mode) {
         char profile_word[sizeof(playden_launch.default_profile_id) + 9];
-        char *profile_arguments[] = { profile_word };
+        char *profile_arguments[3] = { profile_word, NULL, NULL };
+        int profile_count = 1;
         snprintf(profile_word, sizeof(profile_word), "profile=%s", playden_launch.default_profile_id);
-        (void)pw_wine_launch_parse(1, profile_arguments, catalog, catalog_count, &launch);
+        if (playden_chain_argument) profile_arguments[profile_count++] = (char *)playden_chain_argument;
+        if (playden_cycle_argument) profile_arguments[profile_count++] = (char *)playden_cycle_argument;
+        (void)pw_wine_launch_parse(profile_count, profile_arguments, catalog, catalog_count, &launch);
     } else {
         (void)pw_wine_launch_parse(argc, argv, catalog, catalog_count, &launch);
     }
