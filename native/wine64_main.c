@@ -982,26 +982,36 @@ static int settings_log_start(void)
 }
 
 /* Playden's PS4 title passes a small path and session ID. The descriptor itself
- * remains in its per-game /data/homebrew title folder and names the private
- * bottle, profile and Steam install. A regular Orbis-Win start has neither arg. */
+ * remains in its per-game title folder under Playden's own data root
+ * (/data/PLDN10001 on the PS4, as library_root resolved it above; /data/homebrew
+ * is the PS5's) and names the private bottle, profile and Steam install. A
+ * regular Orbis-Win start has neither arg. */
 static int playden_descriptor_open(void)
 {
-    static const char prefix[] = "/data/homebrew/";
     static const char suffix[] = "/game-launch.json";
+    char prefix[PW_TITLE_ROOT_CAPACITY + 1];
     char expected_title[10], bytes[PW_TITLE_LAUNCH_MAX_BYTES + 1], error[160];
     const char *path = playden_descriptor_argument;
-    const size_t prefix_size = sizeof(prefix) - 1, suffix_size = sizeof(suffix) - 1;
+    const size_t suffix_size = sizeof(suffix) - 1;
     const size_t length = path ? strlen(path) : 0;
+    size_t prefix_size;
     int fd;
     ssize_t read_size;
     size_t used = 0;
 
+    /* Only the title's own data root: the descriptor a game starts from is one Playden wrote. */
+    if (!library_root || snprintf(prefix, sizeof(prefix), "%s/", library_root) >= (int)sizeof(prefix)) {
+        PS5LOG_LOG("PW_WINE64 Playden descriptor refused: no title data root");
+        return -1;
+    }
+    prefix_size = strlen(prefix);
     if (!path || !playden_session_argument || strcmp(title_id, "PLDN10001") ||
         length != prefix_size + 9 + suffix_size || strncmp(path, prefix, prefix_size) ||
         strcmp(path + prefix_size + 9, suffix) ||
         !pw_title_session_id_valid(playden_session_argument + 8) ||
         !pw_title_path_is_regular_file(path)) {
-        PS5LOG_LOG("PW_WINE64 Playden descriptor refused: path or session is invalid");
+        PS5LOG_LOG("PW_WINE64 Playden descriptor refused: path or session is invalid (root=%s)",
+                   library_root ? library_root : "-");
         return -1;
     }
     memcpy(expected_title, path + prefix_size, 9);
