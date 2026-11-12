@@ -33,6 +33,8 @@ static pthread_mutex_t net_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wake = PTHREAD_COND_INITIALIZER;    /* records to write, or a pass asked */
 static pthread_cond_t drained = PTHREAD_COND_INITIALIZER; /* the writer finished a pass */
 static volatile sig_atomic_t fd = -1;
+int pw_diagnostics_private_modes;
+
 static int disk_error; /* __atomic: the writer stores it with the lock released */
 static char current[512], previous[512], identity[256];
 static char buffers[2][PW_DIAGNOSTICS_PENDING];
@@ -254,11 +256,20 @@ int pw_diagnostics_open(const char *root, const char *build, const char *profile
     }
     /* ⚠ 0777/0666 and chmod (archive 0008): the logs are read over FTP, and
      * GoldHEN's server does not run as the title; a 0700 directory or 0600
-     * file (the title's umask applies to open's mode) cannot be listed. */
-    if (mkdir(root, 0777) != 0 && errno != EEXIST) { disk_error = errno; goto out; }
-    if (mkdir(directory, 0777) != 0 && errno != EEXIST) { disk_error = errno; goto out; }
-    (void)chmod(root, 0777);
-    (void)chmod(directory, 0777);
+     * file (the title's umask applies to open's mode) cannot be listed.
+     *
+     * Not under Playden (pw_diagnostics_private_modes): its root is the game's
+     * own library folder, which Playden requires to stay owner-only. Widening
+     * it made Playden refuse the finished session ("managed bottle ownership
+     * marker is invalid"), and the PS4 cannot chmod it back. Playden reads
+     * these logs itself, so nothing needs them open to FTP. */
+    const mode_t folder_mode = pw_diagnostics_private_modes ? 0700 : 0777;
+    if (mkdir(root, folder_mode) != 0 && errno != EEXIST) { disk_error = errno; goto out; }
+    if (mkdir(directory, folder_mode) != 0 && errno != EEXIST) { disk_error = errno; goto out; }
+    if (!pw_diagnostics_private_modes) {
+        (void)chmod(root, 0777);
+        (void)chmod(directory, 0777);
+    }
     snprintf(index, sizeof(index), "%s/next.txt", directory);
     counter = open(index, O_RDONLY);
     if (counter >= 0) {

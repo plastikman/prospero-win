@@ -14,6 +14,11 @@
 #define PW_DIAGNOSTICS_PENDING (512u * 1024u)
 #endif
 enum { PW_DIAGNOSTICS_SESSIONS = 8 };
+/* Set before pw_diagnostics_open when the root is a folder another application owns and
+ * requires to stay owner-only (Playden's per-game library): the log folders are then made
+ * 0700 and never chmodded open for FTP. */
+extern int pw_diagnostics_private_modes;
+
 int pw_diagnostics_open(const char *root, const char *build, const char *profile,
                         uint32_t cycle);
 /* Any thread: formats the record into the buffer and returns; a writer

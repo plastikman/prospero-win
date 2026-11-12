@@ -2151,6 +2151,8 @@ int main(int argc, char **argv)
     } else {
         (void)pw_wine_launch_parse(argc, argv, catalog, catalog_count, &launch);
     }
+    /* Playden owns this root (the game's library folder) and requires it owner-only. */
+    pw_diagnostics_private_modes = playden_mode;
     (void)pw_diagnostics_open(library_root, PW_BUILD_ID,
                               launch.app ? launch.app->id : "launcher", launch.cycle);
     /* The package's own identity (title, APP_VER, commit), defined by
