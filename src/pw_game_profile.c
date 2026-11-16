@@ -523,6 +523,22 @@ size_t pw_game_cpu_env(const PwGameProfile *profile, PwGameEnv *env)
     return 2;
 }
 
+/* Measured 2026-11-16 on the only two 64-bit titles this port has run, Hollow Knight
+ * and Risk of Rain 2: without the per-page exec migration both die five or six
+ * seconds in, under hundreds of SYSTEM_DEBUG_RUNTIME_SHADOW_MEMORY_ALLOC_ERROR (Risk
+ * of Rain 2 logged 504). A whole-range migration is what a 32-bit title needs and
+ * 7df46bd proved it crashes them when forced, so this is keyed on pe64 and nothing
+ * else. A profile that sets the variable itself still wins: it is the per-title knob
+ * and some 64-bit title will eventually want a different size. */
+size_t pw_game_memory_env(const PwGameProfile *profile, PwGameEnv *env)
+{
+    if (!profile || !env || profile->app.architecture != PW_APP_ARCH_PE64) return 0;
+    for (size_t i = 0; i < profile->debug_env_count; i++)
+        if (!strcmp(profile->debug_env[i].name, "PW_PS4_EXEC_MIGRATE_RANGE_MAX")) return 0;
+    env[0] = (PwGameEnv){ "PW_PS4_EXEC_MIGRATE_RANGE_MAX", "262144" };
+    return 1;
+}
+
 size_t pw_game_graphics_env(const PwGameProfile *profile, PwGameEnv *env)
 {
     size_t count = 0;

@@ -166,7 +166,7 @@ typedef struct PwGameDebugEnv {
     char value[PW_GAME_DEBUG_ENV_VALUE];
 } PwGameDebugEnv;
 enum { PW_GAME_RUNTIME_ENV_MAX = 2, PW_GAME_CPU_ENV_MAX = 2, PW_GAME_GRAPHICS_ENV_MAX = 4,
-       PW_GAME_CLOCK_ENV_MAX = 2 };
+       PW_GAME_CLOCK_ENV_MAX = 2, PW_GAME_MEMORY_ENV_MAX = 1 };
 
 typedef struct PwGameProfile {
     PwAppProfile app;
@@ -200,6 +200,11 @@ int pw_game_cpu_native(const PwGameProfile *profile);
  * wow64native.dll (with PW_VK_BATCH) or wowprospero.dll explicitly, so the
  * prefix's Wow64\x86 key is never consulted; 0 for a 64-bit game. */
 size_t pw_game_cpu_env(const PwGameProfile *profile, PwGameEnv *env);
+
+/* A pe64 title gets the per-page exec migration unless its profile sets the
+ * variable itself; PW_GAME_MEMORY_ENV_MAX pairs. Without it a 64-bit title dies
+ * within seconds under SYSTEM_DEBUG_RUNTIME_SHADOW_MEMORY_ALLOC_ERROR. */
+size_t pw_game_memory_env(const PwGameProfile *profile, PwGameEnv *env);
 
 /* Graphics-specific environment, at most PW_GAME_GRAPHICS_ENV_MAX entries.
  * graphics = opengl (or zink) selects GALLIUM_DRIVER=zink and

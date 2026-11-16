@@ -2043,7 +2043,8 @@ int main(int argc, char **argv)
             * file. (The synced 3 + ... undercounted the PS4 mprotect marker
             * by one.) */
            WINE64_PROFILE_ENV_CAPACITY = 9 + PW_GAME_GRAPHICS_ENV_MAX + PW_GAME_RUNTIME_ENV_MAX + PW_GAME_CPU_ENV_MAX +
-                                         PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX };
+                                         PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX +
+                                         PW_GAME_MEMORY_ENV_MAX };
     static PwWineStartEnv extra[WINE64_FIXED_ENV_COUNT + WINE64_PROFILE_ENV_CAPACITY] = {
         { "WINEDEBUG", PW_WINE64_DEBUG },
         /* the i386 exe runs in this process through WoW64; otherwise Wine
@@ -2345,6 +2346,17 @@ int main(int argc, char **argv)
             }
             PS5LOG_LOG("PW_WINE64 cpu=%s backend=%s prefix_cpu=%d", cpu_mode,
                        cpu_dll ? cpu_dll : "prefix", installed);
+        }
+        /* A pe64 title needs the per-page exec migration or it dies in seconds
+         * (src/pw_game_profile.c). Its own [debug] env still wins. */
+        {
+            PwGameEnv memory_env[PW_GAME_MEMORY_ENV_MAX];
+            size_t memory_count = pw_game_memory_env(game, memory_env);
+
+            for (size_t i = 0; i < memory_count; i++)
+                extra[config.extra_env_count++] = (PwWineStartEnv){ memory_env[i].name, memory_env[i].value };
+            if (memory_count) PS5LOG_LOG("PW_WINE64 pe64 memory default %s=%s",
+                                         memory_env[0].name, memory_env[0].value);
         }
         /* [debug] winedebug: this game's channels in place of the title's. */
         if (game->winedebug[0]) {
