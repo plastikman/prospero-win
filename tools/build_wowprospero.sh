@@ -41,7 +41,11 @@ done
 [ -f "$build_dir/Makefile" ] || fail "no configured Wine build at $build_dir"
 [ -d "$source_dir/dlls/wow64" ] || fail "no Wine source at $source_dir"
 commit=$(git -C "$source_dir" rev-parse HEAD 2>/dev/null) || fail "cannot read Wine commit"
-[ "$commit" = "$WINE_COMMIT" ] || fail "Wine source is $commit, expected $WINE_COMMIT"
+# Accept the pinned base OR a descendant: a pinned port tree is WINE_COMMIT
+# plus the delta, so HEAD never equals the base.
+[ "$commit" = "$WINE_COMMIT" ] ||
+    git -C "$source_dir" merge-base --is-ancestor "$WINE_COMMIT" HEAD 2>/dev/null ||
+    fail "Wine source is $commit, which is not $WINE_COMMIT nor a descendant of it"
 grep -q -- "--enable-archs=i386,x86_64" "$build_dir/config.log" ||
     fail "Wine build is not a WoW64 (--enable-archs=i386,x86_64) configuration"
 

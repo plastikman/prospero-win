@@ -19,7 +19,11 @@ while [ "$#" -gt 0 ]; do
 done
 fail() { echo "build_wow64native: $*" >&2; exit 1; }
 [ -n "$source_dir" ] && [ -n "$build_dir" ] && [ -n "$output_dir" ] || fail "all paths are required"
-[ "$(git -C "$source_dir" rev-parse HEAD)" = 490f6d5dcbb2a5047345b8af88d114bbcaad69a8 ] || fail "wrong Wine revision"
+# Accept the pinned base OR any descendant of it: a restored/pinned port tree is
+# 490f6d5 PLUS the delta, so HEAD never equals the base commit.
+git -C "$source_dir" merge-base --is-ancestor 490f6d5dcbb2a5047345b8af88d114bbcaad69a8 HEAD 2>/dev/null ||
+    [ "$(git -C "$source_dir" rev-parse HEAD)" = 490f6d5dcbb2a5047345b8af88d114bbcaad69a8 ] ||
+    fail "wrong Wine revision"
 grep -q -- '--enable-archs=i386,x86_64' "$build_dir/config.log" || fail "not a WoW64 configuration"
 [ -x "$build_dir/tools/winegcc/winegcc" ] && [ -f "$build_dir/dlls/ntdll/ntdll.so" ] || fail "prepare the existing Wine build first"
 module=$root/wine/wow64native
