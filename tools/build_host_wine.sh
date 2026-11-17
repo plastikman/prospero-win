@@ -39,9 +39,12 @@ done
 # One pin and one series: the console build's.
 commit=$(sed -n 's/^WINE_COMMIT=//p' "$root/tools/build_wine_ps5.sh")
 patches=$root/wine/patches
-ordered=$(sh "$root/tools/build_wine_ps5.sh" --check-patches) || fail "the patch series is not well-formed"
+if [ "${PROSPERO_WINE_PREPATCHED:-0}" = 1 ]; then ordered=
+else ordered=$(sh "$root/tools/build_wine_ps5.sh" --check-patches) || fail "the patch series is not well-formed"
+fi
 [ -n "$commit" ] || fail "no WINE_COMMIT in build_wine_ps5.sh"
-git -C "$source_dir" cat-file -e "$commit^{commit}" 2>/dev/null ||
+[ "${PROSPERO_WINE_PREPATCHED:-0}" = 1 ] ||
+    git -C "$source_dir" cat-file -e "$commit^{commit}" 2>/dev/null ||
     fail "$source_dir does not have the pinned Wine revision $commit"
 for tool in i686-w64-mingw32-gcc x86_64-w64-mingw32-gcc i686-w64-mingw32-strip x86_64-w64-mingw32-strip; do
     command -v "$tool" >/dev/null || fail "$tool is required"
@@ -49,6 +52,13 @@ done
 
 mkdir -p "$work"
 tree=$work/source
+if [ "${PROSPERO_WINE_PREPATCHED:-0}" = 1 ]; then
+    # Build an already-patched/pinned tree as it stands. Without this the lines
+    # below would `checkout --force` and `git clean -fdx` it, DESTROYING the
+    # pinned delta that no patch series can reproduce.
+    [ -d "$tree/.git" ] || fail "PROSPERO_WINE_PREPATCHED=1 but no tree at $tree"
+    echo "prepatched: building $tree at $(git -C "$tree" rev-parse --short HEAD)"
+else
 [ -d "$tree/.git" ] || git clone -q --shared --no-checkout "$source_dir" "$tree"
 git -C "$tree" checkout -q --force "$commit"
 git -C "$tree" clean -q -fdx
@@ -67,6 +77,7 @@ cp "$root/wine/ps5/menu/pw_title_menu.h" "$tree/dlls/ntdll/pw_title_menu.h" ||
     fail "cannot stage title-menu ABI"
 cp "$root/wine/ps5/input/pw_key_shared.h" "$tree/dlls/win32u/pw_key_shared.h" ||
     fail "cannot stage shared-input ABI"
+fi
 
 configure_args="--prefix=/usr --enable-archs=i386,x86_64 --disable-tests"
 stamp=$({ printf '%s\n' "$commit" "$configure_args"

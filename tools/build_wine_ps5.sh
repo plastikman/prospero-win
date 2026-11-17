@@ -182,8 +182,17 @@ sdk=${sdk:-$foundation/.deps/native/ps5-payload-sdk}
 [ -x "$sdk/bin/prospero-clang" ] || fail "no PS5 payload SDK at $sdk"
 [ -x "$host_tools/tools/winebuild/winebuild" ] ||
     fail "no host Wine tools at $host_tools (run tools/build_wine_runtime.sh)"
+# PROSPERO_WINE_PREPATCHED=1 builds from an already-patched tree at $work/source
+# (e.g. restored from a pinned bundle) instead of pristine-source + patch series.
+# The series cannot reproduce the shipped tree, so this is the supported route
+# for a from-source build off the build host.
+if [ "${PROSPERO_WINE_PREPATCHED:-0}" = 1 ]; then
+    [ -d "$work/source/.git" ] ||
+        fail "PROSPERO_WINE_PREPATCHED=1 but no tree at $work/source"
+else
 [ "$(git -C "$source_dir" rev-parse HEAD 2>/dev/null)" = "$WINE_COMMIT" ] ||
     fail "$source_dir is not the pinned Wine revision $WINE_COMMIT"
+fi
 
 # A private copy keeps the shared checkout pristine for the host build.
 mkdir -p "$work"
@@ -243,6 +252,9 @@ else
     gnutls_args="--without-gnutls"
 fi
 tree=$work/source
+if [ "${PROSPERO_WINE_PREPATCHED:-0}" = 1 ]; then
+    echo "prepatched: building $tree at $(git -C "$tree" rev-parse --short HEAD)"
+else
 if [ ! -d "$tree/.git" ]; then
     git clone -q --shared --no-checkout "$source_dir" "$tree"
 fi
@@ -252,9 +264,13 @@ for patch in $ordered; do
     git -C "$tree" apply --index "$patches/$patch" || fail "patch does not apply: $patch"
     echo "applied $patch"
 done
+fi
 
 # Stage Vulkan batching after the complete patch series. Failure must stop the
 # build before either half can be emitted with a different dispatch table.
+# A prepatched tree already carries all of this staging; stage_vk_batch.py
+# asserts on pristine text and would fail with count 0.
+if [ "${PROSPERO_WINE_PREPATCHED:-0}" != 1 ]; then
 python3 "$root/tools/stage_vk_batch.py" --source "$tree" --repo "$root" ||
     fail "cannot stage Vulkan command-stream runtime"
 
@@ -265,6 +281,9 @@ cp "$root/wine/ps5/menu/pw_title_menu.h" "$tree/dlls/ntdll/pw_title_menu.h" ||
     fail "cannot stage title-menu ABI"
 cp "$root/wine/ps5/input/pw_key_shared.h" "$tree/dlls/win32u/pw_key_shared.h" ||
     fail "cannot stage shared-input ABI"
+else
+    echo "prepatched: Vulkan batching and shared ABI headers already staged"
+fi
 
 cflags=${CFLAGS:--g -O2}
 
