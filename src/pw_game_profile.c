@@ -398,7 +398,7 @@ static int debug_field(PwGameProfile *profile, const uint8_t *key, size_t key_le
     return PW_OK;
 }
 
-/* [runtime] thread_scheduling, shared_input, fast_clock: true/false or
+/* [runtime] version: 1 or 2; thread_scheduling, shared_input, fast_clock: true/false or
  * 1/0; cpu: native or translator; each once. */
 static int runtime_field(PwGameRuntime *runtime, uint32_t *seen, const uint8_t *key, size_t key_length,
                          const uint8_t *v, size_t n)
@@ -412,6 +412,19 @@ static int runtime_field(PwGameRuntime *runtime, uint32_t *seen, const uint8_t *
         else if (is(v, n, "translator")) runtime->cpu = PW_GAME_CPU_TRANSLATOR;
         else return PW_ERR_UNSUPPORTED;
         *seen |= 2u;
+        return PW_OK;
+    }
+    /* [runtime] version = 1|2 names the profile's generation. The runtime reads every key it
+     * supports whatever the generation says, so the value only has to be one we know; it selects
+     * nothing by itself. Accepting it is what lets a generator declare version 2 -- Playden gates
+     * its "32-bit code" setting (cpu = native|translator, read above) on the kit claiming
+     * profile-version-2, and writes "version = 2" alongside it. Without this that line came back
+     * PW_ERR_UNSUPPORTED and the whole profile was refused, so the setting could not be offered at
+     * all and an imported game was stuck on native. */
+    if (is(key, key_length, "version")) {
+        if (*seen & 16u) return PW_ERR_MALFORMED;
+        if (!is(v, n, "1") && !is(v, n, "2")) return PW_ERR_UNSUPPORTED;
+        *seen |= 16u;
         return PW_OK;
     }
     if (is(key, key_length, "thread_scheduling")) bit = 1u, field = &runtime->thread_scheduling;
