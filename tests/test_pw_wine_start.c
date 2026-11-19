@@ -87,8 +87,10 @@ static int fake_info(int32_t handle, void *info)
 
 static char env_log[512];
 static int env_fail_on;
+static unsigned env_calls;
 static int fake_env(const char *name, const char *value)
 {
+    env_calls++;
     if (env_fail_on && !strcmp(name, "WINEDEBUG")) return -7;
     strcat(env_log, name); strcat(env_log, "="); strcat(env_log, value); strcat(env_log, ";");
     return 0;
@@ -126,6 +128,7 @@ static void build_module(int with_optional)
 int main(void)
 {
     static const PwWineStartEnv extra[] = { { "WINEDEBUG", "err+all" } };
+    static PwWineStartEnv maximum_env[PW_WINE_START_MAX_ENV + 1];
     static const char *const argv[] = { "wine", "C:\\Games\\Pinball\\PINBALL.EXE" };
     const PwWineStartOps ops = { fake_load, fake_info, fake_env, fake_thread };
     PwWineStartConfig config = {
@@ -155,6 +158,17 @@ int main(void)
     assert(!strcmp(env_log, "WINEPREFIX=/data/prospero-win/prefixes/pinball;"
                             "WINE_PS5_NTDLL_DIR=/app0/win/wine/lib/wine/x86_64-unix;"
                             "WINELOADERNOEXEC=1;WINEDEBUG=err+all;"));
+    /* The [environment] section adds eight bounded entries to the existing profile variables. */
+    for (unsigned i = 0; i < PW_WINE_START_MAX_ENV + 1; i++) maximum_env[i] = (PwWineStartEnv){ "X", "1" };
+    config.extra_env = maximum_env;
+    config.extra_env_count = PW_WINE_START_MAX_ENV;
+    env_calls = 0;
+    assert(pw_wine_start_environment(&start, &config, &ops) == PW_OK && env_calls == PW_WINE_START_MAX_ENV + 3);
+    config.extra_env_count = PW_WINE_START_MAX_ENV + 1;
+    env_calls = 0;
+    assert(pw_wine_start_environment(&start, &config, &ops) == PW_ERR_PRECONDITION && env_calls == 0);
+    config.extra_env = extra;
+    config.extra_env_count = 1;
     assert(pw_wine_start_run(&start, &config, &ops) == PW_OK);
     assert(thread_entry && thread_arg == &start && thread_stack == (16u << 20));
     assert(calls_wine_main == 0 && start.stage == PW_WINE_START_THREAD);

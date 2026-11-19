@@ -24,9 +24,11 @@ typedef struct PwAudioPs5Ops {
 int pw_audio_ps5_platform_ops(PwAudioPs5Ops *);
 /* The main port for a caller that mixes and clocks itself (Wine's audio
  * sink): the library initialised, PW_AUDIO_PS5_GRAIN frames of 16-bit
- * stereo at PW_AUDIO_PS5_RATE per output call, unity volume. The caller
+ * stereo at PW_AUDIO_PS5_RATE per output call. volume_percent is 0..100,
+ * linearly scaled from mute to the console's 0 dB level. The caller
  * then calls ops->output(*handle, grain) and ops->close(*handle).
  * PW_ERR_STATE when the library refuses. */
 int pw_audio_ps5_open_port(const PwAudioPs5Ops *ops,int *handle);
+int pw_audio_ps5_open_port_with_volume(const PwAudioPs5Ops *ops,uint32_t volume_percent,int *handle);
 
 #endif

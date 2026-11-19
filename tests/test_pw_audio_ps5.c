@@ -5,12 +5,13 @@
 
 static unsigned inits,opens,volumes,outputs,closes;
 static int16_t last[PW_AUDIO_PS5_GRAIN*2];
+static int32_t expected_volume=0x8000;
 
 static int op_init(void){inits++;return 0;}
 static int op_open(int u,int t,int i,uint32_t g,uint32_t r,uint32_t f)
 {assert(u==0xff&&t==0&&i==0&&g==256&&r==48000&&f==1);opens++;return 7;}
 static int op_volume(int h,int flags,const int32_t *v)
-{assert(h==7&&flags==3&&v[0]==0x8000&&v[7]==0x8000);volumes++;return 0;}
+{assert(h==7&&flags==3);for(unsigned i=0;i<8;i++)assert(v[i]==expected_volume);volumes++;return 0;}
 static int op_output(int h,const void *p)
 {
     assert(h==7);memcpy(last,p,sizeof(last));outputs++;return 0;
@@ -36,15 +37,21 @@ static void test_open_port(void)
     assert(inits==0 && handle==-1);
     assert(pw_audio_ps5_open_port(&ops,&handle)==PW_OK);
     assert(handle==7 && inits==1 && opens==1 && volumes==1 && closes==0);
+    expected_volume=0;
+    assert(pw_audio_ps5_open_port_with_volume(&ops,0,&handle)==PW_OK && volumes==2);
+    expected_volume=0x4000;
+    assert(pw_audio_ps5_open_port_with_volume(&ops,50,&handle)==PW_OK && volumes==3);
+    assert(pw_audio_ps5_open_port_with_volume(&ops,101,&handle)==PW_ERR_PRECONDITION && volumes==3);
+    expected_volume=0x8000;
     int16_t grain[PW_AUDIO_PS5_GRAIN*2];
     for(int i=0;i<PW_AUDIO_PS5_GRAIN*2;i++)grain[i]=(int16_t)i;
     assert(ops.output(handle,grain)==0 && outputs==1 && last[511]==511);
 
     handle=-1;
     PwAudioPs5Ops broken=ops;broken.init=fail_init;
-    assert(pw_audio_ps5_open_port(&broken,&handle)==PW_ERR_STATE && opens==1 && handle==-1);
+    assert(pw_audio_ps5_open_port(&broken,&handle)==PW_ERR_STATE && opens==3 && handle==-1);
     broken=ops;broken.open=fail_open;
-    assert(pw_audio_ps5_open_port(&broken,&handle)==PW_ERR_STATE && volumes==1 && handle==-1);
+    assert(pw_audio_ps5_open_port(&broken,&handle)==PW_ERR_STATE && volumes==3 && handle==-1);
     /* a port whose volume cannot be set is closed again */
     broken=ops;broken.volume=fail_volume;
     assert(pw_audio_ps5_open_port(&broken,&handle)==PW_ERR_STATE && closes==1 && handle==-1);

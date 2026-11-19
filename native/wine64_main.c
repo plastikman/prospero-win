@@ -907,6 +907,60 @@ static int game_setup_failed(const char *reason)
     return 1;
 }
 
+/* A profile's [steam] install_dir names the Playden game root inside the
+ * bottle's virtual C:\\Program Files (x86)\\Steam\\steamapps\\common view.
+ * Wine's PS4 path layer loads this table lazily on first lookup. */
+static int ensure_private_directory(const char *path)
+{
+    struct stat info;
+    if (!mkdir(path, 0755)) return 0;
+    if (errno != EEXIST || lstat(path, &info) || !S_ISDIR(info.st_mode)) return -1;
+    return 0;
+}
+
+static int pw_steam_view_write(const char *prefix, const char *install_dir, const char *game_root)
+{
+    char path[PW_TITLE_ROOT_CAPACITY + PW_APP_ID_CAPACITY + 256];
+    char temporary[sizeof(path) + 32], line[PW_TITLE_LAUNCH_MAX_BYTES + PW_GAME_STEAM_INSTALL_DIR_CAPACITY];
+    const char *const folders[] = { "drive_c", "Program Files (x86)", "Steam", "steamapps", "common" };
+    struct stat info;
+    int n, fd, failed = 0;
+    size_t written = 0, length;
+
+    if (!prefix || !install_dir || !install_dir[0] || !game_root || !game_root[0]) return -1;
+    if (lstat(game_root, &info) || !S_ISDIR(info.st_mode)) return -1;
+    n = snprintf(path, sizeof(path), "%s", prefix);
+    if (n < 0 || (size_t)n >= sizeof(path) || ensure_private_directory(path)) return -1;
+    for (size_t i = 0; i < sizeof(folders) / sizeof(folders[0]); i++) {
+        const size_t used = strlen(path), remaining = sizeof(path) - used;
+        n = snprintf(path + used, remaining, "/%s", folders[i]);
+        if (n < 0 || (size_t)n >= remaining || ensure_private_directory(path)) return -1;
+    }
+    n = snprintf(line, sizeof(line), "%s\t%s\n", install_dir, game_root);
+    if (n < 0 || (size_t)n >= sizeof(line)) return -1;
+    length = (size_t)n;
+    n = snprintf(temporary, sizeof(temporary), "%s/.pw-symlinks.playden-tmp", path);
+    if (n < 0 || (size_t)n >= sizeof(temporary)) return -1;
+    {
+        const size_t used = strlen(path), remaining = sizeof(path) - used;
+        n = snprintf(path + used, remaining, "/.pw-symlinks");
+        if (n < 0 || (size_t)n >= remaining) return -1;
+    }
+    fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (fd < 0) return -1;
+    while (written < length) {
+        ssize_t count = write(fd, line + written, length - written);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) { failed = 1; break; }
+        written += (size_t)count;
+    }
+    if (fsync(fd)) failed = 1;
+    if (close(fd)) failed = 1;
+    if (!failed && !rename(temporary, path)) return 0;
+    (void)unlink(temporary);
+    return -1;
+}
+
 /* ---- library ------------------------------------------------------------ */
 
 /* Complete the one-shot helper exchange before loading profiles or starting
@@ -2044,6 +2098,7 @@ int main(int argc, char **argv)
             * by one.) */
            WINE64_PROFILE_ENV_CAPACITY = 9 + PW_GAME_GRAPHICS_ENV_MAX + PW_GAME_RUNTIME_ENV_MAX + PW_GAME_CPU_ENV_MAX +
                                          PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX +
+                                         PW_GAME_ENVIRONMENT_MAX +
                                          PW_GAME_MEMORY_ENV_MAX };
     static PwWineStartEnv extra[WINE64_FIXED_ENV_COUNT + WINE64_PROFILE_ENV_CAPACITY] = {
         { "WINEDEBUG", PW_WINE64_DEBUG },
@@ -2192,6 +2247,13 @@ int main(int argc, char **argv)
         snprintf(prefix, sizeof(prefix), "%s/prefixes/%s", library_root, game->app.prefix);
     else
         snprintf(prefix, sizeof(prefix), "%s/prefix", library_root);
+    if (game && game->steam.install_dir[0]) {
+        const int steam_status = playden_mode
+            ? pw_steam_view_write(prefix, game->steam.install_dir, playden_launch.game_root) : -1;
+        PS5LOG_LOG("PW_WINE64 steam view install_dir=%s target=%s status=%d", game->steam.install_dir,
+                   playden_mode ? playden_launch.game_root : "-", steam_status);
+        if (steam_status) return game_setup_failed("steam-library-view");
+    }
     snprintf(radv_cache, sizeof(radv_cache), "%s/cache/radv", library_root);
     snprintf(exec_chain_request, sizeof(exec_chain_request), "%s/.pw-exec-chain", prefix);
     snprintf(exec_refused, sizeof(exec_refused), "%s/.pw-exec-refused", prefix);
@@ -2383,11 +2445,28 @@ int main(int argc, char **argv)
             }
             if (debug_count) PS5LOG_LOG("PW_WINE64 debug_env=%s", names);
         }
+        /* [environment]: the bounded per-game variables that Playden validates. */
+        {
+            PwGameEnv profile_env[PW_GAME_ENVIRONMENT_MAX];
+            size_t environment_count = pw_game_profile_env(game, profile_env);
+            char names[PW_GAME_ENVIRONMENT_MAX * PW_GAME_ENVIRONMENT_NAME] = "";
+
+            for (size_t i = 0; i < environment_count; i++) {
+                extra[config.extra_env_count++] = (PwWineStartEnv){ profile_env[i].name, profile_env[i].value };
+                if (i) strcat(names, ",");
+                strcat(names, profile_env[i].name);
+            }
+            if (environment_count) PS5LOG_LOG("PW_WINE64 environment=%s", names);
+        }
         /* refresh and opengl_thread set the PS5 OpenGL SDK's output rate and
          * glthread; Zink, which replaced it, has neither, so they are ignored. */
         if (game->display.refresh != 60 || game->display.opengl_thread)
             PS5LOG_LOG("PW_WINE64 ignored display refresh=%u opengl_thread=%d (no longer supported)",
                        (unsigned)game->display.refresh, game->display.opengl_thread);
+        /* The Playden PS4 kit view keys these capability claims to this exact
+         * marker in the released PRX. Keep it beside the applied profile so a
+         * kit built from an older Orbis-Win release cannot claim the new keys. */
+        PS5LOG_LOG("PW_WINE64 profile_features=environment,audio-volume,steam-library-path");
         PS5LOG_LOG("PW_WINE64 profile id=%s prefix=%s desktop=%s scaling=%d view=%s show_fps=%d framegen=%u "
                    "input=%s preset=%s mode=%s mouse=%d rumble=%u dll_overrides=%s", game->app.id, prefix,
                    desktop[0] ? desktop : "default",
@@ -2572,9 +2651,11 @@ int main(int argc, char **argv)
             void (*set_audio)(PwWineAudioSink, void *) = (void (*)(PwWineAudioSink, void *))
                 (uintptr_t)pw_prx_lookup(start.descriptor, "pw_wine_set_audio_sink");
             int audio_status = set_audio ? pw_audio_ps5_platform_ops(&audio_ops) : PW_ERR_NOT_FOUND;
-            if (audio_status == PW_OK) audio_status = pw_audio_ps5_open_port(&audio_ops, &audio_port);
+            if (audio_status == PW_OK)
+                audio_status = pw_audio_ps5_open_port_with_volume(&audio_ops, game->audio.volume, &audio_port);
             if (audio_status == PW_OK) set_audio(wine_audio, NULL);
-            PS5LOG_LOG("PW_WINE64 audio sink=%d port=%d status=%s", set_audio != NULL, audio_port,
+            PS5LOG_LOG("PW_WINE64 audio sink=%d port=%d volume=%u status=%s", set_audio != NULL, audio_port,
+                       (unsigned)game->audio.volume,
                        pw_result_name(audio_status));
         }
         /* The game starts in its profile's working directory. A title

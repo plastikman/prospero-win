@@ -96,7 +96,10 @@ enum {
     PW_GAME_TOUCH_SPEED_DEFAULT = 400,  /* mouse = touchpad without mouse_speed: 1200 felt like a jump */
     PW_GAME_RUMBLE_MAX = 100,
     PW_GAME_WINEDEBUG_CAPACITY = 128,
+    PW_GAME_AUDIO_VOLUME_MAX = 100,
+    PW_GAME_STEAM_INSTALL_DIR_CAPACITY = 129,
     PW_GAME_DEBUG_ENV_MAX = 5, PW_GAME_DEBUG_ENV_NAME = 48, PW_GAME_DEBUG_ENV_VALUE = 96,
+    PW_GAME_ENVIRONMENT_MAX = 8, PW_GAME_ENVIRONMENT_NAME = 64, PW_GAME_ENVIRONMENT_VALUE = 128,
 };
 
 typedef enum PwGameScaling { PW_GAME_SCALING_FIT = 0, PW_GAME_SCALING_INTEGER,
@@ -165,6 +168,18 @@ typedef struct PwGameDebugEnv {
     char name[PW_GAME_DEBUG_ENV_NAME];
     char value[PW_GAME_DEBUG_ENV_VALUE];
 } PwGameDebugEnv;
+/* [environment] NAME = VALUE: Playden's bounded runtime environment list. */
+typedef struct PwGameProfileEnv {
+    char name[PW_GAME_ENVIRONMENT_NAME];
+    char value[PW_GAME_ENVIRONMENT_VALUE];
+} PwGameProfileEnv;
+typedef struct PwGameAudio {
+    uint32_t volume;       /* percent, 0 mutes; 100 is the console's 0 dB level */
+    uint8_t volume_set;
+} PwGameAudio;
+typedef struct PwGameSteam {
+    char install_dir[PW_GAME_STEAM_INSTALL_DIR_CAPACITY]; /* one safe component below Steam's common folder */
+} PwGameSteam;
 enum { PW_GAME_RUNTIME_ENV_MAX = 2, PW_GAME_CPU_ENV_MAX = 2, PW_GAME_GRAPHICS_ENV_MAX = 4,
        PW_GAME_CLOCK_ENV_MAX = 2, PW_GAME_MEMORY_ENV_MAX = 1 };
 
@@ -176,6 +191,10 @@ typedef struct PwGameProfile {
     char winedebug[PW_GAME_WINEDEBUG_CAPACITY];
     PwGameDebugEnv debug_env[PW_GAME_DEBUG_ENV_MAX];    /* [debug] env lines */
     size_t debug_env_count;
+    PwGameProfileEnv environment[PW_GAME_ENVIRONMENT_MAX]; /* [environment] lines */
+    size_t environment_count;
+    PwGameAudio audio;
+    PwGameSteam steam;
     PwGameRuntime runtime;      /* [runtime], everything off by default */
     /* A player's settings chose another program than the profile's own ([application]
      * executable): a launcher or setup tool, whose game the title may run next. */
@@ -183,7 +202,7 @@ typedef struct PwGameProfile {
 } PwGameProfile;
 
 /* Parse a whole profile. [application] must come first; [display],
- * [input], [debug] and [runtime] are optional, once each. PW_OK or a
+ * [input], [debug], [runtime], [environment], [audio] and [steam] are optional, once each. PW_OK or a
  * PW_ERR_* status. */
 int pw_game_profile_parse(const uint8_t *bytes, size_t length, PwGameProfile *profile);
 /* The variables runtime sets in Wine's environment, into env, which has
@@ -216,6 +235,8 @@ size_t pw_game_graphics_env(const PwGameProfile *profile, PwGameEnv *env);
 /* The [debug] env variables, into env, which has room for
  * PW_GAME_DEBUG_ENV_MAX; how many. The strings live in profile. */
 size_t pw_game_debug_env(const PwGameProfile *profile, PwGameEnv *env);
+/* The [environment] variables, into env, which has room for PW_GAME_ENVIRONMENT_MAX; how many. */
+size_t pw_game_profile_env(const PwGameProfile *profile, PwGameEnv *env);
 /* An input with nothing bound, keyboard mode, no pointer, full rumble. */
 void pw_game_input_init(PwGameInput *input);
 /* A player's settings for one game (settings/<profile id>.conf), over its parsed profile: [input] takes

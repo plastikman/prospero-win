@@ -291,7 +291,8 @@ static int display_field(PwGameDisplay *display, uint32_t *seen, const uint8_t *
     return PW_ERR_UNSUPPORTED;
 }
 
-enum { SECTION_NONE, SECTION_APPLICATION, SECTION_DISPLAY, SECTION_INPUT, SECTION_DEBUG, SECTION_RUNTIME };
+enum { SECTION_NONE, SECTION_APPLICATION, SECTION_DISPLAY, SECTION_INPUT, SECTION_DEBUG, SECTION_RUNTIME,
+       SECTION_ENVIRONMENT, SECTION_AUDIO, SECTION_STEAM };
 
 /* One line: its trimmed extent and where the next begins. */
 static size_t next_line(const uint8_t *bytes, size_t length, size_t cursor,
@@ -315,7 +316,32 @@ static int section_of(const uint8_t *begin, const uint8_t *end)
            is(begin, (size_t)(end - begin), "display") ? SECTION_DISPLAY :
            is(begin, (size_t)(end - begin), "input") ? SECTION_INPUT :
            is(begin, (size_t)(end - begin), "debug") ? SECTION_DEBUG :
-           is(begin, (size_t)(end - begin), "runtime") ? SECTION_RUNTIME : -1;
+           is(begin, (size_t)(end - begin), "runtime") ? SECTION_RUNTIME :
+           is(begin, (size_t)(end - begin), "environment") ? SECTION_ENVIRONMENT :
+           is(begin, (size_t)(end - begin), "audio") ? SECTION_AUDIO :
+           is(begin, (size_t)(end - begin), "steam") ? SECTION_STEAM : -1;
+}
+
+/* [steam] install_dir: one path component below steamapps/common. Keep this
+ * contract in step with Playden's IsProsperoSteamInstallDir(). */
+static int steam_field(PwGameSteam *steam, const uint8_t *key, size_t key_length,
+                       const uint8_t *value, size_t value_length)
+{
+    static const char invalid[] = "\\/:*?\"<>|";
+
+    if (!is(key, key_length, "install_dir")) return PW_ERR_UNSUPPORTED;
+    if (steam->install_dir[0]) return PW_ERR_MALFORMED;
+    if (!value_length || value_length >= sizeof(steam->install_dir) ||
+        (value_length == 1 && value[0] == '.') || (value_length == 2 && value[0] == '.' && value[1] == '.') ||
+        value[value_length - 1] == ' ' || value[value_length - 1] == '.')
+        return PW_ERR_UNSUPPORTED;
+    for (size_t i = 0; i < value_length; i++) {
+        uint8_t c = value[i];
+        if (c < 0x20 || c == 0x7f || strchr(invalid, c)) return PW_ERR_UNSUPPORTED;
+    }
+    memcpy(steam->install_dir, value, value_length);
+    steam->install_dir[value_length] = 0;
+    return PW_OK;
 }
 
 /* [debug] winedebug = Wine's channel list (e.g. +seh,warn+module,-all):
@@ -377,6 +403,68 @@ static int debug_env_field(PwGameProfile *profile, const uint8_t *value, size_t 
     entry->name[name_length] = 0;
     memcpy(entry->value, equals + 1, data_length);
     entry->value[data_length] = 0;
+    return PW_OK;
+}
+
+/* Playden's [environment] allow-list (src/runtime/prospero_profile.cpp): these
+ * are per-game graphics and Wine controls, not a general process environment. */
+static int environment_field(PwGameProfile *profile, const uint8_t *key, size_t key_length,
+                             const uint8_t *value, size_t value_length)
+{
+    static const char *const prefixes[] = { "DXVK_", "MESA_", "RADV_", "SDL_" };
+    const int large_address = is(key, key_length, "wine_large_address_aware");
+    const int nsiproxy = is(key, key_length, "pw_nsiproxy_disable");
+    const int park_files = is(key, key_length, "wine_ps5_park_files");
+    const int cached_files = is(key, key_length, "wine_ps5_cached_files");
+    int allowed = large_address || nsiproxy || park_files || cached_files ||
+                  is(key, key_length, "wine_cpu_topology");
+    PwGameProfileEnv *entry;
+
+    if (!key_length || key_length >= PW_GAME_ENVIRONMENT_NAME || !value_length ||
+        value_length >= PW_GAME_ENVIRONMENT_VALUE || profile->environment_count >= PW_GAME_ENVIRONMENT_MAX)
+        return PW_ERR_MALFORMED;
+    for (size_t i = 0; i < key_length; i++) {
+        uint8_t c = key[i];
+        if (!((c >= 'A' && c <= 'Z') || c == '_' || (i > 0 && c >= '0' && c <= '9'))) return PW_ERR_MALFORMED;
+    }
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
+        allowed |= key_length > strlen(prefixes[i]) && starts(key, key_length, prefixes[i]);
+    if (!allowed || is(key, key_length, "dxvk_hud") || is(key, key_length, "sdl_joystick_rawinput"))
+        return PW_ERR_UNSUPPORTED;
+    if (large_address || nsiproxy) {
+        if (!is(value, value_length, "0") && !is(value, value_length, "1")) return PW_ERR_UNSUPPORTED;
+    } else if (park_files || cached_files) {
+        if (value_length > 4) return PW_ERR_UNSUPPORTED;
+        for (size_t i = 0; i < value_length; i++)
+            if (value[i] < '0' || value[i] > '9') return PW_ERR_UNSUPPORTED;
+    }
+    for (size_t i = 0; i < value_length; i++) {
+        uint8_t c = value[i];
+        if (c < 0x20 || c > 0x7e || c == '"' || c == '\'') return PW_ERR_MALFORMED;
+    }
+    for (size_t i = 0; i < profile->environment_count; i++)
+        if (same(key, key_length, profile->environment[i].name)) return PW_ERR_MALFORMED;
+    entry = &profile->environment[profile->environment_count++];
+    memcpy(entry->name, key, key_length);
+    entry->name[key_length] = 0;
+    memcpy(entry->value, value, value_length);
+    entry->value[value_length] = 0;
+    return PW_OK;
+}
+
+static int audio_field(PwGameAudio *audio, uint32_t *seen, const uint8_t *key, size_t key_length,
+                      const uint8_t *value, size_t value_length)
+{
+    uint32_t volume;
+    int status;
+
+    if (!is(key, key_length, "volume")) return PW_ERR_UNSUPPORTED;
+    if (*seen & 1u) return PW_ERR_MALFORMED;
+    if ((status = number(value, value_length, &volume)) != PW_OK) return status;
+    if (volume > PW_GAME_AUDIO_VOLUME_MAX) return PW_ERR_UNSUPPORTED;
+    audio->volume = volume;
+    audio->volume_set = 1;
+    *seen |= 1u;
     return PW_OK;
 }
 
@@ -446,7 +534,7 @@ static int parse_sections(const uint8_t *bytes, size_t length, PwGameProfile *pr
                           PwGameInput *input_only, size_t *application_end)
 {
     int section = SECTION_NONE;
-    uint32_t seen_sections = 0, display_seen = 0, runtime_seen = 0;
+    uint32_t seen_sections = 0, display_seen = 0, runtime_seen = 0, audio_seen = 0;
     size_t cursor = 0;
 
     while (cursor < length) {
@@ -480,6 +568,13 @@ static int parse_sections(const uint8_t *bytes, size_t length, PwGameProfile *pr
             section == SECTION_RUNTIME ?
             runtime_field(&profile->runtime, &runtime_seen, begin, (size_t)(key_end - begin),
                           value, (size_t)(end - value)) :
+            section == SECTION_ENVIRONMENT ?
+            environment_field(profile, begin, (size_t)(key_end - begin), value, (size_t)(end - value)) :
+            section == SECTION_AUDIO ?
+            audio_field(&profile->audio, &audio_seen, begin, (size_t)(key_end - begin), value,
+                        (size_t)(end - value)) :
+            section == SECTION_STEAM ?
+            steam_field(&profile->steam, begin, (size_t)(key_end - begin), value, (size_t)(end - value)) :
             section == SECTION_DISPLAY ?
             display_field(&profile->display, &display_seen, begin, (size_t)(key_end - begin),
                           value, (size_t)(end - value)) :
@@ -509,6 +604,14 @@ size_t pw_game_debug_env(const PwGameProfile *profile, PwGameEnv *env)
     for (size_t i = 0; i < profile->debug_env_count; i++)
         env[i] = (PwGameEnv){ profile->debug_env[i].name, profile->debug_env[i].value };
     return profile->debug_env_count;
+}
+
+size_t pw_game_profile_env(const PwGameProfile *profile, PwGameEnv *env)
+{
+    if (!profile || !env) return 0;
+    for (size_t i = 0; i < profile->environment_count; i++)
+        env[i] = (PwGameEnv){ profile->environment[i].name, profile->environment[i].value };
+    return profile->environment_count;
 }
 
 int pw_game_cpu_native(const PwGameProfile *profile)
@@ -616,6 +719,7 @@ int pw_game_profile_parse(const uint8_t *bytes, size_t length, PwGameProfile *pr
     parsed.input.mouse_speed = 0;       /* unset until a line sets it */
     parsed.display.show_fps = 1;        /* on unless the profile says false */
     parsed.display.refresh = 60;
+    parsed.audio.volume = PW_GAME_AUDIO_VOLUME_MAX;
     if ((status = parse_sections(bytes, length, &parsed, NULL, &application_end)) != PW_OK)
         return status;
     if ((status = pw_app_profile_parse(bytes, application_end, &parsed.app)) != PW_OK)
@@ -669,8 +773,9 @@ int pw_game_profile_apply_settings(PwGameProfile *profile, const uint8_t *bytes,
     PwGameProfile result, debug;
     PwGameInput input;
     PwGameDisplay display;
+    PwGameAudio audio = { 0 };
     char add[PW_APP_DLL_OVERRIDES_CAPACITY] = "", program[PW_APP_PATH_CAPACITY] = "";
-    uint32_t seen_sections = 0, display_seen = 0;
+    uint32_t seen_sections = 0, display_seen = 0, audio_seen = 0;
     int section = SECTION_NONE;
     size_t cursor = 0;
 
@@ -689,7 +794,8 @@ int pw_game_profile_apply_settings(PwGameProfile *profile, const uint8_t *bytes,
         if (begin == end || *begin == ';' || *begin == '#') continue;
         if (*begin == '[') {
             int next = section_of(begin, end);
-            if (next < 0 || next == SECTION_RUNTIME || (seen_sections & (1u << next))) return PW_ERR_MALFORMED;
+            if (next < 0 || next == SECTION_RUNTIME || next == SECTION_ENVIRONMENT || next == SECTION_STEAM ||
+                (seen_sections & (1u << next))) return PW_ERR_MALFORMED;
             seen_sections |= 1u << next;
             section = next;
             continue;
@@ -728,6 +834,9 @@ int pw_game_profile_apply_settings(PwGameProfile *profile, const uint8_t *bytes,
             if (!is(begin, key_length, "winedebug")) return PW_ERR_UNSUPPORTED;
             status = debug_field(&debug, begin, key_length, value, value_length);
             break;
+        case SECTION_AUDIO:
+            status = audio_field(&audio, &audio_seen, begin, key_length, value, value_length);
+            break;
         default:
             status = input_field(&input, begin, key_length, value, value_length, 1);
             break;
@@ -747,6 +856,7 @@ int pw_game_profile_apply_settings(PwGameProfile *profile, const uint8_t *bytes,
         result.display.height = display.height;
     }
     if (debug.winedebug[0]) memcpy(result.winedebug, debug.winedebug, sizeof(result.winedebug));
+    if (audio_seen & 1u) result.audio = audio;
     if (program[0]) {
         /* Another program in the game's folder: from the folder of the profile's own, which it
          * also starts in; the game's arguments are not its. */

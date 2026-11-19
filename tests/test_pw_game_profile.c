@@ -38,7 +38,7 @@ static void test_graphics_env(void)
             assert(count <= PW_GAME_GRAPHICS_ENV_MAX);
             /* Fixed6, desktop/override/XInput3, graphics, runtime, clock and CPU. */
             assert(6 + 3 + count + pw_game_cpu_env(&p, cpu) + pw_game_runtime_env(&p.runtime, runtime) +
-                   PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX <= PW_WINE_START_MAX_ENV);
+                   PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX + PW_GAME_ENVIRONMENT_MAX <= PW_WINE_START_MAX_ENV);
             /* refresh and opengl_thread no longer set anything */
             if (graphics == PW_APP_GRAPHICS_ZINK) {
                 assert(count == (size_t)(2 + fps));
@@ -600,7 +600,93 @@ static void test_debug_env(void)
     /* The title's environment has room for every profile variable at once. */
     assert(PW_GAME_DEBUG_ENV_MAX == 5);
     assert(7 + 3 + PW_GAME_GRAPHICS_ENV_MAX + PW_GAME_RUNTIME_ENV_MAX +
-           PW_GAME_CPU_ENV_MAX + PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX <= PW_WINE_START_MAX_ENV);
+           PW_GAME_CPU_ENV_MAX + PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX +
+           PW_GAME_ENVIRONMENT_MAX <= PW_WINE_START_MAX_ENV);
+}
+
+/* [environment]: bounded launch variables Playden validates, including the Wine options */
+static void test_profile_environment(void)
+{
+    PwGameProfile p;
+    PwGameEnv env[PW_GAME_ENVIRONMENT_MAX];
+
+    assert(parse(APP, &p) == PW_OK && p.environment_count == 0 && pw_game_profile_env(&p, env) == 0);
+    assert(parse(APP "[environment]\nWINE_LARGE_ADDRESS_AWARE = 1\n"
+                 "WINE_PS5_PARK_FILES = 800\nWINE_PS5_CACHED_FILES = 160\n"
+                 "WINE_CPU_TOPOLOGY = 4:0,1,2,3\nDXVK_FRAME_RATE = 45\n",
+                 &p) == PW_OK);
+    assert(pw_game_profile_env(&p, env) == 5);
+    assert(!strcmp(env[0].name, "WINE_LARGE_ADDRESS_AWARE") && !strcmp(env[0].value, "1"));
+    assert(!strcmp(env[1].name, "WINE_PS5_PARK_FILES") && !strcmp(env[1].value, "800"));
+    assert(!strcmp(env[2].name, "WINE_PS5_CACHED_FILES") && !strcmp(env[2].value, "160"));
+    assert(!strcmp(env[3].name, "WINE_CPU_TOPOLOGY") && !strcmp(env[3].value, "4:0,1,2,3"));
+    assert(!strcmp(env[4].name, "DXVK_FRAME_RATE") && !strcmp(env[4].value, "45"));
+
+    /* Eight entries and the 127-byte limit match Playden's profile contract. */
+    assert(parse(APP "[environment]\nDXVK_A=1\nDXVK_B=1\nDXVK_C=1\nDXVK_D=1\n"
+                 "DXVK_E=1\nDXVK_F=1\nDXVK_G=1\nDXVK_H=1\n", &p) == PW_OK);
+    assert(p.environment_count == PW_GAME_ENVIRONMENT_MAX);
+    assert(parse(APP "[environment]\nDXVK_A=1\nDXVK_B=1\nDXVK_C=1\nDXVK_D=1\n"
+                 "DXVK_E=1\nDXVK_F=1\nDXVK_G=1\nDXVK_H=1\nDXVK_I=1\n", &p) != PW_OK);
+    {
+        char text[512];
+        memset(text, 'a', 127);
+        text[127] = 0;
+        snprintf(text + 127, sizeof(text) - 127, "\n");
+        char profile[1024];
+        snprintf(profile, sizeof(profile), APP "[environment]\nDXVK_CONFIG_FILE=%s", text);
+        assert(parse(profile, &p) == PW_OK);
+        text[126] = 'a';
+        text[127] = 'a';
+        text[128] = 0;
+        snprintf(profile, sizeof(profile), APP "[environment]\nDXVK_CONFIG_FILE=%s\n", text);
+        assert(parse(profile, &p) != PW_OK);
+    }
+
+    /* Only the names Playden accepts; don't turn this into an arbitrary WINE_* injection path. */
+    {
+        const char *refused[] = {
+            "WINE_UNKNOWN = 1", "WINEARCH = wow64", "WINEDEBUG = +all", "DXVK_HUD = fps",
+            "SDL_JOYSTICK_RAWINPUT = 0", "WINE_LARGE_ADDRESS_AWARE = true",
+            "WINE_PS5_PARK_FILES = 10000", "WINE_PS5_CACHED_FILES = -1",
+            "DXVK_FRAME_RATE = 60'", "DXVK_FRAME_RATE = 60\"",
+            "DXVK_FRAME_RATE = 1\nDXVK_FRAME_RATE = 2",
+        };
+        for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+            char profile[512];
+            snprintf(profile, sizeof(profile), APP "[environment]\n%s\n", refused[i]);
+            assert(parse(profile, &p) != PW_OK);
+        }
+    }
+    assert(parse(APP "[debug]\nenv = PW_NATIVE_PROFILE=1\n[environment]\nWINE_LARGE_ADDRESS_AWARE=1\n", &p) == PW_OK);
+    assert(pw_game_debug_env(&p, env) == 1 && pw_game_profile_env(&p, env) == 1);
+}
+
+static void test_audio_volume(void)
+{
+    PwGameProfile p;
+    assert(parse(APP, &p) == PW_OK && p.audio.volume == 100 && !p.audio.volume_set);
+    assert(parse(APP "[audio]\nvolume = 0\n", &p) == PW_OK && p.audio.volume == 0 && p.audio.volume_set);
+    assert(parse(APP "[audio]\nvolume = 50\n", &p) == PW_OK && p.audio.volume == 50);
+    assert(parse(APP "[audio]\nvolume = 100\n", &p) == PW_OK && p.audio.volume == 100);
+    assert(parse(APP "[audio]\nvolume = 101\n", &p) != PW_OK);
+    assert(parse(APP "[audio]\nvolume = mute\n", &p) != PW_OK);
+    assert(parse(APP "[audio]\nvolume = 50\nvolume = 75\n", &p) == PW_ERR_MALFORMED);
+}
+
+static void test_steam_install_dir(void)
+{
+    PwGameProfile p;
+    assert(parse(APP, &p) == PW_OK && !p.steam.install_dir[0]);
+    assert(parse(APP "[steam]\ninstall_dir = The Talos Principle\n", &p) == PW_OK);
+    assert(!strcmp(p.steam.install_dir, "The Talos Principle"));
+    assert(parse(APP "[steam]\ninstall_dir = 0\n", &p) == PW_OK && !strcmp(p.steam.install_dir, "0"));
+    assert(parse(APP "[steam]\ninstall_dir = ../game\n", &p) != PW_OK);
+    assert(parse(APP "[steam]\ninstall_dir = .\n", &p) != PW_OK);
+    assert(parse(APP "[steam]\ninstall_dir = bad/part\n", &p) != PW_OK);
+    assert(parse(APP "[steam]\ninstall_dir = trailing.\n", &p) != PW_OK);
+    assert(parse(APP "[steam]\ninstall_dir = one\ninstall_dir = two\n", &p) == PW_ERR_MALFORMED);
+    assert(parse(APP "[steam]\nother = value\n", &p) == PW_ERR_UNSUPPORTED);
 }
 
 /* keyboard_stick, its dead zone and the four direction keys. */
@@ -680,6 +766,7 @@ static void test_settings(void)
     assert(p.display.width == 1152 && p.display.height == 864);
     assert(!strcmp(p.winedebug, "err+all,warn+all"));
     assert(!strcmp(p.app.dll_overrides, "d3d9=n;d3dx9_27=n,b"));
+    assert(apply(&p, "[audio]\nvolume = 0\n") == PW_OK && p.audio.volume == 0 && p.audio.volume_set);
     /* A preset replaces the profile's whole [input]: its own buttons no longer apply. */
     assert(parse(APP "[input]\nmode = xinput\ncross = space\n", &p) == PW_OK);
     assert(apply(&p, "[input]\npreset = mouselook\nsquare = e\n") == PW_OK);
@@ -726,6 +813,9 @@ int main(void)
     test_runtime();
     test_cpu();
     test_debug_env();
+    test_profile_environment();
+    test_audio_volume();
+    test_steam_install_dir();
     test_refusals();
     test_presets();
     test_default_mode();

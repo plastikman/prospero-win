@@ -40,20 +40,26 @@ int pw_audio_ps5_platform_ops(PwAudioPs5Ops *ops)
 #endif
 }
 
-int pw_audio_ps5_open_port(const PwAudioPs5Ops *ops,int *handle)
+int pw_audio_ps5_open_port_with_volume(const PwAudioPs5Ops *ops,uint32_t volume_percent,int *handle)
 {
     int32_t volumes[8];
-    if(!ops || !handle || !ops->init || !ops->open || !ops->volume || !ops->close)
+    if(!ops || !handle || volume_percent > 100 || !ops->init || !ops->open || !ops->volume || !ops->close)
         return PW_ERR_PRECONDITION;
     if(ops->init()<0)return PW_ERR_STATE;
     int port=ops->open(PW_AUDIO_PS5_USER_SYSTEM,PW_AUDIO_PS5_PORT_MAIN,
         PW_AUDIO_PS5_PORT_INDEX,PW_AUDIO_PS5_GRAIN,PW_AUDIO_PS5_RATE,
         PW_AUDIO_PS5_FORMAT_S16_STEREO);
     if(port<0)return PW_ERR_STATE;
-    for(unsigned i=0;i<8;i++)volumes[i]=PW_AUDIO_PS5_VOLUME_0DB;
+    const int32_t level = (PW_AUDIO_PS5_VOLUME_0DB * (int32_t)volume_percent + 50) / 100;
+    for(unsigned i=0;i<8;i++)volumes[i]=level;
     if(ops->volume(port,PW_AUDIO_PS5_VOLUME_FLAGS,volumes)<0) {
         (void)ops->close(port);return PW_ERR_STATE;
     }
     *handle=port;
     return PW_OK;
+}
+
+int pw_audio_ps5_open_port(const PwAudioPs5Ops *ops,int *handle)
+{
+    return pw_audio_ps5_open_port_with_volume(ops, 100, handle);
 }
