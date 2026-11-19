@@ -36,6 +36,7 @@
 #include "../src/pw_script_input.h"
 #include "../src/pw_wine_launch.h"
 #include "../src/pw_game_menu.h"
+#include "../src/pw_input_switch.h"
 #include "pw_data_mount.h"
 #include "pw_audio_ps5.h"
 #include "pw_pad_ps5.h"
@@ -2142,6 +2143,10 @@ int main(int argc, char **argv)
     static PwPadPs5 pad;
     static PwHidPs5 hid;
     static PwGameInput game_input;
+    static PwGameInput other_input;
+    static PwInputSwitch input_switch;
+    int has_other_input = 0;
+    const char *input_label = "Game controls", *other_label = "Setup mouse";
     /* [input] player2: a second signed-in user's DualSense as more keys. */
     static PwPadPs5 pad2;
     static PwGameInput game_input2;
@@ -2274,8 +2279,9 @@ int main(int argc, char **argv)
     }
     exec_chain_on = game && game->other_program && launch.chain < PW_WINE64_CHAIN_MAX;
     if (game) {
-        /* A launcher (the first program of an exec chain) is driven with the pointer: the shipped
-         * mouse preset, the left stick and Cross. The game it starts gets its own controls. */
+        /* A chain=off [launcher] profile is an alternate input mapping for
+         * setup dialogs that share the game's process. The touchpad hold
+         * switches mappings; game controls remain the default. */
         static PwGameProfile launcher_profile;
         const PwGameProfile *input_profile = game;
         if (exec_chain_on && !launch.chain) {
@@ -2286,6 +2292,20 @@ int main(int argc, char **argv)
             PS5LOG_LOG("PW_WINE64 launcher input preset=mouse (the game's own controls after it)");
         }
         int input_status = pw_wine_library_input(input_profile, library_root, &game_input);
+        if (game->has_launcher && game->launcher_chain_off) {
+            other_input = game->launcher_input;
+            pw_game_input_default_mode(&other_input);
+            has_other_input = 1;
+            input_label = game->game_label[0] ? game->game_label : "Game controls";
+            other_label = game->launcher_label[0] ? game->launcher_label : "Setup mouse";
+            pw_input_switch_init(&input_switch, PW_PAD_PS5_TOUCHPAD);
+            PS5LOG_LOG("PW_WINE64 launcher switch game=%s alternate=%s mouse=%d mode=%d",
+                       input_label, other_label, (int)other_input.mouse, (int)other_input.mode);
+        }
+        if (game->has_launcher && !game->launcher_chain_off) {
+            PS5LOG_LOG("PW_WINE64 profile refused reason=launcher-chain-unsupported");
+            return game_setup_failed("launcher-chain-unsupported");
+        }
         int input2_status = pw_wine_library_player2_input(game, library_root, &game_input2);
         /* [input] 1049: the 1048 stick diagnostic was gated on deflection, so
          * "setting is off" and "axes frozen at centre" both came out silent.
@@ -2467,6 +2487,7 @@ int main(int argc, char **argv)
          * marker in the released PRX. Keep it beside the applied profile so a
          * kit built from an older Orbis-Win release cannot claim the new keys. */
         PS5LOG_LOG("PW_WINE64 profile_features=environment,audio-volume,steam-library-path");
+        PS5LOG_LOG("PW_WINE64 profile_features=launcher-touchpad-switch");
         PS5LOG_LOG("PW_WINE64 profile id=%s prefix=%s desktop=%s scaling=%d view=%s show_fps=%d framegen=%u "
                    "input=%s preset=%s mode=%s mouse=%d rumble=%u dll_overrides=%s", game->app.id, prefix,
                    desktop[0] ? desktop : "default",
@@ -2792,6 +2813,7 @@ int main(int argc, char **argv)
          * below still reads the real pad. */
         const PwPadPs5 *seen = &pad;
         int menu_open = 0;
+        int pad_neutral = 0;
         if (pad_read && (set_menu || osk_status == PW_OK)) {
             uint32_t held = pad.core.previous_buttons, pressed = pad.core.pressed_edges,
                      released = pad.core.released_edges;
@@ -2827,8 +2849,49 @@ int main(int argc, char **argv)
                 game_pad.left_stick.x = game_pad.left_stick.y = 0x80;
                 game_pad.right_stick.x = game_pad.right_stick.y = 0x80;
                 game_pad.l2 = game_pad.r2 = 0;
+                game_pad.finger_down = game_pad.finger_count = 0;
             }
+            pad_neutral = neutral;
             seen = &game_pad;
+        }
+        if (pad_read && has_other_input) {
+            uint32_t held = seen->core.previous_buttons, pressed = seen->core.pressed_edges,
+                     released = seen->core.released_edges;
+            PwInputSwitchView switch_view;
+            if (pad_neutral) {
+                if (pw_input_switch_cancel(&input_switch)) released |= PW_PAD_PS5_TOUCHPAD;
+                held &= ~(uint32_t)PW_PAD_PS5_TOUCHPAD;
+                pressed &= ~(uint32_t)PW_PAD_PS5_TOUCHPAD;
+            } else {
+                pw_input_switch_tick(&input_switch, held, pressed, released, pad.touch_left != 0,
+                                     PW_WINE64_TICK_US, &switch_view);
+                held = switch_view.held;
+                pressed = switch_view.pressed;
+                released = switch_view.released;
+            }
+            game_pad = *seen;
+            if (!pad_neutral) game_pad.touch_left = switch_view.left != 0;
+            game_pad.core.previous_buttons = held;
+            game_pad.core.pressed_edges = pressed;
+            game_pad.core.released_edges = released;
+            seen = &game_pad;
+            if (!pad_neutral && switch_view.switch_now) {
+                size_t release_count = pw_wine_game_inputs(&game_input, 0,
+                                                            held | released, events,
+                                                            sizeof(events) / sizeof(events[0]));
+                for (size_t i = 0; i < release_count; i++) {
+                    if (post_input(&events[i]) == 0) posted++;
+                    else refused++;
+                }
+                PwGameInput swap = game_input;
+                const char *label = input_label;
+                game_input = other_input;
+                other_input = swap;
+                input_label = other_label;
+                other_label = label;
+                game_pad.core.released_edges = 0;
+                PS5LOG_LOG("PW_WINE64 input switch to=%s", input_label);
+            }
         }
         /* XInput controller 0: the DualSense, and in a script build the
          * macro's controller added to it, every frame, so a scripted press
@@ -2930,8 +2993,8 @@ int main(int argc, char **argv)
                 }
             }
             if (game_input.mouse == PW_GAME_STICK_TOUCHPAD) {
-                count += (size_t)pw_wine_touch_pointer_step(&pointer, pad.finger_down != 0,
-                                                            pad.finger_x, pad.finger_y,
+                count += (size_t)pw_wine_touch_pointer_step(&pointer, seen->finger_down != 0,
+                                                            seen->finger_x, seen->finger_y,
                                                             game_input.mouse_speed, &events[count]);
             } else if (game_input.mouse != PW_GAME_STICK_NONE) {
                 const PwPadPs5Stick *stick = game_input.mouse == PW_GAME_STICK_LEFT ?

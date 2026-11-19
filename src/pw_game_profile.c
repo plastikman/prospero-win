@@ -292,7 +292,7 @@ static int display_field(PwGameDisplay *display, uint32_t *seen, const uint8_t *
 }
 
 enum { SECTION_NONE, SECTION_APPLICATION, SECTION_DISPLAY, SECTION_INPUT, SECTION_DEBUG, SECTION_RUNTIME,
-       SECTION_ENVIRONMENT, SECTION_AUDIO, SECTION_STEAM };
+       SECTION_ENVIRONMENT, SECTION_AUDIO, SECTION_STEAM, SECTION_LAUNCHER };
 
 /* One line: its trimmed extent and where the next begins. */
 static size_t next_line(const uint8_t *bytes, size_t length, size_t cursor,
@@ -319,7 +319,32 @@ static int section_of(const uint8_t *begin, const uint8_t *end)
            is(begin, (size_t)(end - begin), "runtime") ? SECTION_RUNTIME :
            is(begin, (size_t)(end - begin), "environment") ? SECTION_ENVIRONMENT :
            is(begin, (size_t)(end - begin), "audio") ? SECTION_AUDIO :
-           is(begin, (size_t)(end - begin), "steam") ? SECTION_STEAM : -1;
+           is(begin, (size_t)(end - begin), "steam") ? SECTION_STEAM :
+           is(begin, (size_t)(end - begin), "launcher") ? SECTION_LAUNCHER : -1;
+}
+
+/* [launcher] supplies an alternate input preset. chain = off keeps the same
+ * executable running and uses the touchpad hold only to switch input. */
+static int launcher_field(PwGameProfile *profile, const uint8_t *key, size_t key_length,
+                          const uint8_t *v, size_t n)
+{
+    char *label = is(key, key_length, "label") ? profile->launcher_label :
+                  is(key, key_length, "game_label") ? profile->game_label : NULL;
+
+    if (is(key, key_length, "chain")) {
+        if (profile->launcher_chain_off || !is(v, n, "off")) return PW_ERR_MALFORMED;
+        profile->launcher_chain_off = 1;
+        return PW_OK;
+    }
+    if (!label) return input_field(&profile->launcher_input, key, key_length, v, n, 0);
+    if (label[0] || !n || n >= PW_GAME_LABEL_CAPACITY) return PW_ERR_MALFORMED;
+    for (size_t i = 0; i < n; i++)
+        if (!((v[i] >= 'a' && v[i] <= 'z') || (v[i] >= 'A' && v[i] <= 'Z') ||
+              (v[i] >= '0' && v[i] <= '9') || v[i] == ' ' || v[i] == '-'))
+            return PW_ERR_MALFORMED;
+    memcpy(label, v, n);
+    label[n] = 0;
+    return PW_OK;
 }
 
 /* [steam] install_dir: one path component below steamapps/common. Keep this
@@ -563,7 +588,10 @@ static int parse_sections(const uint8_t *bytes, size_t length, PwGameProfile *pr
         value = equals + 1;
         trim(&value, &end);
         if (begin == key_end) return PW_ERR_MALFORMED;
-        int status = section == SECTION_DEBUG ?
+        if (section == SECTION_LAUNCHER) profile->has_launcher = 1;
+        int status = section == SECTION_LAUNCHER ?
+            launcher_field(profile, begin, (size_t)(key_end - begin), value, (size_t)(end - value)) :
+            section == SECTION_DEBUG ?
             debug_field(profile, begin, (size_t)(key_end - begin), value, (size_t)(end - value)) :
             section == SECTION_RUNTIME ?
             runtime_field(&profile->runtime, &runtime_seen, begin, (size_t)(key_end - begin),
@@ -716,14 +744,20 @@ int pw_game_profile_parse(const uint8_t *bytes, size_t length, PwGameProfile *pr
     if (length > PW_APP_PROFILE_MAX_BYTES) return PW_ERR_LIMIT;
     memset(&parsed, 0, sizeof(parsed));
     pw_game_input_init(&parsed.input);
+    pw_game_input_init(&parsed.launcher_input);
     parsed.input.mouse_speed = 0;       /* unset until a line sets it */
     parsed.display.show_fps = 1;        /* on unless the profile says false */
     parsed.display.refresh = 60;
     parsed.audio.volume = PW_GAME_AUDIO_VOLUME_MAX;
     if ((status = parse_sections(bytes, length, &parsed, NULL, &application_end)) != PW_OK)
         return status;
+    /* This PS4 port supports an in-process alternate preset only. A launcher
+     * profile without chain=off would claim automatic exec-chain semantics
+     * that this runtime does not implement. */
+    if (parsed.has_launcher && !parsed.launcher_chain_off) return PW_ERR_UNSUPPORTED;
     if ((status = pw_app_profile_parse(bytes, application_end, &parsed.app)) != PW_OK)
         return status;
+    if (parsed.has_launcher) pw_game_input_default_mode(&parsed.launcher_input);
     /* show_fps and menu set the HUD variable themselves (pw_game_graphics_env). */
     for (size_t i = 0; (parsed.display.show_fps || parsed.display.menu) && i < parsed.debug_env_count; i++)
         if (!strcmp(parsed.debug_env[i].name, "DXVK_HUD") || !strcmp(parsed.debug_env[i].name, "GALLIUM_HUD"))
@@ -770,7 +804,7 @@ static int relative_program(const uint8_t *value, size_t length, char *out, size
 
 int pw_game_profile_apply_settings(PwGameProfile *profile, const uint8_t *bytes, size_t length)
 {
-    PwGameProfile result, debug;
+    PwGameProfile result, debug, launcher;
     PwGameInput input;
     PwGameDisplay display;
     PwGameAudio audio = { 0 };
@@ -782,6 +816,8 @@ int pw_game_profile_apply_settings(PwGameProfile *profile, const uint8_t *bytes,
     if (!profile || (!bytes && length)) return PW_ERR_PRECONDITION;
     if (length > PW_APP_PROFILE_MAX_BYTES) return PW_ERR_LIMIT;
     pw_game_input_init(&input);
+    memset(&launcher, 0, sizeof(launcher));
+    pw_game_input_init(&launcher.launcher_input);
     input.mouse_speed = 0;
     memset(&display, 0, sizeof(display));
     memset(&debug, 0, sizeof(debug));
@@ -796,6 +832,7 @@ int pw_game_profile_apply_settings(PwGameProfile *profile, const uint8_t *bytes,
             int next = section_of(begin, end);
             if (next < 0 || next == SECTION_RUNTIME || next == SECTION_ENVIRONMENT || next == SECTION_STEAM ||
                 (seen_sections & (1u << next))) return PW_ERR_MALFORMED;
+            if (next == SECTION_LAUNCHER) launcher.has_launcher = 1;
             seen_sections |= 1u << next;
             section = next;
             continue;
@@ -837,13 +874,25 @@ int pw_game_profile_apply_settings(PwGameProfile *profile, const uint8_t *bytes,
         case SECTION_AUDIO:
             status = audio_field(&audio, &audio_seen, begin, key_length, value, value_length);
             break;
+        case SECTION_LAUNCHER:
+            status = launcher_field(&launcher, begin, key_length, value, value_length);
+            break;
         default:
             status = input_field(&input, begin, key_length, value, value_length, 1);
             break;
         }
         if (status != PW_OK) return status;
     }
+    if (launcher.has_launcher && !launcher.launcher_chain_off) return PW_ERR_UNSUPPORTED;
     result = *profile;
+    if (launcher.has_launcher) {
+        result.has_launcher = 1;
+        result.launcher_chain_off = launcher.launcher_chain_off;
+        result.launcher_input = launcher.launcher_input;
+        memcpy(result.launcher_label, launcher.launcher_label, sizeof(result.launcher_label));
+        memcpy(result.game_label, launcher.game_label, sizeof(result.game_label));
+        pw_game_input_default_mode(&result.launcher_input);
+    }
     if (input.set & SET_PRESET) {
         /* A chosen preset is the game's whole input, the profile's own lines included. */
         memcpy(input.player2, result.input.player2, sizeof(input.player2));

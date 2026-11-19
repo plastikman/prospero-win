@@ -30,7 +30,7 @@
  *   mode = keyboard        ; keyboard (buttons send keys/mouse) or xinput (also
  *                          ; the game's XInput controller); default: xinput
  *                          ; when nothing is bound, keyboard otherwise
- *   mouse = right_stick    ; a stick moves the pointer: left_stick, right_stick, none
+ *   mouse = right_stick    ; pointer: left_stick, right_stick, touchpad or none
  *   mouse_speed = 1200     ; pointer pixels per second at full tilt
  *   rumble = 50            ; how strongly the DualSense vibrates for the
  *                          ; game, 0 (off) to 100 (the default)
@@ -45,6 +45,11 @@
  *   r2 = mouse_left        ;            mouse_middle | vk:0xNN | none
  *   player2 = pinball-p2   ; a keyboard preset for a second DualSense, the pad
  *                          ; of another signed-in user (local multiplayer)
+ *
+ *   [launcher]             ; an alternate setup/menu mapping in the same process
+ *   chain = off            ; hold the touchpad for 2 s to switch between it
+ *   mode = keyboard        ; and [input]; the touchpad click selects while
+ *   mouse = touchpad       ; the touch surface moves the pointer
  *
  *   [debug]
  *   winedebug = +seh,+virtual   ; Wine's debug channels for this game (default:
@@ -96,6 +101,7 @@ enum {
     PW_GAME_TOUCH_SPEED_DEFAULT = 400,  /* mouse = touchpad without mouse_speed: 1200 felt like a jump */
     PW_GAME_RUMBLE_MAX = 100,
     PW_GAME_WINEDEBUG_CAPACITY = 128,
+    PW_GAME_LABEL_CAPACITY = 32,
     PW_GAME_AUDIO_VOLUME_MAX = 100,
     PW_GAME_STEAM_INSTALL_DIR_CAPACITY = 129,
     PW_GAME_DEBUG_ENV_MAX = 5, PW_GAME_DEBUG_ENV_NAME = 48, PW_GAME_DEBUG_ENV_VALUE = 96,
@@ -106,8 +112,8 @@ typedef enum PwGameScaling { PW_GAME_SCALING_FIT = 0, PW_GAME_SCALING_INTEGER,
                              PW_GAME_SCALING_STRETCH } PwGameScaling;
 typedef enum PwGameView { PW_GAME_VIEW_WINDOW = 0, PW_GAME_VIEW_DESKTOP } PwGameView;
 typedef enum PwGameInputMode { PW_GAME_INPUT_KEYBOARD = 0, PW_GAME_INPUT_XINPUT } PwGameInputMode;
-/* PW_GAME_STICK_TOUCHPAD is valid for [input] mouse only: finger travel on the
- * touchpad moves the pointer, as a laptop trackpad does (2026-11-06). */
+/* PW_GAME_STICK_TOUCHPAD is valid for mouse in [input] or [launcher]: finger
+ * travel on the touchpad moves the pointer, as a laptop trackpad does. */
 typedef enum PwGameStick { PW_GAME_STICK_NONE = 0, PW_GAME_STICK_LEFT, PW_GAME_STICK_RIGHT,
                            PW_GAME_STICK_TOUCHPAD } PwGameStick;
 typedef enum PwGameBindKind { PW_GAME_BIND_UNSET = 0, PW_GAME_BIND_NONE, PW_GAME_BIND_KEY,
@@ -187,6 +193,9 @@ typedef struct PwGameProfile {
     PwAppProfile app;
     PwGameDisplay display;
     PwGameInput input;          /* this profile's own [input] lines */
+    PwGameInput launcher_input; /* [launcher]: alternate setup/menu controls */
+    char launcher_label[PW_GAME_LABEL_CAPACITY], game_label[PW_GAME_LABEL_CAPACITY];
+    uint8_t has_launcher, launcher_chain_off;
     /* [debug] winedebug: WINEDEBUG for this game, empty for the title's. */
     char winedebug[PW_GAME_WINEDEBUG_CAPACITY];
     PwGameDebugEnv debug_env[PW_GAME_DEBUG_ENV_MAX];    /* [debug] env lines */
@@ -201,8 +210,9 @@ typedef struct PwGameProfile {
     uint8_t other_program;
 } PwGameProfile;
 
-/* Parse a whole profile. [application] must come first; [display],
- * [input], [debug], [runtime], [environment], [audio] and [steam] are optional, once each. PW_OK or a
+/* Parse a whole profile. [application] must come first; [display], [input],
+ * [launcher] (only with chain = off), [debug], [runtime], [environment],
+ * [audio] and [steam] are optional, once each. PW_OK or a
  * PW_ERR_* status. */
 int pw_game_profile_parse(const uint8_t *bytes, size_t length, PwGameProfile *profile);
 /* The variables runtime sets in Wine's environment, into env, which has
