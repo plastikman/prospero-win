@@ -1,0 +1,73 @@
+From: Codex <codex@openai.com>
+Subject: iphlpapi: report the PS4 NetCtl adapter to GetAdaptersInfo
+
+PS4 Wine does not expose its network interface through NSI, so the legacy
+GetAdaptersInfo call fails even though sockets and DNS work. Use the NetCtl
+snapshot already passed by the launcher to return one valid Ethernet adapter.
+If no usable snapshot is present, preserve Wine's original error.
+
+---
+diff --git a/dlls/iphlpapi/iphlpapi_main.c b/dlls/iphlpapi/iphlpapi_main.c
+index b315490b1f2..50557a704ea 100644
+--- a/dlls/iphlpapi/iphlpapi_main.c
++++ b/dlls/iphlpapi/iphlpapi_main.c
+@@ -585,6 +585,50 @@ static void ip_addr_string_init( IP_ADDR_STRING *s, const IN_ADDR *addr, const I
+     s->Context = ctxt;
+ }
+ 
++/* PS4 has working sockets, but does not expose its interface through Wine's
++ * NSI device. Use the NetCtl snapshot provided by the launcher for legacy
++ * callers that still enumerate adapters through GetAdaptersInfo(). */
++static DWORD ps4_adapters_info( IP_ADAPTER_INFO *info, ULONG *size, DWORD original_err )
++{
++    char config[160], *field[6], *cursor, *comma;
++    IN_ADDR address, mask, gateway;
++    DWORD len, i;
++
++    len = GetEnvironmentVariableA( "WINE_PS4_NETCFG", config, sizeof(config) );
++    if (!len || len >= sizeof(config)) return original_err;
++    cursor = config;
++    for (i = 0; i < ARRAY_SIZE(field); ++i)
++    {
++        field[i] = cursor;
++        comma = strchr( cursor, ',' );
++        if (i < ARRAY_SIZE(field) - 1 && !comma) return original_err;
++        if (comma) *comma = 0, cursor = comma + 1;
++    }
++    if (RtlIpv4StringToAddressA( field[0], TRUE, NULL, &address ) ||
++        RtlIpv4StringToAddressA( field[1], TRUE, NULL, &mask ) ||
++        RtlIpv4StringToAddressA( field[2], TRUE, NULL, &gateway )) return original_err;
++    if (!info || *size < sizeof(*info))
++    {
++        *size = sizeof(*info);
++        return ERROR_BUFFER_OVERFLOW;
++    }
++    memset( info, 0, sizeof(*info) );
++    strcpy( info->AdapterName, "orbis-ethernet" );
++    strcpy( info->Description, "Orbis Ethernet" );
++    info->Index = 2;
++    info->Type = IF_TYPE_ETHERNET_CSMACD;
++    info->DhcpEnabled = TRUE;
++    ip_addr_string_init( &info->IpAddressList, &address, &mask, 0 );
++    mask.s_addr = INADDR_NONE;
++    ip_addr_string_init( &info->GatewayList, &gateway, &mask, 0 );
++    ip_addr_string_init( &info->DhcpServer, NULL, NULL, 0 );
++    ip_addr_string_init( &info->PrimaryWinsServer, NULL, NULL, 0 );
++    ip_addr_string_init( &info->SecondaryWinsServer, NULL, NULL, 0 );
++    *size = sizeof(*info);
++    MESSAGE( "PW_ADAPTERS_INFO PS4 NetCtl fallback: one adapter, index %lu\n", info->Index );
++    return ERROR_SUCCESS;
++}
++
+ /******************************************************************
+  *    GetAdaptersInfo (IPHLPAPI.@)
+  *
+@@ -615,7 +659,7 @@ DWORD WINAPI GetAdaptersInfo( IP_ADAPTER_INFO *info, ULONG *size )
+                                   (void **)&if_keys, sizeof(*if_keys), (void **)&if_rw, sizeof(*if_rw),
+                                   NULL, 0, (void **)&if_stat, sizeof(*if_stat), &if_count, 0 );
+ 
+-    if (err) return err;
++    if (err) return ps4_adapters_info( info, size, err );
+     for (i = 0; i < if_count; i++)
+     {
+         if (if_stat[i].type == IF_TYPE_SOFTWARE_LOOPBACK) continue;

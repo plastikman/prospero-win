@@ -1,0 +1,39 @@
+From: Codex <codex@openai.com>
+Subject: kernelbase: find drive roots when no drives are published
+
+PS4 titles have no mount manager service to publish drive letters in
+\\DosDevices\\. If that directory is empty, probe each drive root as
+GetDriveType already does, allowing GetLogicalDrives and
+GetLogicalDriveStrings to report the mounted C: drive.
+
+---
+ dlls/kernelbase/volume.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/dlls/kernelbase/volume.c b/dlls/kernelbase/volume.c
+index edfd777..c14515c 100644
+--- a/dlls/kernelbase/volume.c
++++ b/dlls/kernelbase/volume.c
+@@ -516,6 +516,20 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetLogicalDrives(void)
+         NtClose( handle );
+     }
+ 
++    if (!bitmask)  /* nothing has published the drives: ask for each root */
++    {
++        WCHAR root[] = L"A:\\";
++        DWORD error = GetLastError();
++
++        for (; root[0] <= 'Z'; root[0]++)
++        {
++            if (!open_device_root( root, &handle )) continue;
++            bitmask |= 1 << (root[0] - 'A');
++            NtClose( handle );
++        }
++        SetLastError( error );
++    }
++
+     return bitmask;
+ }
+ 
+-- 
+2.43.0

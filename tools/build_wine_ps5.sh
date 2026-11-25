@@ -147,7 +147,7 @@ done
 
 [ -z "$ps5vk_sdk" ] || [ -z "$radv" ] || fail "--ps5vk-sdk and --radv both name libvulkan.prx; give one"
 
-# The series: NNNN-lower-case-name.patch, unique numbers below 1000, each a
+# The series: NNNN-lower-case-name.patch, unique four-digit numbers, each a
 # mail-formatted patch with a subject. Printed in the order it is applied.
 series() {
     [ -d "$patches" ] || fail "no patch directory $patches"
@@ -161,8 +161,8 @@ series() {
             fail "patch name must be NNNN-lower-case-words.patch: $patch"
         number=$(printf '%s' "$patch" | cut -c1-4 | sed 's/^0*//')
         number=${number:-0}
-        [ "$number" -ge 100 ] && [ "$number" -le 999 ] ||
-            fail "patch number outside 0100-0999: $patch"
+        [ "$number" -ge 100 ] && [ "$number" -le 9999 ] ||
+            fail "patch number outside 0100-9999: $patch"
         [ "$number" -ne "$last" ] || fail "duplicate patch number: $patch"
         last=$number
         grep -q '^Subject: ' "$patches/$patch" || fail "patch has no Subject: $patch"

@@ -1,0 +1,55 @@
+From: Codex <codex@openai.com>
+Subject: mmdevapi: keep persisted audio endpoint names unchanged
+
+When Wine reloads devices from the registry, it only marks them not present.
+Do not regenerate their Properties from the saved FriendlyName: that value
+is already formatted as "Speakers (...)" or "Microphone (...)" and would gain
+another wrapper on every initialization. The active driver's later
+enumeration continues to refresh the properties for devices it provides.
+
+---
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 8440b5d863..e7150df53b 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -441,7 +441,8 @@ static const WCHAR *find_product_name_override(const WCHAR *device_id)
+  * If GUID is null, a random guid will be assigned
+  * and the device will be created
+  */
+-static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DWORD state, BOOL setdefault)
++static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DWORD state,
++        BOOL setdefault, BOOL update_properties)
+ {
+     HKEY key, root;
+     MMDevice *device, *cur = NULL;
+@@ -494,7 +495,11 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+     {
+         HKEY keyprop;
+         RegSetValueExW(key, L"DeviceState", 0, REG_DWORD, (const BYTE*)&state, sizeof(DWORD));
+-        if (!RegCreateKeyExW(key, L"Properties", 0, NULL, 0, KEY_WRITE|KEY_READ|KEY_WOW64_64KEY, NULL, &keyprop, NULL))
++        /* Loading a persisted device only changes its state. Rebuilding its
++         * properties from FriendlyName would wrap "Speakers (...)" or
++         * "Microphone (...)" again on every mmdevapi initialization. */
++        if (update_properties &&
++            !RegCreateKeyExW(key, L"Properties", 0, NULL, 0, KEY_WRITE|KEY_READ|KEY_WOW64_64KEY, NULL, &keyprop, NULL))
+         {
+             PROPVARIANT pv;
+             WCHAR *type;
+@@ -626,7 +631,7 @@ HRESULT load_devices_from_reg(void)
+             && pv.vt == VT_LPWSTR)
+         {
+             MMDevice_Create(pv.pwszVal, &guid, curflow,
+-                    DEVICE_STATE_NOTPRESENT, FALSE);
++                    DEVICE_STATE_NOTPRESENT, FALSE, FALSE);
+             CoTaskMemFree(pv.pwszVal);
+         }
+     } while (1);
+@@ -690,7 +695,7 @@ HRESULT load_driver_devices(EDataFlow flow)
+ 
+         get_device_guid( flow, dev_name, &guid );
+ 
+-        dev = MMDevice_Create(name, &guid, flow, DEVICE_STATE_ACTIVE, params.default_idx == i);
++        dev = MMDevice_Create(name, &guid, flow, DEVICE_STATE_ACTIVE, params.default_idx == i, TRUE);
+         set_format(dev);
+     }
+ 

@@ -1,0 +1,47 @@
+From: Codex <codex@openai.com>
+Subject: ntdll: honor WINE_CPU_TOPOLOGY processor count
+
+Let a title profile lower the number of processors Wine reports to a game.
+This provides a supported per-title workaround for games whose job system
+hangs when it creates workers for every processor. The setting remains static
+for the process; games that need the full processor count during gameplay may
+still need a loading-specific fix.
+
+---
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index 5e30f0e1868..e4fe32968fe 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -1735,6 +1735,23 @@ static void get_random( void *buf, ULONG len )
+  *
+  * Init a couple of places with CPU related information.
+  */
++static long cpu_topology_override( long num )
++{
++    const char *env = getenv( "WINE_CPU_TOPOLOGY" );
++    char *end;
++    long count;
++
++    if (!env || !*env) return num;
++    count = strtol( env, &end, 10 );
++    if (end == env || (*end && *end != ':') || count < 1 || count > num)
++    {
++        MESSAGE( "wine: WINE_CPU_TOPOLOGY=%s ignored, %ld processors\n", env, num );
++        return num;
++    }
++    MESSAGE( "wine: WINE_CPU_TOPOLOGY=%s, %ld of %ld processors\n", env, count, num );
++    return count;
++}
++
+ void init_cpu_info(void)
+ {
+     long num;
+@@ -1760,7 +1777,7 @@ void init_cpu_info(void)
+     num = 1;
+     FIXME("Detecting the number of processors is not supported.\n");
+ #endif
+-    peb->NumberOfProcessors = num;
++    peb->NumberOfProcessors = cpu_topology_override( num );
+     init_cpu_model();
+     get_random( &process_cookie, sizeof(process_cookie) );
+ }
