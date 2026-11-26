@@ -89,7 +89,7 @@ FREETYPE_EXPORTS="FT_Activate_Size FT_Done_Face FT_Done_FreeType FT_Done_Glyph F
  FT_New_Memory_Face FT_Outline_Embolden FT_Outline_Get_Bitmap FT_Outline_Get_CBox
  FT_Outline_Transform FT_Outline_Translate FT_Property_Set FT_Render_Glyph FT_Set_Charmap
  FT_Set_Pixel_Sizes FT_Vector_Length FT_Vector_Transform FT_Vector_Unit"
-TARGETS="dlls/ntdll/ntdll.so dlls/win32u/win32u.so server/wineserver dlls/winevulkan/winevulkan.so
+TARGETS="dlls/ntdll/ntdll.so dlls/win32u/win32u.so server/wineserver dlls/winebus.sys/winebus.so dlls/winevulkan/winevulkan.so
  dlls/opengl32/opengl32.so dlls/ws2_32/ws2_32.so dlls/crypt32/crypt32.so dlls/dwrite/dwrite.so"
 # The PE modules the patches change: every xinput built from xinput1_3's
 # source reads the title's controller (patch 0470); xinput9_1_0 forwards to
@@ -98,9 +98,13 @@ TARGETS="dlls/ntdll/ntdll.so dlls/win32u/win32u.so server/wineserver dlls/winevu
 # hooks and dispatch table capability checks come from the same source.
 # xaudio2_* and xactengine*: they link Wine's static FAudio, whose resampler
 # wrote past its buffer (patch 0972).
-# kernelbase: no debugger start in a title (patch 0971).
-PE_MODULES="ntdll win32u xinput1_1 xinput1_2 xinput1_3 xinput1_4 xinputuap quartz winevulkan kernelbase"
+# kernelbase: no debugger start in a title (patch 0971); iphlpapi and mmdevapi
+# carry the PS4 adapter and persisted endpoint fixes (patches 1009 and 1011).
+PE_MODULES="ntdll win32u xinput1_1 xinput1_2 xinput1_3 xinput1_4 xinputuap quartz winevulkan kernelbase iphlpapi mmdevapi"
 PE_MODULES="$PE_MODULES xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_7 xaudio2_8 xaudio2_9 xactengine2_0 xactengine2_4 xactengine2_7 xactengine2_9 xactengine3_0 xactengine3_1 xactengine3_2 xactengine3_3 xactengine3_4 xactengine3_5 xactengine3_6 xactengine3_7"
+# winebus.sys is a driver, not a .dll target; patch 1013 also needs its Unix
+# library linked to winebus.prx below.
+PE_DRIVERS="winebus.sys"
 # Everything optional but FreeType (built below) is off: the console has none
 # of these libraries, and a configure-time probe against the payload SDK must
 # not pick up host headers.
@@ -320,6 +324,7 @@ status=0
 # LDFLAGS is not a make dependency, so relink the three targets every run.
 (cd "$build" && rm -f $TARGETS)
 for step in "dlls/ntdll/ntdll.so|$heap $dmem" "dlls/win32u/win32u.so|" "server/wineserver|$heap" \
+        "dlls/winebus.sys/winebus.so|" \
         "dlls/winevulkan/winevulkan.so|" "dlls/opengl32/opengl32.so|" "dlls/ws2_32/ws2_32.so|" \
         "dlls/crypt32/crypt32.so|" "dlls/dwrite/dwrite.so|" \
         $([ -f "$tls/lib/libgnutls.a" ] && echo "dlls/secur32/secur32.so|"); do
@@ -335,6 +340,11 @@ for arch in i386 x86_64; do
     [ "$arch" != x86_64 ] || modules="$modules wow64"
     for module in $modules; do
         target=dlls/$module/$arch-windows/$module.dll
+        make -C "$build" -k -j"$jobs" "$target" >> "$work/make.log" 2>&1 || status=$?
+        [ ! -f "$build/$target" ] || cp "$build/$target" "$work/pe/$arch-windows/"
+    done
+    for module in $PE_DRIVERS; do
+        target=dlls/$module/$arch-windows/$module
         make -C "$build" -k -j"$jobs" "$target" >> "$work/make.log" 2>&1 || status=$?
         [ ! -f "$build/$target" ] || cp "$build/$target" "$work/pe/$arch-windows/"
     done
@@ -436,6 +446,8 @@ if [ "$prx_status" = 0 ]; then
         __wine_unix_call_funcs __wine_unix_call_wow64_funcs
     python3 "$root/tools/gen_prx_descriptor.py" "$prx/obj/xinput_desc.c" \
         __wine_unix_call_funcs __wine_unix_call_wow64_funcs
+    python3 "$root/tools/gen_prx_descriptor.py" "$prx/obj/winebus_desc.c" \
+        __wine_unix_call_funcs __wine_unix_call_wow64_funcs
     python3 "$root/tools/gen_prx_descriptor.py" "$prx/obj/winevulkan_desc.c" \
         __wine_unix_call_funcs __wine_unix_call_wow64_funcs
     python3 "$root/tools/gen_prx_descriptor.py" "$prx/obj/opengl32_desc.c" \
@@ -460,7 +472,7 @@ if [ "$prx_status" = 0 ]; then
     # shellcheck disable=SC2086
     python3 "$root/tools/gen_prx_descriptor.py" "$prx/obj/libfreetype_desc.c" $FREETYPE_EXPORTS
     for unit in ntdll_desc win32u_desc wineserver_desc wowprospero_desc wineps5_desc \
-            libfreetype_desc xinput_desc winevulkan_desc opengl32_desc ws2_32_desc crypt32_desc dwrite_desc \
+            libfreetype_desc xinput_desc winebus_desc winevulkan_desc opengl32_desc ws2_32_desc crypt32_desc dwrite_desc \
             libvulkan_desc $([ -f "$tls/lib/libgnutls.a" ] && echo secur32_desc libgnutls_desc); do
         "$sdk/bin/prospero-clang" -std=c11 -O2 -Wall -Wextra -Werror -fPIC -I"$root/wine/ps5" \
             -c "$prx/obj/$unit.c" -o "$prx/obj/$unit.o" || fail "cannot compile $unit.c"
@@ -515,6 +527,9 @@ if [ "$prx_status" = 0 ]; then
         -c "$tree/dlls/xinput1_3/unixlib.c" -o "$prx/obj/xinput_unixlib.o" ||
         fail "cannot compile xinput's unixlib.c"
     link_prx xinput1_3 - "$prx/obj/xinput_unixlib.o $prx/obj/xinput_desc.o" "$prx/ntdll.shared.elf"
+    # Winebus' PS5 HID bus (patch 1013) reads and reports the title's pad via
+    # ntdll's sink. It is the Unix side of winebus.sys, loaded by name as a PRX.
+    link_prx winebus dlls/winebus.sys/winebus.so "$prx/obj/winebus_desc.o" "$prx/ntdll.shared.elf"
     # Wine's Vulkan Unix side: it calls into ntdll and into win32u's Vulkan
     # driver (__wine_get_vulkan_driver).
     link_prx winevulkan dlls/winevulkan/winevulkan.so "$prx/obj/winevulkan_desc.o" \
@@ -617,6 +632,7 @@ text = Path(log).read_text(errors="replace")
 owners = {"dlls/ntdll/": "dlls/ntdll/ntdll.so", "dlls/win32u/": "dlls/win32u/win32u.so",
           "server/": "server/wineserver", "dlls/winevulkan/": "dlls/winevulkan/winevulkan.so",
           "dlls/opengl32/": "dlls/opengl32/opengl32.so", "dlls/ws2_32/": "dlls/ws2_32/ws2_32.so",
+          "dlls/winebus.sys/": "dlls/winebus.sys/winebus.so",
           "dlls/crypt32/": "dlls/crypt32/crypt32.so", "dlls/dwrite/": "dlls/dwrite/dwrite.so",
           "dlls/secur32/": "dlls/secur32/secur32.so"}
 unresolved = {target: set() for target in owners.values()}
@@ -664,7 +680,7 @@ webkit_exports = exports("libkernel_web.so") | exports("libScePosixForWebKit.so"
 objdump = shutil.which("llvm-objdump-18") or shutil.which("llvm-objdump") or f"{sdk}/bin/llvm-objdump"
 SYSCALL_ALLOWED = {"__wine_syscall_dispatcher", "__wine_unix_call_dispatcher"}
 ntdll_exports = exports("ntdll.shared.elf", prx) if (Path(prx) / "ntdll.shared.elf").is_file() else set()
-for name in ("ntdll", "win32u", "wineserver", "wowprospero", "wineps5", "libfreetype", "xinput1_3",
+for name in ("ntdll", "win32u", "wineserver", "wowprospero", "wineps5", "libfreetype", "xinput1_3", "winebus",
              "winevulkan", "opengl32", "ws2_32", "crypt32", "dwrite", "libvulkan", "secur32", "libgnutls") if not prx_status.startswith("skipped") else ():
     module = Path(prx) / "sce_module" / f"{name}.prx"
     link_log = Path(prx) / f"{name}.link.log"
@@ -687,7 +703,7 @@ for name in ("ntdll", "win32u", "wineserver", "wowprospero", "wineps5", "libfree
         imports = {fields[7].split("@")[0] for fields in (line.split() for line in symbols.splitlines())
                    if len(fields) >= 8 and fields[6] == "UND"}
         provided = title_exports | (ntdll_exports if name in ("win32u", "wowprospero", "wineps5",
-                                                              "xinput1_3", "winevulkan", "opengl32", "ws2_32",
+                                                              "xinput1_3", "winebus", "winevulkan", "opengl32", "ws2_32",
                                                               "crypt32", "dwrite", "secur32") else set())
         entry["title_unbound"] = sorted((imports & exports("libkernel_sys.so")) - provided)
         # Nor does it get the WebKit process's libraries: ws2_32's getaddrinfo,
@@ -712,7 +728,7 @@ for name in ("ntdll", "win32u", "wineserver", "wowprospero", "wineps5", "libfree
     result["prx"]["modules"][name] = entry
 # The patched PE modules, beside the PRXs.
 result["pe"] = {str(path.relative_to(Path(prx).parent / "pe")): hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in sorted((Path(prx).parent / "pe").glob("*-windows/*.dll"))}
+                for path in sorted((Path(prx).parent / "pe").glob("*-windows/*")) if path.is_file()}
 # Commits of the PRX foundation, PS5_Mesa, PS5_Vulkan, the payload SDK RADV
 # was linked with; SHA-256 of the ps5vk archive and of the root certificate
 # bundle staged for crypt32. Null when not linked or not recorded.

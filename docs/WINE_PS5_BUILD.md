@@ -22,9 +22,11 @@ FreeBSD headers, so Wine selects its FreeBSD paths (kqueue instead of epoll,
 sysctl), and `__PROSPERO__` selects the PS5 patches. PE modules come from
 the host build that `tools/build_wine_runtime.sh` produces, which also
 supplies winebuild and widl. The exception is the few PE modules a patch
-changes (`PE_MODULES` in `tools/build_wine_ps5.sh`), which are built from the
-patched tree for i386 and x86_64 into `.deps/wine-ps5/pe`. That needs both
-MinGW cross compilers.
+changes (`PE_MODULES` and `PE_DRIVERS` in `tools/build_wine_ps5.sh`), which are
+built from the patched tree for i386 and x86_64 into `.deps/wine-ps5/pe`. The
+PS4 winebus HID path also builds `winebus.so` from that patched tree and links
+it as `winebus.prx`; `package_release.sh` stages the paired driver and PRX.
+That needs both MinGW cross compilers.
 
 ~~~sh
 tools/build_wine_ps5.sh --check-patches   # validate and print the series

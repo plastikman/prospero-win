@@ -77,6 +77,20 @@ ls "$wine_ps5"/prx/sce_module/ntdll.prx >/dev/null 2>&1 || fail "--wine-ps5: no 
     fail "--native-cpu: no x86_64-windows/wow64native.dll and ps5/wow64native.prx in '$native_cpu'"
 [ -f "$lapy_release" ] || fail "--lapy-release: no file '$lapy_release'"
 [ -f "$wine_ps5/report.json" ] || fail "--wine-ps5: no report.json in '$wine_ps5'"
+python3 - "$wine_ps5/report.json" "$wine_ps5/pe" <<'PY' || fail "--wine-ps5: issue #8 native modules are missing"
+import json, sys
+from pathlib import Path
+report = json.loads(Path(sys.argv[1]).read_text())
+pe = Path(sys.argv[2])
+for arch in ("i386-windows", "x86_64-windows"):
+    for name in ("iphlpapi.dll", "mmdevapi.dll", "winebus.sys"):
+        if not (pe / arch / name).is_file():
+            sys.exit(f"missing PS4-built {arch}/{name}")
+if not (Path(sys.argv[1]).parent / "prx/sce_module/winebus.prx").is_file():
+    sys.exit("missing PS4 winebus.prx companion")
+if not report.get("prx", {}).get("modules", {}).get("winebus", {}).get("built"):
+    sys.exit("report.json does not confirm a built winebus.prx")
+PY
 for file in LICENSE COPYING.LIB AUTHORS NOTICES.md; do
     [ -f "$wine_ps5/source/$file" ] || fail "--wine-ps5: no Wine source/$file in '$wine_ps5'"
 done
@@ -131,6 +145,11 @@ for arch in i386-windows x86_64-windows; do
     done
     # The PE modules the PS5 patches change (PE_MODULES in build_wine_ps5.sh).
     if [ -d "$wine_ps5/pe/$arch" ]; then cp "$wine_ps5/pe/$arch"/*.dll "$lib/$arch/"; fi
+    # winebus.sys is a driver rather than a DLL. Patch 1013 adds the PS5 HID
+    # bus to it, so stage the PS4-built driver alongside the Winebus PRX.
+    if [ -f "$wine_ps5/pe/$arch/winebus.sys" ]; then
+        cp "$wine_ps5/pe/$arch/winebus.sys" "$lib/$arch/"
+    fi
 done
 cp "$cpu_dll" "$lib/x86_64-windows/wowprospero.dll"
 # The native WoW64 CPU: the launcher copies the DLL into a game's prefix.

@@ -7,12 +7,15 @@ interrupted stack from the signal path. Limit the extra record to four
 exceptions.
 
 ---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 5a3749ec54e..99cf0c30677 100644
 --- a/dlls/ntdll/unix/signal_x86_64.c
 +++ b/dlls/ntdll/unix/signal_x86_64.c
-@@ -2045,6 +2045,20 @@
+@@ -1805,6 +1805,21 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
+                  data && data->teb ? data->teb->Tib.StackBase : NULL,
                   data && data->teb ? data->teb->Tib.StackLimit : NULL,
                   data && data->teb ? data->teb->DeallocationStack : NULL );
- 
++
 +        /* The crash reporter's FACECS dump is opaque here. Preserve the CPU
 +         * state in the log before Wine tries to launch its unavailable
 +         * debugger. Do not inspect the interrupted stack from this handler. */
@@ -30,3 +33,5 @@ exceptions.
      }
  #endif
  
+--
+2.43.0
