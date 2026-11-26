@@ -77,17 +77,29 @@ else
     echo "using prepatched Wine source at $source_commit; not replaying the patch archive"
 fi
 
-# The series includes sources that live in wine/ps5 (the Vulkan batching
-# runtime, the shared clock and key-state ABIs); stage them as the console
-# build does, or the tree does not configure.
-python3 "$root/tools/stage_vk_batch.py" --source "$tree" --repo "$root" ||
-    fail "cannot stage Vulkan command-stream runtime"
-cp "$root/wine/ps5/time/pw_qpc_clock.h" "$tree/dlls/ntdll/pw_qpc_clock.h" ||
-    fail "cannot stage shared-clock ABI"
-cp "$root/wine/ps5/menu/pw_title_menu.h" "$tree/dlls/ntdll/pw_title_menu.h" ||
-    fail "cannot stage title-menu ABI"
-cp "$root/wine/ps5/input/pw_key_shared.h" "$tree/dlls/win32u/pw_key_shared.h" ||
-    fail "cannot stage shared-input ABI"
+if [ "$prepatched" -eq 0 ]; then
+    # The series includes sources that live in wine/ps5. Stage them just as the
+    # console build does, or the tree does not configure.
+    python3 "$root/tools/stage_vk_batch.py" --source "$tree" --repo "$root" ||
+        fail "cannot stage Vulkan command-stream runtime"
+    cp "$root/wine/ps5/time/pw_qpc_clock.h" "$tree/dlls/ntdll/pw_qpc_clock.h" ||
+        fail "cannot stage shared-clock ABI"
+    cp "$root/wine/ps5/menu/pw_title_menu.h" "$tree/dlls/ntdll/pw_title_menu.h" ||
+        fail "cannot stage title-menu ABI"
+    cp "$root/wine/ps5/input/pw_key_shared.h" "$tree/dlls/win32u/pw_key_shared.h" ||
+        fail "cannot stage shared-input ABI"
+else
+    for file in dlls/ntdll/pw_qpc_clock.h dlls/ntdll/pw_title_menu.h \
+                dlls/win32u/pw_key_shared.h dlls/winevulkan/pw_vk_batch_pe.c \
+                dlls/winevulkan/pw_vk_present_pe.c dlls/winevulkan/pw_vk_batch_unix.c \
+                dlls/winevulkan/pw_vk_retire.c dlls/winevulkan/pw_vk_function_names.h; do
+        [ -f "$tree/$file" ] || fail "prepatched Wine source is missing $file"
+    done
+    grep -q 'pw_vk_batch_call' "$tree/dlls/winevulkan/vulkan_loader.h" ||
+        fail "prepatched Wine source has no Vulkan batch dispatch"
+    grep -q 'unix_pw_vk_batch' "$tree/dlls/winevulkan/loader_thunks.h" ||
+        fail "prepatched Wine source has no Vulkan batch thunk"
+fi
 
 configure_args="--prefix=/usr --enable-archs=i386,x86_64 --disable-tests"
 stamp=$({ printf '%s\n' "$commit" "$source_commit" "$prepatched" "$configure_args"

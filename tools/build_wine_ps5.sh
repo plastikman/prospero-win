@@ -276,18 +276,34 @@ else
     echo "using prepatched Wine source at $source_commit; not replaying the patch archive"
 fi
 
-# Stage Vulkan batching after the complete patch series. Failure must stop the
-# build before either half can be emitted with a different dispatch table.
-python3 "$root/tools/stage_vk_batch.py" --source "$tree" --repo "$root" ||
-    fail "cannot stage Vulkan command-stream runtime"
+if [ "$prepatched" -eq 0 ]; then
+    # Stage Vulkan batching after the complete patch series. Failure must stop
+    # the build before either half can be emitted with a different dispatch table.
+    python3 "$root/tools/stage_vk_batch.py" --source "$tree" --repo "$root" ||
+        fail "cannot stage Vulkan command-stream runtime"
 
-# Stage the pointer-free shared-clock ABI used by PE32 and the provider.
-cp "$root/wine/ps5/time/pw_qpc_clock.h" "$tree/dlls/ntdll/pw_qpc_clock.h" ||
-    fail "cannot stage shared-clock ABI"
-cp "$root/wine/ps5/menu/pw_title_menu.h" "$tree/dlls/ntdll/pw_title_menu.h" ||
-    fail "cannot stage title-menu ABI"
-cp "$root/wine/ps5/input/pw_key_shared.h" "$tree/dlls/win32u/pw_key_shared.h" ||
-    fail "cannot stage shared-input ABI"
+    # Stage the pointer-free shared-clock and input ABIs used by PE32 and the provider.
+    cp "$root/wine/ps5/time/pw_qpc_clock.h" "$tree/dlls/ntdll/pw_qpc_clock.h" ||
+        fail "cannot stage shared-clock ABI"
+    cp "$root/wine/ps5/menu/pw_title_menu.h" "$tree/dlls/ntdll/pw_title_menu.h" ||
+        fail "cannot stage title-menu ABI"
+    cp "$root/wine/ps5/input/pw_key_shared.h" "$tree/dlls/win32u/pw_key_shared.h" ||
+        fail "cannot stage shared-input ABI"
+else
+    # The source pin already records these generated and port-owned files.
+    # Re-running the staging script mutates its Vulkan loader a second time.
+    for file in dlls/ntdll/pw_qpc_clock.h dlls/ntdll/pw_title_menu.h \
+                dlls/win32u/pw_key_shared.h dlls/winevulkan/pw_vk_batch_pe.c \
+                dlls/winevulkan/pw_vk_present_pe.c dlls/winevulkan/pw_vk_batch_unix.c \
+                dlls/winevulkan/pw_vk_retire.c dlls/winevulkan/pw_vk_function_names.h; do
+        [ -f "$tree/$file" ] || fail "prepatched Wine source is missing $file"
+    done
+    grep -q 'pw_vk_batch_call' "$tree/dlls/winevulkan/vulkan_loader.h" ||
+        fail "prepatched Wine source has no Vulkan batch dispatch"
+    grep -q 'unix_pw_vk_batch' "$tree/dlls/winevulkan/loader_thunks.h" ||
+        fail "prepatched Wine source has no Vulkan batch thunk"
+    echo "prepatched Wine source includes the pinned Vulkan and ABI support files"
+fi
 
 cflags=${CFLAGS:--g -O2}
 
