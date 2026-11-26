@@ -26,6 +26,8 @@ work=${PROSPERO_HOST_WINE_WORK:-$root/.deps/wine-host}
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 
 fail() { echo "build_host_wine: $*" >&2; exit 1; }
+prepatched=${PROSPERO_WINE_PREPATCHED:-0}
+case $prepatched in 0|1) ;; *) fail "PROSPERO_WINE_PREPATCHED must be 0 or 1" ;; esac
 while [ $# -gt 0 ]; do
     case $1 in
     --source) source_dir=$2; shift ;;
@@ -41,8 +43,20 @@ commit=$(sed -n 's/^WINE_COMMIT=//p' "$root/tools/build_wine_ps5.sh")
 patches=$root/wine/patches
 ordered=$(sh "$root/tools/build_wine_ps5.sh" --check-patches) || fail "the patch series is not well-formed"
 [ -n "$commit" ] || fail "no WINE_COMMIT in build_wine_ps5.sh"
-git -C "$source_dir" cat-file -e "$commit^{commit}" 2>/dev/null ||
-    fail "$source_dir does not have the pinned Wine revision $commit"
+if [ "$prepatched" -eq 1 ]; then
+    [ "$(git -C "$source_dir" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] ||
+        fail "not a prepatched Wine git checkout: $source_dir"
+    source_commit=$(git -C "$source_dir" rev-parse HEAD 2>/dev/null) ||
+        fail "cannot read the prepatched Wine revision at $source_dir"
+    [ -z "$(git -C "$source_dir" status --porcelain --untracked-files=normal)" ] ||
+        fail "prepatched Wine checkout is dirty: $source_dir"
+    git -C "$source_dir" merge-base --is-ancestor "$commit" "$source_commit" ||
+        fail "$source_dir is not descended from Wine base $commit"
+else
+    source_commit=$commit
+    git -C "$source_dir" cat-file -e "$commit^{commit}" 2>/dev/null ||
+        fail "$source_dir does not have the pinned Wine revision $commit"
+fi
 for tool in i686-w64-mingw32-gcc x86_64-w64-mingw32-gcc i686-w64-mingw32-strip x86_64-w64-mingw32-strip; do
     command -v "$tool" >/dev/null || fail "$tool is required"
 done
@@ -50,11 +64,18 @@ done
 mkdir -p "$work"
 tree=$work/source
 [ -d "$tree/.git" ] || git clone -q --shared --no-checkout "$source_dir" "$tree"
-git -C "$tree" checkout -q --force "$commit"
+git -C "$tree" cat-file -e "$source_commit^{commit}" 2>/dev/null ||
+    git -C "$tree" fetch -q "$source_dir" "$source_commit" ||
+    fail "cannot fetch Wine source revision $source_commit into $tree"
+git -C "$tree" checkout -q --force "$source_commit"
 git -C "$tree" clean -q -fdx
-for patch in $ordered; do
-    git -C "$tree" apply --index "$patches/$patch" || fail "patch does not apply: $patch"
-done
+if [ "$prepatched" -eq 0 ]; then
+    for patch in $ordered; do
+        git -C "$tree" apply --index "$patches/$patch" || fail "patch does not apply: $patch"
+    done
+else
+    echo "using prepatched Wine source at $source_commit; not replaying the patch archive"
+fi
 
 # The series includes sources that live in wine/ps5 (the Vulkan batching
 # runtime, the shared clock and key-state ABIs); stage them as the console
@@ -69,7 +90,7 @@ cp "$root/wine/ps5/input/pw_key_shared.h" "$tree/dlls/win32u/pw_key_shared.h" ||
     fail "cannot stage shared-input ABI"
 
 configure_args="--prefix=/usr --enable-archs=i386,x86_64 --disable-tests"
-stamp=$({ printf '%s\n' "$commit" "$configure_args"
+stamp=$({ printf '%s\n' "$commit" "$source_commit" "$prepatched" "$configure_args"
           for patch in $ordered; do cat "$patches/$patch"; done; } | sha256sum | cut -c1-64)
 build=$work/build
 if [ ! -f "$build/Makefile" ] || [ "$(cat "$build/.prospero-stamp" 2>/dev/null)" != "$stamp" ]; then

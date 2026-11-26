@@ -150,6 +150,8 @@ while [ $# -gt 0 ]; do
 done
 
 [ -z "$ps5vk_sdk" ] || [ -z "$radv" ] || fail "--ps5vk-sdk and --radv both name libvulkan.prx; give one"
+prepatched=${PROSPERO_WINE_PREPATCHED:-0}
+case $prepatched in 0|1) ;; *) fail "PROSPERO_WINE_PREPATCHED must be 0 or 1" ;; esac
 
 # The series: NNNN-lower-case-name.patch, unique four-digit numbers, each a
 # mail-formatted patch with a subject. Printed in the order it is applied.
@@ -184,8 +186,20 @@ sdk=${sdk:-$foundation/.deps/native/ps5-payload-sdk}
 [ -x "$sdk/bin/prospero-clang" ] || fail "no PS5 payload SDK at $sdk"
 [ -x "$host_tools/tools/winebuild/winebuild" ] ||
     fail "no host Wine tools at $host_tools (run tools/build_wine_runtime.sh)"
-[ "$(git -C "$source_dir" rev-parse HEAD 2>/dev/null)" = "$WINE_COMMIT" ] ||
-    fail "$source_dir is not the pinned Wine revision $WINE_COMMIT"
+if [ "$prepatched" -eq 1 ]; then
+    [ "$(git -C "$source_dir" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] ||
+        fail "not a prepatched Wine git checkout: $source_dir"
+    source_commit=$(git -C "$source_dir" rev-parse HEAD 2>/dev/null) ||
+        fail "cannot read the prepatched Wine revision at $source_dir"
+    [ -z "$(git -C "$source_dir" status --porcelain --untracked-files=normal)" ] ||
+        fail "prepatched Wine checkout is dirty: $source_dir"
+    git -C "$source_dir" merge-base --is-ancestor "$WINE_COMMIT" "$source_commit" ||
+        fail "$source_dir is not descended from Wine base $WINE_COMMIT"
+else
+    source_commit=$WINE_COMMIT
+    [ "$(git -C "$source_dir" rev-parse HEAD 2>/dev/null)" = "$WINE_COMMIT" ] ||
+        fail "$source_dir is not the pinned Wine revision $WINE_COMMIT"
+fi
 
 # A private copy keeps the shared checkout pristine for the host build.
 mkdir -p "$work"
@@ -248,12 +262,19 @@ tree=$work/source
 if [ ! -d "$tree/.git" ]; then
     git clone -q --shared --no-checkout "$source_dir" "$tree"
 fi
-git -C "$tree" checkout -q --force "$WINE_COMMIT"
+git -C "$tree" cat-file -e "$source_commit^{commit}" 2>/dev/null ||
+    git -C "$tree" fetch -q "$source_dir" "$source_commit" ||
+    fail "cannot fetch Wine source revision $source_commit into $tree"
+git -C "$tree" checkout -q --force "$source_commit"
 git -C "$tree" clean -q -fdx
-for patch in $ordered; do
-    git -C "$tree" apply --index "$patches/$patch" || fail "patch does not apply: $patch"
-    echo "applied $patch"
-done
+if [ "$prepatched" -eq 0 ]; then
+    for patch in $ordered; do
+        git -C "$tree" apply --index "$patches/$patch" || fail "patch does not apply: $patch"
+        echo "applied $patch"
+    done
+else
+    echo "using prepatched Wine source at $source_commit; not replaying the patch archive"
+fi
 
 # Stage Vulkan batching after the complete patch series. Failure must stop the
 # build before either half can be emitted with a different dispatch table.
@@ -272,7 +293,7 @@ cflags=${CFLAGS:--g -O2}
 
 # Reconfigure whenever the patches, staged Vulkan sources or arguments change.
 stamp=$(
-    { printf '%s\n' "$WINE_COMMIT" "$CONFIGURE_ARGS" "$sdk" "$FREETYPE_SHA256" \
+    { printf '%s\n' "$WINE_COMMIT" "$source_commit" "$prepatched" "$CONFIGURE_ARGS" "$sdk" "$FREETYPE_SHA256" \
         "$cflags" "$gnutls_args" "${GNUTLS_LIBS:-}"
       for patch in $ordered; do cat "$patches/$patch"; done
       cat "$root/tools/stage_vk_batch.py" "$root/tools/generate_vk_codecs.py" "$root"/wine/ps5/pw_vk_*.[ch] \
